@@ -3,3 +3,4 @@
 .*~
 renders/
 target/
+*.ppm
