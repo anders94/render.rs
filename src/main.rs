@@ -10,8 +10,6 @@ use std::path::PathBuf;
 enum Backend {
     /// Multi-threaded CPU raytracer (f64)
     Cpu,
-    /// Apple Silicon GPU via MLX (f32, requires the `mlx` build feature)
-    Mlx,
     /// Apple GPU via a native Metal compute kernel (f32, macOS only)
     Metal,
 }
@@ -121,21 +119,21 @@ fn main() -> Result<()> {
             println!("Path tracing at {spp} spp...");
             render_rs::raytracer::pt::render(&scene, spp)
         }
-        (Integrator::Path, _) => {
-            anyhow::bail!("the path integrator is CPU-only until roadmap Phase 3; use --backend cpu")
+        (Integrator::Path, Backend::Metal) => {
+            let spp = args.spp.unwrap_or_else(|| {
+                let (sx, sy) = scene.pixel_samples;
+                (sx * sy).max(64)
+            });
+            println!("Path tracing on Metal at {spp} spp...");
+            #[cfg(target_os = "macos")]
+            {
+                render_rs::raytracer::metal::render_pt(&scene, spp)?
+            }
+            #[cfg(not(target_os = "macos"))]
+            anyhow::bail!("the metal backend requires macOS")
         }
         (Integrator::Whitted, backend) => match backend {
         Backend::Cpu => render(&scene),
-        Backend::Mlx => {
-            #[cfg(feature = "mlx")]
-            {
-                render_rs::raytracer::mlx::render(&scene)?
-            }
-            #[cfg(not(feature = "mlx"))]
-            anyhow::bail!(
-                "this binary was built without MLX support; rebuild with `cargo build --release --features mlx`"
-            )
-        }
         Backend::Metal => {
             #[cfg(target_os = "macos")]
             {

@@ -23,9 +23,23 @@ use std::ptr::NonNull;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {}
 
-const KERNEL_SRC: &str = include_str!("kernel.metal");
+const ISECT_COMMON_SRC: &str = include_str!("isect_common.metal");
+const WHITTED_SRC: &str = include_str!("kernel.metal");
+const PT_SRC: &str = include_str!("kernel_pt.metal");
 /// GPU-watchdog insurance: bounded work per command buffer.
 const ROWS_PER_BAND: usize = 256;
+/// The path tracer keeps each command buffer small — one sample over a
+/// bounded row band — so heavy scenes never trip the macOS GPU watchdog
+/// ("Impacting Interactivity" kills buffers that run too long).
+const PT_ROWS_PER_BAND: usize = 512;
+
+fn whitted_source() -> String {
+    format!("{ISECT_COMMON_SRC}\n{WHITTED_SRC}")
+}
+
+fn pt_source() -> String {
+    format!("{ISECT_COMMON_SRC}\n{PT_SRC}")
+}
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 
@@ -45,7 +59,7 @@ fn render_impl(flat: &FlatScene, bufs: &SceneBuffers) -> Result<Image> {
     #[allow(deprecated)]
     options.setFastMathEnabled(false);
     let library = device
-        .newLibraryWithSource_options_error(&NSString::from_str(KERNEL_SRC), Some(&options))
+        .newLibraryWithSource_options_error(&NSString::from_str(&whitted_source()), Some(&options))
         .map_err(|e| anyhow!("MSL compilation failed:\n{}", e.localizedDescription()))?;
     let function = library
         .newFunctionWithName(ns_string!("render_pixels"))
@@ -123,6 +137,129 @@ fn render_impl(flat: &FlatScene, bufs: &SceneBuffers) -> Result<Image> {
     Ok(image)
 }
 
+/// Path-traced render on the GPU: same light transport as the CPU
+/// reference (`raytracer::pt`), f32, statistically convergent to the same
+/// image. Samples run in batches of PT_SAMPLE_BATCH per command buffer.
+pub fn render_pt(scene: &Scene, spp: u32) -> Result<Image> {
+    let gpu = super::gpu_scene::GpuPtScene::build(scene)?;
+    autoreleasepool(|_| render_pt_impl(&gpu, spp))
+}
+
+fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image> {
+    use super::gpu_scene::GpuPtUniforms;
+
+    let device = MTLCreateSystemDefaultDevice()
+        .ok_or_else(|| anyhow!("no Metal device available"))?;
+    // Unlike the whitted kernel, the PT kernel is written infinity-free
+    // (PT_BIG sentinels, safe_inv) precisely so fast math can stay ON —
+    // it is a large win on this ALU-heavy kernel.
+    let options = MTLCompileOptions::new();
+    #[allow(deprecated)]
+    options.setFastMathEnabled(true);
+    let library = device
+        .newLibraryWithSource_options_error(&NSString::from_str(&pt_source()), Some(&options))
+        .map_err(|e| anyhow!("PT MSL compilation failed:\n{}", e.localizedDescription()))?;
+    let function = library
+        .newFunctionWithName(ns_string!("render_pt"))
+        .ok_or_else(|| anyhow!("kernel entry point `render_pt` not found"))?;
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| anyhow!("PT pipeline creation failed: {}", e.localizedDescription()))?;
+    let queue = device
+        .newCommandQueue()
+        .ok_or_else(|| anyhow!("failed to create Metal command queue"))?;
+
+    let buffers: Vec<Buffer> = [
+        gpu.objects_bytes(),
+        gpu.object_materials_bytes(),
+        gpu.materials_bytes(),
+        gpu.lights_bytes(),
+        gpu.tlas_bytes(),
+        gpu.instances_bytes(),
+        gpu.blas_bytes(),
+        gpu.tri_indices_bytes(),
+        gpu.vertices_bytes(),
+        gpu.normals_bytes(),
+        gpu.mesh_infos_bytes(),
+    ]
+    .into_iter()
+    .map(|bytes| upload(&device, bytes))
+    .collect::<Result<_>>()?;
+
+    let (w, h) = (gpu.uniforms.width as usize, gpu.uniforms.height as usize);
+    let accum_len = w * h * 4 * std::mem::size_of::<f32>();
+    let accum_buf = device
+        .newBufferWithLength_options(accum_len, MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| anyhow!("accumulation buffer allocation failed"))?;
+    unsafe {
+        std::ptr::write_bytes(accum_buf.contents().as_ptr() as *mut u8, 0, accum_len);
+    }
+
+    // 8x8 threadgroups: the PT kernel is register-heavy (traversal
+    // stacks), and smaller groups schedule better under that pressure.
+    let _ = pipeline.maxTotalThreadsPerThreadgroup();
+    let tg = MTLSize { width: 8, height: 8, depth: 1 };
+
+    for sample in 0..spp {
+        let mut y0 = 0usize;
+        while y0 < h {
+            let band = (h - y0).min(PT_ROWS_PER_BAND);
+            let mut uniforms: GpuPtUniforms = gpu.uniforms;
+            uniforms.sample_start = sample;
+            uniforms.sample_count = 1;
+            uniforms.y_offset = y0 as u32;
+
+            let cmd = queue
+                .commandBuffer()
+                .ok_or_else(|| anyhow!("failed to create command buffer"))?;
+            let enc = cmd
+                .computeCommandEncoder()
+                .ok_or_else(|| anyhow!("failed to create compute encoder"))?;
+            enc.setComputePipelineState(&pipeline);
+            unsafe {
+                for (i, buf) in buffers.iter().enumerate() {
+                    enc.setBuffer_offset_atIndex(Some(buf), 0, i);
+                }
+                enc.setBytes_length_atIndex(
+                    NonNull::new(&uniforms as *const GpuPtUniforms as *mut c_void).unwrap(),
+                    std::mem::size_of::<GpuPtUniforms>(),
+                    11,
+                );
+                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 12);
+            }
+            let grid = MTLSize { width: w, height: band, depth: 1 };
+            enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            if cmd.status() != MTLCommandBufferStatus::Completed {
+                let detail = cmd
+                    .error()
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| "no error detail".to_string());
+                return Err(anyhow!("PT command buffer failed: {detail}"));
+            }
+            y0 += band;
+        }
+    }
+
+    let ptr = accum_buf.contents().as_ptr() as *const f32;
+    let data = unsafe { std::slice::from_raw_parts(ptr, w * h * 4) };
+    let mut image = vec![vec![Vec3::zero(); w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let weight = data[i + 3].max(1.0);
+            image[y][x] = Vec3::new(
+                (data[i] / weight) as f64,
+                (data[i + 1] / weight) as f64,
+                (data[i + 2] / weight) as f64,
+            );
+        }
+    }
+    Ok(image)
+}
+
 /// Test-support entry point: intersect one object with a batch of rays via
 /// the `intersect_probe` kernel; returns (valid, t) per ray. Used by the
 /// per-primitive parity tests.
@@ -137,7 +274,7 @@ pub fn intersect_probe(
         #[allow(deprecated)]
         options.setFastMathEnabled(false);
         let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(KERNEL_SRC), Some(&options))
+            .newLibraryWithSource_options_error(&NSString::from_str(&whitted_source()), Some(&options))
             .map_err(|e| anyhow!("MSL compilation failed:\n{}", e.localizedDescription()))?;
         let function = library
             .newFunctionWithName(ns_string!("intersect_probe"))

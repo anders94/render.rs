@@ -36,9 +36,11 @@ All primitives support:
 
 ## Performance
 
-- **800x600 scene with 5 objects**: 0.13s (multi-threaded)
-- **29/29 unit tests passing**
-- **~2,110 lines of Rust code**
+- Whitted on Metal: 1080p, 64 objects, 4spp in 0.23s
+- Path-traced glade (10k instances, 10B effective triangles) at 720p/96spp
+  in 84s on Metal, 178s on CPU
+- 79 tests including GPU parity, statistical PT parity, and BVH
+  brute-force cross-checks
 
 ## Usage
 
@@ -61,16 +63,19 @@ cargo run --release -- scene.rib --backend metal -o output.png -f png
 
 ## GPU Rendering
 
-Three backends share the same scene model and shading math:
+Backends share one scene model and are cross-validated by the test suite:
 
-| Backend | How | 1080p 4spp, 5 objects | 1080p 4spp, 64 objects | 4K 4spp, 64 objects |
-|---|---|---|---|---|
-| `--backend cpu` (default) | rayon, f64 | 0.84s | 1.15s | 4.55s |
-| `--backend metal` **(recommended GPU)** | native MSL compute kernel | **0.13s** | **0.23s** | **0.74s** |
-| `--backend mlx` | MLX array ops (wavefront) | 5.0s | 36s | — |
+| | CPU (default) | `--backend metal` |
+|---|---|---|
+| Whitted integrator | rayon, f64 | native MSL megakernel, pixel-exact parity tests |
+| Path integrator | f64 reference | f32 megakernel with TLAS/BLAS traversal, statistical parity tests |
+| Cornell 300px 512spp (path) | 10.9s | 3.4s |
+| Glade: 10k instances / 10B tris, 720p 96spp (path) | 178s | 84s |
 
-*(Apple Silicon Mac; wall time including scene parse, image write, and for
-Metal the one-time ~100ms runtime shader compile)*
+The Metal path tracer is a megakernel; incoherent traversal on huge scenes
+limits it to a few× CPU until the wavefront refactor (roadmap Phase 9).
+The MLX backend was removed in Phase 3 (it was memory-bandwidth-bound by
+design; see ROADMAP.md history).
 
 ### Metal backend (recommended)
 
@@ -82,19 +87,9 @@ and compiled at runtime by the OS). Output is deterministic (no atomics) and
 parity-tested against the CPU backend — `cargo test` runs the suite on
 macOS.
 
-### MLX backend (experimental, slower)
-
-Built on [mlx-rs](https://github.com/oxideai/mlx-rs); requires
-`cargo build --release --features mlx` (compiles MLX's C++ core — needs
-`cmake` and the Metal toolchain: `xcodebuild -downloadComponent MetalToolchain`).
-Kept as a correct, parity-tested reference (`cargo test --features mlx`),
-but MLX's array model materializes an intermediate array per op per object,
-so it is memory-bandwidth-bound and slower than the CPU; mlx-rs exposes no
-custom-kernel API, and MLX's `compile` fusion fails on graphs this deep.
-
-Both GPU backends compute in f32 (Metal GPUs have no f64), so output can
-differ from the CPU backend by about one 8-bit quantization step on
-silhouette edges.
+The GPU computes in f32 (Metal GPUs have no f64): whitted output can
+differ from the CPU by about one 8-bit step on silhouette edges; the path
+integrator's f32/f64 difference is far below its Monte Carlo noise.
 
 ## Example RIB Files
 
@@ -157,22 +152,12 @@ WorldEnd
 
 ## Supported RIB Commands
 
-| Command | Status | Description |
-|---------|--------|-------------|
-| Display | ✅ | Output file specification |
-| Format | ✅ | Image resolution |
-| Projection | ✅ | Camera projection (perspective) |
-| WorldBegin/End | ✅ | Scene definition |
-| Color | ✅ | RGB color |
-| Surface | ✅ | Material type |
-| Translate | ✅ | Translation transform |
-| Rotate | ✅ | Rotation transform |
-| Scale | ✅ | Scaling transform |
-| Sphere | ✅ | Sphere primitive |
-| Cone | ✅ | Cone primitive |
-| Cylinder | ✅ | Cylinder primitive |
-| AttributeBegin/End | ⚠️ | Parsing issue (use direct commands) |
-| LightSource | ⚠️ | Parameter parsing issue |
+See **COMPLIANCE.md** for the full request matrix. Policy: every
+syntactically valid RIB request is accepted — implemented requests take
+effect, state-only requests are recorded, everything else warns once and
+is skipped. Highlights: all seven quadrics, Polygon, PointsPolygons
+meshes, ObjectInstance instancing, ReadArchive, AreaLightSource,
+ConcatTransform/named coordinate systems, Declare/inline declarations.
 
 ## Test Scenes
 
@@ -232,12 +217,13 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 - `--integrator whitted` (default): direct lighting + hard shadows + mirror
   reflections. Fast, deterministic, what the GPU backends speak.
-- `--integrator path` (CPU): progressive Monte Carlo **global illumination**
-  — soft shadows, color bleeding, area lights (via `AreaLightSource` on quad
+- `--integrator path`: progressive Monte Carlo **global illumination** —
+  soft shadows, color bleeding, area lights (via `AreaLightSource` on quad
   polygons), physically-based lobes (Lambert / GGX), next-event estimation
   with multiple importance sampling, Russian roulette. `--spp N` controls
-  samples per pixel. Use `-f exr` for linear HDR output. See
-  `tests/fixtures/cornell.rib`.
+  samples per pixel; `-f exr` writes linear HDR. Runs on the CPU (f64
+  reference) or the GPU with `--backend metal` (f32, statistically
+  identical, much faster). See `tests/fixtures/cornell.rib`.
 
 ## Features (rendering)
 

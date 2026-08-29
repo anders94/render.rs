@@ -111,6 +111,25 @@ impl Bvh {
         self.nodes.is_empty()
     }
 
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Leaf-order primitive ids (for exporters that reorder primitive
+    /// buffers into leaf order).
+    pub fn prim_order(&self) -> &[u32] {
+        &self.prim_order
+    }
+
+    /// Node data for GPU export: (min, max, first_or_left, count).
+    /// Interior nodes: first_or_left = left-child index, count = 0.
+    /// Leaves: first_or_left = first slot in prim_order, count = prims.
+    pub fn node_views(&self) -> impl Iterator<Item = (Vec3, Vec3, u32, u32)> + '_ {
+        self.nodes
+            .iter()
+            .map(|n| (n.bounds.min, n.bounds.max, n.first, n.count))
+    }
+
     pub fn root_bounds(&self) -> Option<Aabb> {
         self.nodes.first().map(|n| n.bounds)
     }

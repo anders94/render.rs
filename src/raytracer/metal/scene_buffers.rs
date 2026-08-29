@@ -244,7 +244,7 @@ pub fn gpu_object(o: &FlatObject) -> GpuObject {
 }
 
 // Sound: T is repr(C) POD with no padding (checked by the size asserts).
-pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
+pub fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
     }

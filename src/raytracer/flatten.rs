@@ -1,5 +1,5 @@
 //! Backend-neutral scene flattening: plain f32 data with no GPU
-//! dependencies, consumed by the MLX and Metal backends.
+//! dependencies, consumed by the GPU backends.
 //!
 //! Material tables are per-object (entry i is the material object i
 //! references), so a hit-object index doubles as a material index.

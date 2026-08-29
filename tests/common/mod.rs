@@ -1,5 +1,5 @@
 //! Helpers shared by the GPU-backend parity test suites
-//! (mlx_parity.rs, metal_parity.rs).
+//! (metal_parity.rs, pt_tests.rs).
 
 #![allow(dead_code)]
 

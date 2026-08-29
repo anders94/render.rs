@@ -2,10 +2,11 @@
 //! flags). One MSL megakernel, one thread per pixel: the per-ray object
 //! loop, shadow rays, and the 5-bounce reflection loop all run in
 //! registers, avoiding the per-op intermediate materialization that makes
-//! the MLX backend memory-bandwidth-bound. The kernel is compiled at
+//! array-programming backends memory-bandwidth-bound. The kernel is compiled at
 //! runtime from the embedded kernel.metal via the OS compiler service.
 
+pub mod gpu_scene;
 mod renderer;
 pub mod scene_buffers;
 
-pub use renderer::{intersect_probe, render};
+pub use renderer::{intersect_probe, render, render_pt};
