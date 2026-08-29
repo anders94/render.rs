@@ -14,7 +14,7 @@ skipped forever.
 | AttributeBegin/AttributeEnd | ✅ | full graphics-state save/restore |
 | TransformBegin/TransformEnd | ✅ | |
 | MotionBegin/MotionEnd | ⏭ P7 | first sample used until then |
-| ObjectBegin/ObjectEnd/ObjectInstance | ⏭ P2 | TLAS instancing |
+| ObjectBegin/ObjectEnd/ObjectInstance | ✅ | mesh geometry instanced via TLAS; quadrics inside blocks warn+skip |
 | SolidBegin/SolidEnd (CSG) | 🚫 | PRMan RIS barely supports it either |
 | IfBegin/ElseIf/Else/IfEnd | 🟡 | condition ignored, body processed |
 | version | ✅ | accepted and ignored |
@@ -32,7 +32,7 @@ skipped forever.
 | Exposure / Quantize | 🟡 | |
 | Display | 🟡 | filename/driver recorded; CLI overrides |
 | Hider / Integrator | ⏭ P1/P4 | |
-| Option (generic) | ✅ | passthrough dictionary |
+| Option (generic) | ✅ | passthrough dictionary; extension: `Option "background" "color" [r g b]` sets the miss color |
 | Declare | ✅ | |
 
 ## Transforms & spaces
@@ -68,7 +68,8 @@ skipped forever.
 | Sphere / Cylinder / Cone | ✅ | |
 | Torus / Disk / Paraboloid / Hyperboloid | ✅ | P0 |
 | Polygon | ✅ | P0, convex fan triangulation |
-| GeneralPolygon / PointsPolygons / PointsGeneralPolygons | ⏭ P2 | |
+| PointsPolygons / PointsGeneralPolygons | ✅ | fan triangulation, vertex N carried; general-polygon holes warn (outer loops used) |
+| GeneralPolygon | ⏭ P5 | |
 | PatchMesh / Patch | ⏭ P5 | |
 | NuPatch / TrimCurve | ⏭ P5 | trims later |
 | SubdivisionMesh / HierarchicalSubdivisionMesh | ⏭ P5 | |
@@ -82,8 +83,8 @@ skipped forever.
 ## Archives & external
 | Request | Status | Notes |
 |---|---|---|
-| ReadArchive | ⏭ P2 | |
-| ArchiveBegin/ArchiveEnd | ⏭ P2 | inline archives |
+| ReadArchive | ✅ | file (relative to RIB dir) or inline archive; depth-capped |
+| ArchiveBegin/ArchiveEnd | ✅ | inline archives |
 | MakeTexture/MakeLatLongEnvironment/etc. | ⏭ P6 | txmake-equivalent tool instead |
 | Binary RIB encoding | ⏭ P9 | |
 

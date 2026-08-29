@@ -7,13 +7,17 @@
 
 use super::ast::{RibFile, RibRequest, RibValue};
 use crate::geometry::{
-    Cone, Cylinder, Disk, Hyperboloid, Intersectable, Paraboloid, Sphere, Torus, Triangle,
+    Cone, Cylinder, Disk, Hyperboloid, Instance, Intersectable, Mesh, Paraboloid, Sphere, Torus,
+    Triangle,
 };
 use crate::math::{Matrix4, Point3, Vec3};
 use crate::scene::*;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+const MAX_ARCHIVE_DEPTH: usize = 16;
 
 /// Attribute state saved/restored by AttributeBegin/AttributeEnd.
 #[derive(Clone)]
@@ -45,6 +49,25 @@ impl Default for GraphicsState {
     }
 }
 
+/// Everything the builder accumulates into the Scene.
+#[derive(Default)]
+struct SceneData {
+    objects: Vec<Arc<dyn Intersectable>>,
+    meshes: Vec<Mesh>,
+    instances: Vec<Instance>,
+    lights: Vec<Light>,
+    materials: Vec<Material>,
+}
+
+/// One placed mesh recorded inside an ObjectBegin block: mesh id, its
+/// transform relative to the block start, and the material captured at
+/// definition time.
+struct ObjectDefEntry {
+    mesh_id: u32,
+    local_transform: Matrix4,
+    material: Material,
+}
+
 pub struct SceneBuilder {
     width: u32,
     height: u32,
@@ -62,6 +85,18 @@ pub struct SceneBuilder {
     warned: HashSet<String>,
     in_motion: bool,
     motion_sample_taken: bool,
+    /// Base directory for resolving ReadArchive paths.
+    base_dir: Option<PathBuf>,
+    /// Inline archives (ArchiveBegin/End) by name.
+    archives: HashMap<String, Vec<RibRequest>>,
+    /// Name of an inline archive currently being recorded.
+    recording_archive: Option<(String, Vec<RibRequest>)>,
+    background: Vec3,
+    /// ObjectBegin definitions by handle.
+    object_defs: HashMap<String, Vec<ObjectDefEntry>>,
+    /// Handle of the object definition currently open, with its entries.
+    defining_object: Option<(String, Vec<ObjectDefEntry>)>,
+    archive_depth: usize,
 }
 
 impl SceneBuilder {
@@ -80,15 +115,51 @@ impl SceneBuilder {
             warned: HashSet::new(),
             in_motion: false,
             motion_sample_taken: false,
+            base_dir: None,
+            background: Vec3::zero(),
+            archives: HashMap::new(),
+            recording_archive: None,
+            object_defs: HashMap::new(),
+            defining_object: None,
+            archive_depth: 0,
         }
     }
 
-    pub fn build(mut self, requests: &RibFile) -> Result<Scene> {
-        let mut objects: Vec<Arc<dyn Intersectable>> = Vec::new();
-        let mut lights: Vec<Light> = Vec::new();
-        let mut materials: Vec<Material> = Vec::new();
+    /// Directory against which ReadArchive paths resolve.
+    pub fn with_base_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.base_dir = Some(dir.into());
+        self
+    }
 
+    pub fn build(mut self, requests: &RibFile) -> Result<Scene> {
+        let mut data = SceneData::default();
+        self.run(requests, &mut data)?;
+
+        let camera = Camera::new(self.width, self.height, self.fov);
+        let mut scene = Scene::new(camera);
+        scene.objects = data.objects;
+        scene.meshes = data.meshes;
+        scene.instances = data.instances;
+        scene.lights = data.lights;
+        scene.materials = data.materials;
+        scene.pixel_samples = self.pixel_samples;
+        scene.background_color = self.background;
+        scene.build_tlas();
+        Ok(scene)
+    }
+
+    fn run(&mut self, requests: &[RibRequest], data: &mut SceneData) -> Result<()> {
         for request in requests {
+            // Inline archive recording captures requests verbatim.
+            if let Some((_, recorded)) = &mut self.recording_archive {
+                if request.name == "ArchiveEnd" {
+                    let (name, recorded) = self.recording_archive.take().unwrap();
+                    self.archives.insert(name, recorded);
+                } else {
+                    recorded.push(request.clone());
+                }
+                continue;
+            }
             // Motion blocks: use the first time sample, skip the rest.
             if self.in_motion && request.name != "MotionEnd" {
                 if self.motion_sample_taken {
@@ -96,25 +167,12 @@ impl SceneBuilder {
                 }
                 self.motion_sample_taken = true;
             }
-            self.process(request, &mut objects, &mut lights, &mut materials)?;
+            self.process(request, data)?;
         }
-
-        let camera = Camera::new(self.width, self.height, self.fov);
-        let mut scene = Scene::new(camera);
-        scene.objects = objects;
-        scene.lights = lights;
-        scene.materials = materials;
-        scene.pixel_samples = self.pixel_samples;
-        Ok(scene)
+        Ok(())
     }
 
-    fn process(
-        &mut self,
-        req: &RibRequest,
-        objects: &mut Vec<Arc<dyn Intersectable>>,
-        lights: &mut Vec<Light>,
-        materials: &mut Vec<Material>,
-    ) -> Result<()> {
+    fn process(&mut self, req: &RibRequest, data: &mut SceneData) -> Result<()> {
         match req.name.as_str() {
             // ---- structure ------------------------------------------------
             "version" | "WorldBegin" | "WorldEnd" | "FrameBegin" | "FrameEnd" => {}
@@ -140,6 +198,63 @@ impl SceneBuilder {
             }
             // Conditional RIB: conditions are not evaluated; bodies process.
             "IfBegin" | "ElseIf" | "Else" | "IfEnd" => {}
+
+            // ---- archives & instancing ------------------------------------
+            "ArchiveBegin" => {
+                if let Some(name) = req.string(0) {
+                    self.recording_archive = Some((name.to_string(), Vec::new()));
+                }
+            }
+            "ArchiveEnd" => {} // handled in run(); stray ends are ignored
+            "ReadArchive" => {
+                if let Some(name) = req.string(0) {
+                    self.read_archive(name, data)?;
+                }
+            }
+            "ObjectBegin" => {
+                let handle = req
+                    .string(0)
+                    .map(str::to_string)
+                    .or_else(|| req.number(0).map(|n| n.to_string()))
+                    .unwrap_or_else(|| "0".to_string());
+                self.attribute_stack.push(self.state.clone());
+                self.transform_stack.push();
+                // Geometry inside the block records relative to the block
+                // start: reset to identity while defining.
+                self.transform_stack.set(Matrix4::identity());
+                self.defining_object = Some((handle, Vec::new()));
+            }
+            "ObjectEnd" => {
+                if let Some((handle, entries)) = self.defining_object.take() {
+                    self.object_defs.insert(handle, entries);
+                }
+                if let Some(saved) = self.attribute_stack.pop() {
+                    self.state = saved;
+                }
+                self.transform_stack.pop();
+            }
+            "ObjectInstance" => {
+                let handle = req
+                    .string(0)
+                    .map(str::to_string)
+                    .or_else(|| req.number(0).map(|n| n.to_string()))
+                    .unwrap_or_else(|| "0".to_string());
+                if let Some(entries) = self.object_defs.get(&handle) {
+                    let placement = self.transform_stack.current();
+                    for entry in entries {
+                        data.materials.push(entry.material.clone());
+                        let material_id = data.materials.len() - 1;
+                        data.instances.push(Instance::new(
+                            entry.mesh_id,
+                            material_id,
+                            placement * entry.local_transform,
+                            &data.meshes[entry.mesh_id as usize],
+                        ));
+                    }
+                } else {
+                    self.warn_once(&format!("ObjectInstance \"{handle}\" has no definition"));
+                }
+            }
 
             // ---- options & camera ----------------------------------------
             "Format" => {
@@ -167,6 +282,15 @@ impl SceneBuilder {
             }
             "Option" | "Attribute" => {
                 if let Some(category) = req.string(0) {
+                    // Extension: `Option "background" "color" [r g b]` sets
+                    // the miss color (a dome light supersedes this at P4).
+                    if req.name == "Option" && category == "background" {
+                        if let Some(c) = req.params_from(1).get_numbers("color") {
+                            if c.len() >= 3 {
+                                self.background = Vec3::new(c[0], c[1], c[2]);
+                            }
+                        }
+                    }
                     for (token, value) in req.params_from(1).iter() {
                         self.passthrough
                             .insert(format!("{category}:{token}"), vec![(*value).clone()]);
@@ -240,7 +364,6 @@ impl SceneBuilder {
                 }
             }
             "Orientation" => {
-                // "outside" is the default; anything else flips.
                 self.state.reverse_orientation = req.string(0) != Some("outside");
             }
             "ReverseOrientation" => {
@@ -260,13 +383,10 @@ impl SceneBuilder {
             // ---- lights ---------------------------------------------------
             "LightSource" => {
                 if let Some(light) = self.parse_light(req) {
-                    lights.push(light);
+                    data.lights.push(light);
                 }
             }
             "AreaLightSource" => {
-                // `AreaLightSource "type" <handle> params...` — following
-                // geometry in this attribute block emits. Handle presence
-                // detected as in parse_light.
                 let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
                 let params = req.params_from(params_start);
                 let intensity = params.get_number("intensity").unwrap_or(1.0);
@@ -277,13 +397,36 @@ impl SceneBuilder {
                 self.state.area_light = Some((intensity, color));
             }
 
-            // ---- geometry -------------------------------------------------
+            // ---- meshes ---------------------------------------------------
+            "PointsPolygons" => {
+                self.points_polygons(req, None, data);
+            }
+            "PointsGeneralPolygons" => {
+                // With loop counts: use each polygon's first (outer) loop;
+                // holes are not supported yet.
+                let nloops = req.values.first().and_then(RibValue::as_numbers);
+                if let Some(nloops) = nloops {
+                    if nloops.iter().any(|n| *n as usize != 1) {
+                        self.warn_once("PointsGeneralPolygons holes are not supported; using outer loops only");
+                    }
+                    let shifted = RibRequest {
+                        name: req.name.clone(),
+                        values: req.values[1..].to_vec(),
+                    };
+                    self.points_polygons(&shifted, None, data);
+                }
+            }
+
+            // ---- quadric / polygon geometry ------------------------------
             "Sphere" => {
                 if let (Some(r), Some(zmin), Some(zmax), Some(tm)) =
                     (req.number(0), req.number(1), req.number(2), req.number(3))
                 {
-                    let id = self.push_material(materials);
-                    objects.push(Arc::new(Sphere::new(
+                    if self.reject_in_object_def(&req.name) {
+                        return Ok(());
+                    }
+                    let id = self.push_material(&mut data.materials);
+                    data.objects.push(Arc::new(Sphere::new(
                         r, zmin, zmax, tm, id, self.transform_stack.current(),
                     )));
                 }
@@ -292,8 +435,11 @@ impl SceneBuilder {
                 if let (Some(r), Some(zmin), Some(zmax), Some(tm)) =
                     (req.number(0), req.number(1), req.number(2), req.number(3))
                 {
-                    let id = self.push_material(materials);
-                    objects.push(Arc::new(Cylinder::new(
+                    if self.reject_in_object_def(&req.name) {
+                        return Ok(());
+                    }
+                    let id = self.push_material(&mut data.materials);
+                    data.objects.push(Arc::new(Cylinder::new(
                         r, zmin, zmax, tm, id, self.transform_stack.current(),
                     )));
                 }
@@ -301,8 +447,11 @@ impl SceneBuilder {
             "Cone" => {
                 if let (Some(h), Some(r), Some(tm)) = (req.number(0), req.number(1), req.number(2))
                 {
-                    let id = self.push_material(materials);
-                    objects.push(Arc::new(Cone::new(
+                    if self.reject_in_object_def(&req.name) {
+                        return Ok(());
+                    }
+                    let id = self.push_material(&mut data.materials);
+                    data.objects.push(Arc::new(Cone::new(
                         h, r, tm, id, self.transform_stack.current(),
                     )));
                 }
@@ -315,8 +464,11 @@ impl SceneBuilder {
                     req.number(3),
                     req.number(4),
                 ) {
-                    let id = self.push_material(materials);
-                    objects.push(Arc::new(Torus::new(
+                    if self.reject_in_object_def(&req.name) {
+                        return Ok(());
+                    }
+                    let id = self.push_material(&mut data.materials);
+                    data.objects.push(Arc::new(Torus::new(
                         major, minor, phimin, phimax, tm, id,
                         self.transform_stack.current(),
                     )));
@@ -325,8 +477,11 @@ impl SceneBuilder {
             "Disk" => {
                 if let (Some(h), Some(r), Some(tm)) = (req.number(0), req.number(1), req.number(2))
                 {
-                    let id = self.push_material(materials);
-                    objects.push(Arc::new(Disk::new(
+                    if self.reject_in_object_def(&req.name) {
+                        return Ok(());
+                    }
+                    let id = self.push_material(&mut data.materials);
+                    data.objects.push(Arc::new(Disk::new(
                         h, r, tm, id, self.transform_stack.current(),
                     )));
                 }
@@ -335,8 +490,11 @@ impl SceneBuilder {
                 if let (Some(rmax), Some(zmin), Some(zmax), Some(tm)) =
                     (req.number(0), req.number(1), req.number(2), req.number(3))
                 {
-                    let id = self.push_material(materials);
-                    objects.push(Arc::new(Paraboloid::new(
+                    if self.reject_in_object_def(&req.name) {
+                        return Ok(());
+                    }
+                    let id = self.push_material(&mut data.materials);
+                    data.objects.push(Arc::new(Paraboloid::new(
                         rmax, zmin, zmax, tm, id, self.transform_stack.current(),
                     )));
                 }
@@ -344,9 +502,12 @@ impl SceneBuilder {
             "Hyperboloid" => {
                 let n: Vec<Option<f64>> = (0..7).map(|i| req.number(i)).collect();
                 if n.iter().all(Option::is_some) {
+                    if self.reject_in_object_def(&req.name) {
+                        return Ok(());
+                    }
                     let v: Vec<f64> = n.into_iter().map(Option::unwrap).collect();
-                    let id = self.push_material(materials);
-                    objects.push(Arc::new(Hyperboloid::new(
+                    let id = self.push_material(&mut data.materials);
+                    data.objects.push(Arc::new(Hyperboloid::new(
                         [v[0], v[1], v[2]],
                         [v[3], v[4], v[5]],
                         v[6],
@@ -358,6 +519,9 @@ impl SceneBuilder {
             "Polygon" => {
                 if let Some(p) = req.params_from(0).get_numbers("P") {
                     if p.len() >= 9 {
+                        if self.reject_in_object_def(&req.name) {
+                            return Ok(());
+                        }
                         let transform = self.transform_stack.current();
                         let vertex =
                             |i: usize| -> [f64; 3] { [p[i * 3], p[i * 3 + 1], p[i * 3 + 2]] };
@@ -368,23 +532,19 @@ impl SceneBuilder {
                         let mut material = self.make_material();
                         if let Some((intensity, color)) = self.state.area_light {
                             material.emission = color * intensity;
-                            // Quads become sampleable rect lights (with MIS);
-                            // other emissive polygons contribute via BSDF
-                            // hits only.
                             if p.len() == 12 {
                                 let c = world(vertex(0));
                                 let e1 = world(vertex(1)) - c;
                                 let e2 = world(vertex(3)) - c;
-                                material.area_light = Some(lights.len());
-                                lights.push(Light::rect(c, e1, e2, intensity, color));
+                                material.area_light = Some(data.lights.len());
+                                data.lights.push(Light::rect(c, e1, e2, intensity, color));
                             }
                         }
-                        materials.push(material);
-                        let id = materials.len() - 1;
+                        data.materials.push(material);
+                        let id = data.materials.len() - 1;
 
-                        // Convex fan triangulation.
                         for i in 1..(p.len() / 3 - 1) {
-                            objects.push(Arc::new(Triangle::new(
+                            data.objects.push(Arc::new(Triangle::new(
                                 vertex(0),
                                 vertex(i),
                                 vertex(i + 1),
@@ -398,13 +558,147 @@ impl SceneBuilder {
 
             // ---- everything else: accept and warn once --------------------
             _ => {
-                if self.warned.insert(req.name.clone()) {
-                    eprintln!(
-                        "warning: RIB request '{}' not implemented yet (see COMPLIANCE.md); skipping",
-                        req.name
-                    );
-                }
+                self.warn_once(&format!(
+                    "RIB request '{}' not implemented yet (see COMPLIANCE.md); skipping",
+                    req.name
+                ));
             }
+        }
+        Ok(())
+    }
+
+    /// Quadrics inside ObjectBegin blocks are not yet instanced; warn+skip.
+    fn reject_in_object_def(&mut self, name: &str) -> bool {
+        if self.defining_object.is_some() {
+            self.warn_once(&format!(
+                "'{name}' inside ObjectBegin is not supported yet (meshes only); skipping"
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn warn_once(&mut self, message: &str) {
+        if self.warned.insert(message.to_string()) {
+            eprintln!("warning: {message}");
+        }
+    }
+
+    /// Build a mesh from PointsPolygons-style values: [nverts] [indices]
+    /// then "P"/"N"/"st" params.
+    fn points_polygons(&mut self, req: &RibRequest, _basis: Option<()>, data: &mut SceneData) {
+        let Some(nverts) = req.values.first().and_then(RibValue::as_numbers) else {
+            return;
+        };
+        let Some(vert_indices) = req.values.get(1).and_then(RibValue::as_numbers) else {
+            return;
+        };
+        let params = req.params_from(2);
+        let Some(p) = params.get_numbers("P") else {
+            self.warn_once("PointsPolygons without \"P\"; skipping");
+            return;
+        };
+
+        let positions: Vec<[f32; 3]> = p
+            .chunks_exact(3)
+            .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+            .collect();
+        let normals = params.get_numbers("N").and_then(|n| {
+            if n.len() == p.len() {
+                Some(
+                    n.chunks_exact(3)
+                        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                self.warn_once("PointsPolygons \"N\" is not per-vertex; ignoring normals");
+                None
+            }
+        });
+        let st = params.get_numbers("st").and_then(|s| {
+            (s.len() * 3 == p.len() * 2).then(|| {
+                s.chunks_exact(2)
+                    .map(|c| [c[0] as f32, c[1] as f32])
+                    .collect::<Vec<_>>()
+            })
+        });
+
+        // Fan-triangulate each polygon.
+        let mut indices: Vec<u32> = Vec::new();
+        let mut cursor = 0usize;
+        for &nv in nverts {
+            let nv = nv as usize;
+            if cursor + nv > vert_indices.len() {
+                break;
+            }
+            let poly = &vert_indices[cursor..cursor + nv];
+            for i in 1..nv.saturating_sub(1) {
+                indices.push(poly[0] as u32);
+                indices.push(poly[i] as u32);
+                indices.push(poly[i + 1] as u32);
+            }
+            cursor += nv;
+        }
+        if indices.is_empty() {
+            return;
+        }
+
+        let mesh = Mesh::new(positions, indices, normals, st);
+        let mesh_id = data.meshes.len() as u32;
+        data.meshes.push(mesh);
+
+        let mut material = self.make_material();
+        if let Some((intensity, color)) = self.state.area_light {
+            // Emissive meshes glow (BSDF hits); they are not yet sampleable
+            // lights.
+            material.emission = color * intensity;
+        }
+
+        if let Some((_, entries)) = &mut self.defining_object {
+            entries.push(ObjectDefEntry {
+                mesh_id,
+                local_transform: self.transform_stack.current(),
+                material,
+            });
+        } else {
+            data.materials.push(material);
+            let material_id = data.materials.len() - 1;
+            data.instances.push(Instance::new(
+                mesh_id,
+                material_id,
+                self.transform_stack.current(),
+                &data.meshes[mesh_id as usize],
+            ));
+        }
+    }
+
+    fn read_archive(&mut self, name: &str, data: &mut SceneData) -> Result<()> {
+        if self.archive_depth >= MAX_ARCHIVE_DEPTH {
+            self.warn_once(&format!("ReadArchive \"{name}\": max depth exceeded; skipping"));
+            return Ok(());
+        }
+        // Inline archives take precedence over files.
+        if let Some(requests) = self.archives.get(name).cloned() {
+            self.archive_depth += 1;
+            self.run(&requests, data)?;
+            self.archive_depth -= 1;
+            return Ok(());
+        }
+        let path = match &self.base_dir {
+            Some(dir) => dir.join(name),
+            None => PathBuf::from(name),
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match super::parse_rib(&content) {
+                Ok(requests) => {
+                    self.archive_depth += 1;
+                    self.run(&requests, data)?;
+                    self.archive_depth -= 1;
+                }
+                Err(e) => self.warn_once(&format!("ReadArchive \"{name}\": parse error: {e}")),
+            },
+            Err(e) => self.warn_once(&format!("ReadArchive \"{name}\": {e}")),
         }
         Ok(())
     }
@@ -465,7 +759,6 @@ impl SceneBuilder {
 }
 
 fn color_from(req: &RibRequest) -> Option<Vec3> {
-    // Color 1 0 0  |  Color [1 0 0]
     if let (Some(r), Some(g), Some(b)) = (req.number(0), req.number(1), req.number(2)) {
         return Some(Vec3::new(r, g, b));
     }
@@ -583,13 +876,11 @@ mod tests {
         "#;
         let requests = parse_rib(input).unwrap();
         let scene = SceneBuilder::new().build(&requests).unwrap();
-        // 4 quadrics + quad fan-triangulated into 2 triangles.
         assert_eq!(scene.objects.len(), 6);
     }
 
     #[test]
     fn test_concat_transform_matches_translate() {
-        // RIB row-major premultiply: translation lives in elements 12..15.
         let a = parse_rib("WorldBegin ConcatTransform [1 0 0 0 0 1 0 0 0 0 1 0 3 4 5 1] Sphere 1 -1 1 360 WorldEnd").unwrap();
         let b = parse_rib("WorldBegin Translate 3 4 5 Sphere 1 -1 1 360 WorldEnd").unwrap();
         let sa = SceneBuilder::new().build(&a).unwrap();
@@ -612,7 +903,7 @@ mod tests {
         "#;
         let requests = parse_rib(input).unwrap();
         let scene = SceneBuilder::new().build(&requests).unwrap();
-        assert_eq!(scene.objects.len(), 1); // sphere lands, subdiv skipped
+        assert_eq!(scene.objects.len(), 1);
     }
 
     #[test]
@@ -630,5 +921,65 @@ mod tests {
         let scene = SceneBuilder::new().build(&requests).unwrap();
         let desc = scene.objects[0].describe();
         assert!((desc.transform.rows()[2][3] - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_points_polygons_builds_mesh() {
+        let input = r#"
+            WorldBegin
+                Translate 0 0 5
+                PointsPolygons [4 4] [0 1 2 3  4 5 6 7]
+                    "P" [-1 -1 0  1 -1 0  1 1 0  -1 1 0
+                          -1 -1 1  1 -1 1  1 1 1  -1 1 1]
+            WorldEnd
+        "#;
+        let requests = parse_rib(input).unwrap();
+        let scene = SceneBuilder::new().build(&requests).unwrap();
+        assert_eq!(scene.meshes.len(), 1);
+        assert_eq!(scene.instances.len(), 1);
+        assert_eq!(scene.meshes[0].triangle_count(), 4); // two quads
+        assert_eq!(scene.triangle_count(), 4);
+    }
+
+    #[test]
+    fn test_object_instance_shares_mesh() {
+        let input = r#"
+            WorldBegin
+                ObjectBegin "quad"
+                    PointsPolygons [4] [0 1 2 3] "P" [-1 -1 0  1 -1 0  1 1 0  -1 1 0]
+                ObjectEnd
+                Translate -2 0 5
+                ObjectInstance "quad"
+                Translate 4 0 0
+                ObjectInstance "quad"
+            WorldEnd
+        "#;
+        let requests = parse_rib(input).unwrap();
+        let scene = SceneBuilder::new().build(&requests).unwrap();
+        assert_eq!(scene.meshes.len(), 1, "one shared mesh");
+        assert_eq!(scene.instances.len(), 2, "two instances");
+        // Instance transforms differ.
+        let a = scene.instances[0].transform.rows();
+        let b = scene.instances[1].transform.rows();
+        assert!((a[0][3] - -2.0).abs() < 1e-12);
+        assert!((b[0][3] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_inline_archive() {
+        let input = r#"
+            ArchiveBegin "ball"
+                Sphere 1 -1 1 360
+            ArchiveEnd
+            WorldBegin
+                Translate 0 0 5
+                ReadArchive "ball"
+                Translate 3 0 0
+                ReadArchive "ball"
+            WorldEnd
+        "#;
+        let requests = parse_rib(input).unwrap();
+        let scene = SceneBuilder::new().build(&requests).unwrap();
+        assert_eq!(scene.objects.len(), 2);
     }
 }

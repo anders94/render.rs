@@ -49,7 +49,10 @@ pub fn random_rays(rng: &mut Lcg, count: usize) -> Vec<Ray> {
 pub fn load_fixture_scene(fixture: &str, width: u32, height: u32) -> Scene {
     let rib = fs::read_to_string(format!("tests/fixtures/{fixture}")).unwrap();
     let commands = parse_rib(&rib).unwrap();
-    let mut scene = SceneBuilder::new().build(&commands).unwrap();
+    let mut scene = SceneBuilder::new()
+        .with_base_dir("tests/fixtures")
+        .build(&commands)
+        .unwrap();
     scene.camera.width = width;
     scene.camera.height = height;
     scene

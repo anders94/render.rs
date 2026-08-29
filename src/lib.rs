@@ -1,3 +1,4 @@
+pub mod accel;
 pub mod math;
 pub mod parser;
 pub mod geometry;

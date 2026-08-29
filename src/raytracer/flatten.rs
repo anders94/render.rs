@@ -83,6 +83,12 @@ pub fn matrix_to_f32(m: &Matrix4) -> Result<[f32; 16]> {
 
 impl FlatScene {
     pub fn from_scene(scene: &Scene) -> Result<Self> {
+        if !scene.instances.is_empty() {
+            bail!(
+                "mesh geometry is not supported by the GPU backends yet (roadmap Phase 3); \
+                 render with --backend cpu"
+            );
+        }
         let mut objects = Vec::with_capacity(scene.objects.len());
         let mut materials = Vec::with_capacity(scene.objects.len());
 

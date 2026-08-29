@@ -8,19 +8,26 @@ pub use light::{Light, LightType};
 pub use material::{Material, MaterialType};
 pub use transform::TransformStack;
 
-use crate::geometry::Intersectable;
+use crate::accel::Bvh;
+use crate::geometry::{to_intersection, Instance, Intersectable, Mesh};
 use crate::math::{Point3, Vec3};
 use crate::raytracer::{Intersection, Ray};
 use std::sync::Arc;
 
 pub struct Scene {
     pub camera: Camera,
+    /// Standalone primitives (quadrics, loose polygons): linear scan.
     pub objects: Vec<Arc<dyn Intersectable>>,
+    /// Mesh library (BLAS per mesh) and their placed instances, traversed
+    /// through the TLAS.
+    pub meshes: Vec<Mesh>,
+    pub instances: Vec<Instance>,
     pub lights: Vec<Light>,
     pub materials: Vec<Material>,
     pub background_color: Vec3,
     /// Samples per pixel in x and y (from the PixelSamples directive).
     pub pixel_samples: (u32, u32),
+    tlas: Bvh,
 }
 
 impl Scene {
@@ -28,11 +35,28 @@ impl Scene {
         Self {
             camera,
             objects: Vec::new(),
+            meshes: Vec::new(),
+            instances: Vec::new(),
             lights: Vec::new(),
             materials: Vec::new(),
             background_color: Vec3::new(0.0, 0.0, 0.0),
             pixel_samples: (1, 1),
+            tlas: Bvh::build(&[]),
         }
+    }
+
+    /// Rebuild the TLAS over instance world bounds. Call after instances
+    /// change (SceneBuilder does this once at the end of build()).
+    pub fn build_tlas(&mut self) {
+        let bounds: Vec<_> = self.instances.iter().map(|i| i.world_bounds).collect();
+        self.tlas = Bvh::build(&bounds);
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        self.instances
+            .iter()
+            .map(|i| self.meshes[i.mesh_id as usize].triangle_count())
+            .sum()
     }
 
     /// Closest intersection of the ray with any object in the scene.
@@ -45,6 +69,33 @@ impl Scene {
                 if intersection.t < closest_t {
                     closest_t = intersection.t;
                     closest = Some(intersection);
+                }
+            }
+        }
+
+        // TLAS runs in parametric t (units of |ray.direction|); the legacy
+        // primitives above use euclidean t. Convert the budget going in and
+        // the result coming out.
+        if !self.instances.is_empty() {
+            let dir_len = ray.direction.length().max(1e-300);
+            let mut best_hit: Option<(usize, crate::geometry::MeshHit)> = None;
+            let t_budget = closest_t / dir_len;
+            let winner = self.tlas.traverse(ray, t_budget, |inst_id, t_max| {
+                let instance = &self.instances[inst_id as usize];
+                instance
+                    .intersect(&self.meshes, ray, t_max)
+                    .map(|hit| {
+                        let t = hit.t_param;
+                        best_hit = Some((instance.material_id, hit));
+                        t
+                    })
+            });
+            if winner.is_some() {
+                if let Some((material_id, hit)) = best_hit {
+                    let intersection = to_intersection(&hit, ray, material_id);
+                    if intersection.t < closest_t {
+                        closest = Some(intersection);
+                    }
                 }
             }
         }
@@ -65,6 +116,16 @@ impl Scene {
                 if intersection.t < max_t - 1e-4 {
                     return true;
                 }
+            }
+        }
+
+        if !self.instances.is_empty() {
+            // light_dir is normalized, so parametric and euclidean t match.
+            let limit = max_t - 1e-4;
+            if self.tlas.any_hit(&shadow_ray, limit, |inst_id, lim| {
+                self.instances[inst_id as usize].occludes(&self.meshes, &shadow_ray, lim)
+            }) {
+                return true;
             }
         }
 

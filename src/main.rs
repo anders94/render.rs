@@ -84,10 +84,21 @@ fn main() -> Result<()> {
     let commands = parse_rib(&rib_content)?;
 
     println!("Building scene...");
-    let mut scene = SceneBuilder::new().build(&commands)?;
+    let mut builder = SceneBuilder::new();
+    if let Some(dir) = args.rib_file.parent() {
+        builder = builder.with_base_dir(dir);
+    }
+    let mut scene = builder.build(&commands)?;
 
-    println!("Scene has {} objects, {} lights, {} materials",
-             scene.objects.len(), scene.lights.len(), scene.materials.len());
+    println!(
+        "Scene has {} objects, {} meshes / {} instances ({} triangles), {} lights, {} materials",
+        scene.objects.len(),
+        scene.meshes.len(),
+        scene.instances.len(),
+        scene.triangle_count(),
+        scene.lights.len(),
+        scene.materials.len()
+    );
 
     if let Some(width) = args.width {
         scene.camera.width = width;
