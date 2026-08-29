@@ -1,0 +1,33 @@
+##RenderMan RIB-Structure 1.1
+Display "shadows.ppm" "file" "rgb"
+Format 640 480 1.0
+PixelSamples 2 2
+Projection "perspective" "fov" [45]
+
+WorldBegin
+    LightSource "distantlight" 1 "from" [3 8 -4] "to" [0 0 5] "intensity" [0.9]
+
+    # Ground: huge matte sphere below the scene
+    AttributeBegin
+        Color 0.8 0.8 0.8
+        Surface "matte"
+        Translate 0 -101.2 6
+        Sphere 100 -100 100 360
+    AttributeEnd
+
+    # Red plastic sphere casting a shadow on the ground
+    AttributeBegin
+        Color 1 0.2 0.2
+        Surface "plastic"
+        Translate -1.2 0 6
+        Sphere 0.8 -0.8 0.8 360
+    AttributeEnd
+
+    # Metal sphere: reflects ground and red sphere, casts shadow
+    AttributeBegin
+        Color 0.9 0.9 0.7
+        Surface "metal" "roughness" [0.05]
+        Translate 1.2 0 6
+        Sphere 0.8 -0.8 0.8 360
+    AttributeEnd
+WorldEnd

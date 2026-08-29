@@ -1,0 +1,29 @@
+Display "materials.ppm" "file" "rgb"
+Format 640 480 1.0
+Projection "perspective" "fov" [45]
+
+WorldBegin
+    # Matte sphere (diffuse only) - left
+    TransformBegin
+        Color 0.7 0.3 0.2
+        Surface "matte"
+        Translate -2.5 0 6
+        Sphere 0.85 -0.85 0.85 360
+    TransformEnd
+
+    # Plastic sphere (diffuse + specular) - center
+    TransformBegin
+        Color 0.7 0.3 0.2
+        Surface "plastic"
+        Translate 0 0 6
+        Sphere 0.85 -0.85 0.85 360
+    TransformEnd
+
+    # Metal sphere (high specular) - right
+    TransformBegin
+        Color 0.7 0.3 0.2
+        Surface "metal"
+        Translate 2.5 0 6
+        Sphere 0.85 -0.85 0.85 360
+    TransformEnd
+WorldEnd

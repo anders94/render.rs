@@ -1,0 +1,10 @@
+Display "test.ppm" "file" "rgb"
+Format 320 240 1.0
+Projection "perspective" "fov" [45]
+
+WorldBegin
+    Color 1 0 0
+    Surface "matte"
+    # Sphere at origin - camera is ALSO at origin!
+    Sphere 1 -1 1 360
+WorldEnd

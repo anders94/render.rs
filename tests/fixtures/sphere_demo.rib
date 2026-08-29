@@ -1,0 +1,11 @@
+Display "sphere_demo.ppm" "file" "rgb"
+Format 640 480 1.0
+Projection "perspective" "fov" [50]
+
+WorldBegin
+    # Nice visible red sphere
+    Color 1 0 0
+    Surface "plastic"
+    Translate 0 0 6
+    Sphere 1.2 -1.2 1.2 360
+WorldEnd

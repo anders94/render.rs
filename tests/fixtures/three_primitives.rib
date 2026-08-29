@@ -1,0 +1,31 @@
+Display "three.ppm" "file" "rgb"
+Format 640 480 1.0
+Projection "perspective" "fov" [45]
+
+WorldBegin
+    # Red sphere on left
+    TransformBegin
+        Color 1 0 0
+        Surface "plastic"
+        Translate -2.0 0 6
+        Sphere 1.0 -1.0 1.0 360
+    TransformEnd
+
+    # Green cylinder in center
+    TransformBegin
+        Color 0 1 0
+        Surface "plastic"
+        Translate 0 0 6
+        Rotate 90 1 0 0
+        Cylinder 0.6 -1.2 1.2 360
+    TransformEnd
+
+    # Blue cone on right
+    TransformBegin
+        Color 0 0 1
+        Surface "plastic"
+        Translate 2.0 1.0 6
+        Rotate 90 1 0 0
+        Cone 2.0 0.8 360
+    TransformEnd
+WorldEnd

@@ -1,0 +1,15 @@
+##RenderMan RIB-Structure 1.1
+Display "simple.ppm" "file" "rgb"
+Format 320 240 1.0
+Projection "perspective" "fov" [45]
+
+WorldBegin
+    LightSource "pointlight" 1 "from" [10 10 -10] "intensity" [1.0]
+
+    AttributeBegin
+        Color 1 0 0
+        Surface "plastic"
+        Translate 0 0 5
+        Sphere 1 -1 1 360
+    AttributeEnd
+WorldEnd

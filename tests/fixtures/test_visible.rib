@@ -1,0 +1,11 @@
+Display "test.ppm" "file" "rgb"
+Format 640 480 1.0
+Projection "perspective" "fov" [45]
+
+WorldBegin
+    # Red sphere with shading
+    Color 1 0 0
+    Surface "plastic"
+    Translate 0 0 8
+    Sphere 1.5 -1.5 1.5 360
+WorldEnd

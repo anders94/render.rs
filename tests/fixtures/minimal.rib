@@ -1,0 +1,11 @@
+Display "test.ppm" "file" "rgb"
+Format 320 240 1.0
+Projection "perspective" "fov" [45]
+
+WorldBegin
+    Color 1 0 0
+    Surface "plastic"
+    # Move sphere away from camera (which is at origin)
+    Translate 0 0 6
+    Sphere 1.2 -1.2 1.2 360
+WorldEnd

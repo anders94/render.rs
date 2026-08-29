@@ -1,0 +1,77 @@
+##RenderMan RIB-Structure 1.1
+version 3.04
+Display "quadric_zoo.ppm" "file" "rgb"
+Format 960 540 1.0
+PixelSamples 2 2
+Projection "perspective" "fov" [40]
+Declare "roughness" "uniform float"
+
+WorldBegin
+    LightSource "distantlight" "key" "from" [4 8 -6] "to" [0 0 7] "intensity" [0.85]
+    LightSource "pointlight" 2 "from" [-5 4 2] "intensity" [0.35]
+
+    # Top row: sphere, torus, cylinder, cone
+    AttributeBegin
+        Color 0.9 0.25 0.2
+        Surface "plastic" "roughness" [0.15]
+        Translate -3.4 1.2 7
+        Sphere 0.9 -0.9 0.9 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.95 0.7 0.15
+        Surface "metal" "roughness" [0.08]
+        Translate -1.1 1.2 7
+        Rotate -55 1 0 0
+        Torus 0.65 0.28 0 360 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.2 0.55 0.9
+        Surface "plastic"
+        Translate 1.1 1.2 7
+        Rotate -90 1 0 0
+        Cylinder 0.55 -0.85 0.85 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.25 0.8 0.35
+        Surface "plastic"
+        Translate 3.4 0.35 7
+        Rotate -90 1 0 0
+        Cone 1.7 0.75 360
+    AttributeEnd
+
+    # Bottom row: paraboloid, hyperboloid, disk, partial sphere via ConcatTransform
+    AttributeBegin
+        Color 0.7 0.3 0.85
+        Surface "plastic"
+        Translate -3.4 -1.6 7
+        Rotate -90 1 0 0
+        Paraboloid 0.8 0 1.5 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.9 0.45 0.6
+        Surface "metal" "roughness" [0.15]
+        Translate -1.1 -1.1 7
+        Rotate -90 1 0 0
+        Hyperboloid 0.7 0 -0.6 0.35 0.35 0.6 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.85 0.85 0.9
+        Surface "metal" "roughness" [0.05]
+        Translate 1.1 -1.1 7
+        Rotate -65 1 0 0
+        Disk 0 0.8 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.3 0.85 0.8
+        Surface "plastic"
+        ConcatTransform [1 0 0 0  0 1 0 0  0 0 1 0  3.4 -1.1 7 1]
+        Sphere 0.8 -0.8 0.8 270
+    AttributeEnd
+
+    # Ground: a big polygon quad
+    AttributeBegin
+        Color 0.75 0.75 0.75
+        Surface "matte"
+        Polygon "P" [-12 -2.2 0.5  12 -2.2 0.5  12 -2.2 18  -12 -2.2 18]
+    AttributeEnd
+WorldEnd

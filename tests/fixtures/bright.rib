@@ -1,0 +1,38 @@
+Display "bright.ppm" "file" "rgb"
+Format 640 480 1.0
+Projection "perspective" "fov" [50]
+
+WorldBegin
+    # Bright red sphere - higher ka for more ambient light
+    TransformBegin
+        Color 1 0 0
+        Surface "matte"
+        Translate -2 0 6
+        Sphere 1 -1 1 360
+    TransformEnd
+
+    # Bright green cylinder
+    TransformBegin
+        Color 0 1 0
+        Surface "plastic"
+        Translate 0 0 6
+        Cylinder 0.8 -1.5 1.5 360
+    TransformEnd
+
+    # Bright blue cone
+    TransformBegin
+        Color 0.3 0.3 1
+        Surface "metal"
+        Translate 2 0 6
+        Rotate -90 1 0 0
+        Cone 2 0.8 360
+    TransformEnd
+
+    # Yellow accent sphere
+    TransformBegin
+        Color 1 1 0.2
+        Surface "plastic"
+        Translate 0 1.5 5
+        Sphere 0.6 -0.6 0.6 360
+    TransformEnd
+WorldEnd

@@ -1,0 +1,391 @@
+Display "many.ppm" "file" "rgb"
+Format 1920 1080 1.0
+PixelSamples 2 2
+Projection "perspective" "fov" [45]
+WorldBegin
+    LightSource "distantlight" 1 "from" [5 10 -10] "to" [0 0 0] "intensity" [0.8]
+    AttributeBegin
+        Color 0.200 0.200 0.200
+        Surface "matte"
+        Translate -3.85 -3.85 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.505 0.748 0.325
+        Surface "plastic"
+        Translate -2.75 -3.85 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.810 0.497 0.451
+        Surface "metal"
+        Translate -1.65 -3.85 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.315 0.245 0.576
+        Surface "matte"
+        Translate -0.55 -3.85 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.621 0.793 0.701
+        Surface "plastic"
+        Translate 0.55 -3.85 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.926 0.542 0.827
+        Surface "metal"
+        Translate 1.65 -3.85 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.431 0.290 0.952
+        Surface "matte"
+        Translate 2.75 -3.85 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.736 0.838 0.277
+        Surface "plastic"
+        Translate 3.85 -3.85 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.241 0.587 0.402
+        Surface "metal"
+        Translate -3.85 -2.75 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.546 0.335 0.528
+        Surface "matte"
+        Translate -2.75 -2.75 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.852 0.883 0.653
+        Surface "plastic"
+        Translate -1.65 -2.75 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.357 0.631 0.778
+        Surface "metal"
+        Translate -0.55 -2.75 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.662 0.380 0.904
+        Surface "matte"
+        Translate 0.55 -2.75 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.967 0.928 0.229
+        Surface "plastic"
+        Translate 1.65 -2.75 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.472 0.676 0.354
+        Surface "metal"
+        Translate 2.75 -2.75 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.777 0.425 0.480
+        Surface "matte"
+        Translate 3.85 -2.75 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.282 0.973 0.605
+        Surface "plastic"
+        Translate -3.85 -1.65 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.588 0.721 0.730
+        Surface "metal"
+        Translate -2.75 -1.65 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.893 0.470 0.855
+        Surface "matte"
+        Translate -1.65 -1.65 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.398 0.218 0.981
+        Surface "plastic"
+        Translate -0.55 -1.65 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.703 0.766 0.306
+        Surface "metal"
+        Translate 0.55 -1.65 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.208 0.515 0.431
+        Surface "matte"
+        Translate 1.65 -1.65 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.513 0.263 0.557
+        Surface "plastic"
+        Translate 2.75 -1.65 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.819 0.811 0.682
+        Surface "metal"
+        Translate 3.85 -1.65 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.324 0.560 0.807
+        Surface "matte"
+        Translate -3.85 -0.55 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.629 0.308 0.933
+        Surface "plastic"
+        Translate -2.75 -0.55 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.934 0.856 0.258
+        Surface "metal"
+        Translate -1.65 -0.55 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.439 0.604 0.383
+        Surface "matte"
+        Translate -0.55 -0.55 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.744 0.353 0.508
+        Surface "plastic"
+        Translate 0.55 -0.55 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.249 0.901 0.634
+        Surface "metal"
+        Translate 1.65 -0.55 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.555 0.649 0.759
+        Surface "matte"
+        Translate 2.75 -0.55 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.860 0.398 0.884
+        Surface "plastic"
+        Translate 3.85 -0.55 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.365 0.946 0.210
+        Surface "metal"
+        Translate -3.85 0.55 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.670 0.694 0.335
+        Surface "matte"
+        Translate -2.75 0.55 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.975 0.443 0.460
+        Surface "plastic"
+        Translate -1.65 0.55 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.480 0.991 0.586
+        Surface "metal"
+        Translate -0.55 0.55 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.786 0.739 0.711
+        Surface "matte"
+        Translate 0.55 0.55 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.291 0.488 0.836
+        Surface "plastic"
+        Translate 1.65 0.55 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.596 0.236 0.961
+        Surface "metal"
+        Translate 2.75 0.55 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.901 0.784 0.287
+        Surface "matte"
+        Translate 3.85 0.55 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.406 0.533 0.412
+        Surface "plastic"
+        Translate -3.85 1.65 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.711 0.281 0.537
+        Surface "metal"
+        Translate -2.75 1.65 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.216 0.829 0.663
+        Surface "matte"
+        Translate -1.65 1.65 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.522 0.578 0.788
+        Surface "plastic"
+        Translate -0.55 1.65 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.827 0.326 0.913
+        Surface "metal"
+        Translate 0.55 1.65 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.332 0.874 0.239
+        Surface "matte"
+        Translate 1.65 1.65 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.637 0.622 0.364
+        Surface "plastic"
+        Translate 2.75 1.65 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.942 0.371 0.489
+        Surface "metal"
+        Translate 3.85 1.65 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.447 0.919 0.614
+        Surface "matte"
+        Translate -3.85 2.75 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.753 0.667 0.740
+        Surface "plastic"
+        Translate -2.75 2.75 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.258 0.416 0.865
+        Surface "metal"
+        Translate -1.65 2.75 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.563 0.964 0.990
+        Surface "matte"
+        Translate -0.55 2.75 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.868 0.712 0.316
+        Surface "plastic"
+        Translate 0.55 2.75 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.373 0.461 0.441
+        Surface "metal"
+        Translate 1.65 2.75 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.678 0.209 0.566
+        Surface "matte"
+        Translate 2.75 2.75 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.984 0.757 0.692
+        Surface "plastic"
+        Translate 3.85 2.75 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.489 0.506 0.817
+        Surface "metal"
+        Translate -3.85 3.85 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.794 0.254 0.942
+        Surface "matte"
+        Translate -2.75 3.85 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.299 0.802 0.267
+        Surface "plastic"
+        Translate -1.65 3.85 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.604 0.551 0.393
+        Surface "metal"
+        Translate -0.55 3.85 9.80
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.909 0.299 0.518
+        Surface "matte"
+        Translate 0.55 3.85 10.60
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.414 0.847 0.643
+        Surface "plastic"
+        Translate 1.65 3.85 9.40
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.720 0.596 0.769
+        Surface "metal"
+        Translate 2.75 3.85 10.20
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+    AttributeBegin
+        Color 0.225 0.344 0.894
+        Surface "matte"
+        Translate 3.85 3.85 9.00
+        Sphere 0.45 -0.45 0.45 360
+    AttributeEnd
+WorldEnd

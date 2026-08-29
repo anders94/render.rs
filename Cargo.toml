@@ -1,0 +1,53 @@
+[package]
+name = "render-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["render.rs contributors"]
+description = "A RenderMan RIB renderer implemented in Rust"
+license = "MIT"
+
+[[bin]]
+name = "render"
+path = "src/main.rs"
+
+[features]
+default = []
+# GPU rendering on Apple Silicon via MLX. First build compiles MLX's C++
+# core with cmake (requires cmake + Xcode command line tools).
+mlx = ["dep:mlx-rs"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+image = "0.25"
+nom = "7.1"
+anyhow = "1.0"
+thiserror = "1.0"
+mlx-rs = { version = "0.25", optional = true }
+
+# Native Metal GPU backend: always available on macOS (pure bindings, fast
+# build), gated by target_os rather than a feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSError",
+] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLComputePipeline",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLTypes",
+    "MTLAllocation",
+] }
+
+[dev-dependencies]
+approx = "0.5"

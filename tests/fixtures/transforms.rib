@@ -1,0 +1,46 @@
+Display "transforms.ppm" "file" "rgb"
+Format 800 600 1.0
+Projection "perspective" "fov" [60]
+
+WorldBegin
+    # Floor - scaled and translated cylinder
+    TransformBegin
+        Color 0.5 0.5 0.5
+        Surface "matte"
+        Translate 0 -2 10
+        Scale 10 1 10
+        Cylinder 0.5 -0.1 0.1 360
+    TransformEnd
+
+    # Red sphere - translated
+    TransformBegin
+        Color 1 0 0
+        Translate -3 1 8
+        Sphere 0.8 -0.8 0.8 360
+    TransformEnd
+
+    # Green cone - rotated and translated
+    TransformBegin
+        Color 0 1 0
+        Translate 0 0 8
+        Rotate -90 1 0 0
+        Scale 1.5 1.5 1.5
+        Cone 1.5 0.8 360
+    TransformEnd
+
+    # Blue cylinder - rotated 45 degrees
+    TransformBegin
+        Color 0 0.5 1
+        Translate 3 0 8
+        Rotate 45 0 0 1
+        Cylinder 0.6 -1.2 1.2 360
+    TransformEnd
+
+    # Yellow sphere - small and high
+    TransformBegin
+        Color 1 1 0
+        Surface "plastic"
+        Translate 0 2.5 7
+        Sphere 0.5 -0.5 0.5 360
+    TransformEnd
+WorldEnd
