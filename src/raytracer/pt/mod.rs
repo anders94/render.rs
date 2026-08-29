@@ -44,10 +44,7 @@ pub fn render(scene: &Scene, spp: u32) -> Image {
                     let mut sum = Vec3::zero();
                     for s in 0..spp {
                         let mut rng = Pcg32::for_pixel_sample(pixel_index, s as u64);
-                        let (jx, jy) = rng.next_2d();
-                        let ray = scene
-                            .camera
-                            .generate_ray(x as f64 + jx, y as f64 + jy);
+                        let ray = camera_ray(scene, x, y, &mut rng);
                         let mut l = trace(scene, ray, pixel_spread, &mut rng);
                         let lum = luminance(&l);
                         if lum > FIREFLY_CLAMP {
@@ -60,6 +57,83 @@ pub fn render(scene: &Scene, spp: u32) -> Image {
                 .collect()
         })
         .collect()
+}
+
+/// Adaptive sampling (roadmap Phase 7): each pixel keeps sampling until
+/// its 95% confidence interval, relative to its luminance, drops below
+/// `tolerance` — or `max_spp` is reached. Convergence is checked every 16
+/// samples after a 32-sample warmup (Welford online variance). Returns
+/// the image and the average samples actually taken per pixel.
+pub fn render_adaptive(scene: &Scene, max_spp: u32, tolerance: f64) -> (Image, f64) {
+    let width = scene.camera.width as usize;
+    let height = scene.camera.height as usize;
+    let pixel_spread =
+        (scene.camera.fov.to_radians() / 2.0).tan() * 2.0 / scene.camera.height as f64;
+    const WARMUP: u32 = 32;
+    const CHECK_EVERY: u32 = 16;
+
+    let rows: Vec<(Vec<Vec3>, u64)> = (0..height)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = Vec::with_capacity(width);
+            let mut taken = 0u64;
+            for x in 0..width {
+                let pixel_index = (y * width + x) as u64;
+                let mut mean = Vec3::zero();
+                let mut m2 = 0.0f64; // luminance variance accumulator
+                let mut lum_mean = 0.0f64;
+                let mut n = 0u32;
+                while n < max_spp.max(1) {
+                    let mut rng = Pcg32::for_pixel_sample(pixel_index, n as u64);
+                    let ray = camera_ray(scene, x, y, &mut rng);
+                    let mut l = trace(scene, ray, pixel_spread, &mut rng);
+                    let lum = luminance(&l);
+                    if lum > FIREFLY_CLAMP {
+                        l = l * (FIREFLY_CLAMP / lum);
+                    }
+                    n += 1;
+                    let lum = luminance(&l);
+                    let delta = lum - lum_mean;
+                    lum_mean += delta / n as f64;
+                    m2 += delta * (lum - lum_mean);
+                    mean = mean + (l - mean) / n as f64;
+                    if n >= WARMUP && n % CHECK_EVERY == 0 {
+                        let var = m2 / (n as f64 - 1.0);
+                        let ci = 1.96 * (var / n as f64).sqrt();
+                        if ci < tolerance * lum_mean.max(0.05) {
+                            break;
+                        }
+                    }
+                }
+                taken += n as u64;
+                row.push(mean);
+            }
+            (row, taken)
+        })
+        .collect();
+
+    let total: u64 = rows.iter().map(|(_, t)| t).sum();
+    let avg = total as f64 / (width * height) as f64;
+    (rows.into_iter().map(|(row, _)| row).collect(), avg)
+}
+
+/// One camera ray: filter-importance-sampled subpixel position, thin-lens
+/// aperture sample when DoF is on, shutter time when the scene moves.
+fn camera_ray(scene: &Scene, x: usize, y: usize, rng: &mut Pcg32) -> Ray {
+    let (u1, u2) = rng.next_2d();
+    let (dx, dy) = scene.camera.filter.sample(u1, u2);
+    let (px, py) = (x as f64 + 0.5 + dx, y as f64 + 0.5 + dy);
+    let (lu, lv) = if scene.camera.lens_radius > 0.0 {
+        rng.next_2d()
+    } else {
+        (0.5, 0.5)
+    };
+    let ray = scene.camera.generate_ray_lens(px, py, lu, lv);
+    if scene.has_motion {
+        ray.with_time(rng.next_f64())
+    } else {
+        ray
+    }
 }
 
 fn luminance(c: &Vec3) -> f64 {
@@ -154,7 +228,8 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
         let presence = pbr.presence.clamp(0.0, 1.0);
         if presence < 1.0 && rng.next_f64() >= presence && presence_skips < MAX_PRESENCE_SKIPS {
             presence_skips += 1;
-            ray = Ray::new(hit.point + ray.direction.normalize() * RAY_OFFSET, ray.direction);
+            ray = Ray::new(hit.point + ray.direction.normalize() * RAY_OFFSET, ray.direction)
+                .with_time(ray.time);
             continue;
         }
 
@@ -198,6 +273,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                 &wo_l,
                 &pbr,
                 eta_rel,
+                ray.time,
                 rng,
             );
             l = l + beta * contribution * num_lights;
@@ -217,7 +293,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
         cone_spread += (1.0 / (1.0 + s.pdf)).min(0.4);
 
         let offset = if s.transmitted { -RAY_OFFSET } else { RAY_OFFSET };
-        ray = Ray::new(hit.point + n * offset, wi_world);
+        ray = Ray::new(hit.point + n * offset, wi_world).with_time(ray.time);
         depth += 1;
 
         // Russian roulette.
@@ -276,6 +352,7 @@ fn sample_light(
     wo_l: &Vec3,
     pbr: &PbrParams,
     eta_rel: f64,
+    time: f64,
     rng: &mut Pcg32,
 ) -> Vec3 {
     let n = frame.to_world(&Vec3::new(0.0, 0.0, 1.0));
@@ -296,7 +373,7 @@ fn sample_light(
             if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            let vis = visibility_to(scene, p, &n, position);
+            let vis = visibility_to(scene, p, &n, position, time);
             if vis <= 0.0 {
                 return Vec3::zero();
             }
@@ -324,7 +401,7 @@ fn sample_light(
             if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            let vis = visibility_toward(scene, p, &n, &wi);
+            let vis = visibility_toward(scene, p, &n, &wi, time);
             if vis <= 0.0 {
                 return Vec3::zero();
             }
@@ -342,6 +419,7 @@ fn sample_light(
             let sample_point = *corner + *edge1 * u + *edge2 * v;
             area_light_contribution(
                 scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, pbr, eta_rel,
+                time,
             )
         }
         LightType::DiskArea { center, e1, e2, normal, area } => {
@@ -352,6 +430,7 @@ fn sample_light(
             let sample_point = *center + *e1 * (r * phi.cos()) + *e2 * (r * phi.sin());
             area_light_contribution(
                 scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, pbr, eta_rel,
+                time,
             )
         }
         LightType::SphereArea { center, radius } => {
@@ -376,7 +455,7 @@ fn sample_light(
             let dist = dist2.sqrt() * cos_t
                 - (radius * radius - dist2 * sin_t * sin_t).max(0.0).sqrt();
             let target = *p + wi * dist;
-            let vis = visibility_to(scene, p, &n, &target);
+            let vis = visibility_to(scene, p, &n, &target, time);
             if vis <= 0.0 {
                 return Vec3::zero();
             }
@@ -410,7 +489,7 @@ fn sample_light(
             if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            let vis = visibility_toward(scene, p, &n, &wi);
+            let vis = visibility_toward(scene, p, &n, &wi, time);
             if vis <= 0.0 {
                 return Vec3::zero();
             }
@@ -433,6 +512,7 @@ fn area_light_contribution(
     wo_l: &Vec3,
     pbr: &PbrParams,
     eta_rel: f64,
+    time: f64,
 ) -> Vec3 {
     let to_light = *sample_point - *p;
     let dist2 = to_light.length_squared().max(1e-12);
@@ -449,7 +529,7 @@ fn area_light_contribution(
     if max_component(&f) <= 0.0 {
         return Vec3::zero();
     }
-    let vis = visibility_to(scene, p, n, sample_point);
+    let vis = visibility_to(scene, p, n, sample_point, time);
     if vis <= 0.0 {
         return Vec3::zero();
     }
@@ -459,22 +539,28 @@ fn area_light_contribution(
 }
 
 /// Fractional visibility toward a point (presence cutouts attenuate).
-fn visibility_to(scene: &Scene, p: &Point3, n: &Vec3, target: &Point3) -> f64 {
+fn visibility_to(scene: &Scene, p: &Point3, n: &Vec3, target: &Point3, time: f64) -> f64 {
     let dir = *target - *p;
     let dist = dir.length();
-    transmittance(scene, *p + *n * RAY_OFFSET, dir.normalize(), dist - 1e-3)
+    transmittance(scene, *p + *n * RAY_OFFSET, dir.normalize(), dist - 1e-3, time)
 }
 
-fn visibility_toward(scene: &Scene, p: &Point3, n: &Vec3, wi: &Vec3) -> f64 {
-    transmittance(scene, *p + *n * RAY_OFFSET, *wi, f64::INFINITY)
+fn visibility_toward(scene: &Scene, p: &Point3, n: &Vec3, wi: &Vec3, time: f64) -> f64 {
+    transmittance(scene, *p + *n * RAY_OFFSET, *wi, f64::INFINITY, time)
 }
 
 /// Walks blockers along a shadow ray; opaque surfaces kill it, presence
 /// cutouts multiply through.
-fn transmittance(scene: &Scene, mut origin: Point3, dir: Vec3, mut remaining: f64) -> f64 {
+fn transmittance(
+    scene: &Scene,
+    mut origin: Point3,
+    dir: Vec3,
+    mut remaining: f64,
+    time: f64,
+) -> f64 {
     let mut vis = 1.0;
     for _ in 0..MAX_PRESENCE_SKIPS {
-        let ray = Ray::new(origin, dir);
+        let ray = Ray::new(origin, dir).with_time(time);
         let Some(hit) = scene.intersect(&ray) else {
             return vis;
         };

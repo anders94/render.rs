@@ -187,6 +187,62 @@ fn textured_patterns_statistical_parity() {
 }
 
 #[test]
+fn motion_dof_statistical_parity() {
+    // Phase 7: transform + deformation motion blur with thin-lens DoF and
+    // a gaussian pixel filter, CPU vs Metal.
+    let scene_rib = r#"
+        Format 96 96 1.0
+        Projection "perspective" "fov" [40]
+        Shutter 0 1
+        DepthOfField 4 0.8 7
+        PixelFilter "gaussian" 2 2
+        Option "background" "color" [0.35 0.45 0.65]
+        WorldBegin
+            LightSource "distantlight" "sun" "from" [4 8 -6] "to" [0 0 6] "intensity" [1.2]
+            AttributeBegin
+                Color 0.7 0.7 0.7
+                Polygon "P" [-30 -1.2 -5  30 -1.2 -5  30 -1.2 40  -30 -1.2 40]
+            AttributeEnd
+            AttributeBegin
+                Color 0.85 0.3 0.2
+                MotionBegin [0 1]
+                    Translate -1.6 -0.4 7
+                    Translate 0.4 -0.4 7
+                MotionEnd
+                Rotate 20 0 1 0
+                Scale 0.6 0.6 0.6
+                PointsPolygons [4 4 4 4 4 4]
+                    [0 1 2 3  5 4 7 6  4 0 3 7  1 5 6 2  3 2 6 7  4 5 1 0]
+                    "P" [-1 -1 -1  1 -1 -1  1 1 -1  -1 1 -1
+                         -1 -1 1  1 -1 1  1 1 1  -1 1 1]
+            AttributeEnd
+            AttributeBegin
+                Color 0.2 0.5 0.85
+                Translate 1.6 -0.2 8
+                MotionBegin [0 1]
+                    PointsPolygons [4] [0 1 2 3] "P" [-0.8 -0.8 0  0.8 -0.8 0  0.8 0.8 0  -0.8 0.8 0]
+                    PointsPolygons [4] [0 1 2 3] "P" [-0.8 -0.8 0  0.8 -0.8 0  1.6 1.6 0  -1.6 1.6 0]
+                MotionEnd
+            AttributeEnd
+        WorldEnd
+    "#;
+    let requests = render_rs::parser::parse_rib(scene_rib).unwrap();
+    let scene = render_rs::parser::SceneBuilder::new().build(&requests).unwrap();
+    assert!(scene.has_motion);
+    assert!(scene.camera.lens_radius > 0.0);
+
+    let cpu = pt::render(&scene, 192);
+    let gpu = metal::render_pt(&scene, 192).unwrap();
+    let mc = image_mean(&cpu);
+    let mg = image_mean(&gpu);
+    let rel = ((mc.x - mg.x).abs() + (mc.y - mg.y).abs() + (mc.z - mg.z).abs())
+        / (mc.x + mc.y + mc.z).max(0.05);
+    assert!(rel < 0.04, "motion scene mean mismatch: {mc:?} vs {mg:?} (rel {rel:.4})");
+    let e = rmse(&cpu, &gpu);
+    assert!(e < 0.12, "motion scene RMSE {e:.4}");
+}
+
+#[test]
 fn metal_pt_deterministic() {
     let scene = load_fixture_scene("cornell.rib", 64, 64);
     let a = metal::render_pt(&scene, 16).unwrap();

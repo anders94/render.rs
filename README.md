@@ -238,7 +238,7 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 ## Known Limitations
 
-1. **Camera positioning** - Camera is currently fixed at origin looking down +Z axis. Use object translations instead.
+1. **Camera** - Fixed at origin looking down +Z (use object/world transforms); perspective and orthographic projections, thin-lens depth of field (`DepthOfField`), motion blur (`MotionBegin`/`Shutter` — transform motion on any instanced geometry plus PointsPolygons deformation), box/triangle/gaussian pixel filters, and adaptive sampling (`--adaptive <tol>` on the CPU path tracer).
 
 2. **Missing primitives** - Curves (hair) and Points are on the roadmap (see ROADMAP.md); implemented: all seven RiSpec quadrics, Polygon/GeneralPolygon (ear-clipped holes), PointsPolygons meshes with SAH BVH + TLAS instancing, Catmull-Clark SubdivisionMesh with creases, bilinear/bicubic PatchMesh with basis matrices, NURBS NuPatch, and fBm displacement at dice time (`Displace "noise"`). COMPLIANCE.md tracks the full RIB request matrix.
 

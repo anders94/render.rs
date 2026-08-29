@@ -18,6 +18,9 @@ pub struct Mesh {
     pub normals: Option<Vec<[f32; 3]>>,
     /// Optional per-vertex texture coordinates (carried for later phases).
     pub st: Option<Vec<[f32; 2]>>,
+    /// Deformation-blur endpoint: positions at shutter close (same
+    /// topology). BLAS bounds cover both endpoints.
+    pub positions1: Option<Vec<[f32; 3]>>,
     pub blas: Bvh,
     pub local_bounds: Aabb,
 }
@@ -29,18 +32,39 @@ impl Mesh {
         normals: Option<Vec<[f32; 3]>>,
         st: Option<Vec<[f32; 2]>>,
     ) -> Self {
+        Self::with_motion(positions, indices, normals, st, None)
+    }
+
+    /// Mesh with an optional deformation endpoint (positions at shutter
+    /// close); triangle bounds grow to cover both endpoints.
+    pub fn with_motion(
+        positions: Vec<[f32; 3]>,
+        indices: Vec<u32>,
+        normals: Option<Vec<[f32; 3]>>,
+        st: Option<Vec<[f32; 2]>>,
+        positions1: Option<Vec<[f32; 3]>>,
+    ) -> Self {
+        let positions1 = positions1.filter(|p| p.len() == positions.len());
         let tri_count = indices.len() / 3;
-        let point = |i: u32| {
-            let p = positions[i as usize];
+        let point = |buf: &[[f32; 3]], i: u32| {
+            let p = buf[i as usize];
             Point3::new(p[0] as f64, p[1] as f64, p[2] as f64)
         };
         let bounds: Vec<Aabb> = (0..tri_count)
             .map(|t| {
-                Aabb::from_points([
-                    point(indices[t * 3]),
-                    point(indices[t * 3 + 1]),
-                    point(indices[t * 3 + 2]),
-                ])
+                let mut b = Aabb::from_points([
+                    point(&positions, indices[t * 3]),
+                    point(&positions, indices[t * 3 + 1]),
+                    point(&positions, indices[t * 3 + 2]),
+                ]);
+                if let Some(p1) = &positions1 {
+                    b.grow(&Aabb::from_points([
+                        point(p1, indices[t * 3]),
+                        point(p1, indices[t * 3 + 1]),
+                        point(p1, indices[t * 3 + 2]),
+                    ]));
+                }
+                b
             })
             .collect();
         let mut local_bounds = Aabb::empty();
@@ -48,7 +72,7 @@ impl Mesh {
             local_bounds.grow(b);
         }
         let blas = Bvh::build(&bounds);
-        Self { positions, indices, normals, st, blas, local_bounds }
+        Self { positions, indices, normals, st, positions1, blas, local_bounds }
     }
 
     pub fn triangle_count(&self) -> usize {
@@ -61,6 +85,23 @@ impl Mesh {
         Point3::new(p[0] as f64, p[1] as f64, p[2] as f64)
     }
 
+    /// Vertex at shutter time (lerped when a deformation endpoint exists).
+    #[inline]
+    fn vertex_at(&self, i: u32, time: f64) -> Point3 {
+        match &self.positions1 {
+            Some(p1) if time > 0.0 => {
+                let a = self.positions[i as usize];
+                let b = p1[i as usize];
+                Point3::new(
+                    a[0] as f64 + (b[0] as f64 - a[0] as f64) * time,
+                    a[1] as f64 + (b[1] as f64 - a[1] as f64) * time,
+                    a[2] as f64 + (b[2] as f64 - a[2] as f64) * time,
+                )
+            }
+            _ => self.vertex(i),
+        }
+    }
+
     /// Möller–Trumbore against triangle `tri`, in mesh-local space, with
     /// the parametric t measured along the (unnormalized) ray direction.
     /// (A watertight Woop test replaces this alongside the f32/GPU port.)
@@ -69,9 +110,9 @@ impl Mesh {
         let i0 = self.indices[tri as usize * 3];
         let i1 = self.indices[tri as usize * 3 + 1];
         let i2 = self.indices[tri as usize * 3 + 2];
-        let v0 = self.vertex(i0);
-        let e1 = self.vertex(i1) - v0;
-        let e2 = self.vertex(i2) - v0;
+        let v0 = self.vertex_at(i0, ray.time);
+        let e1 = self.vertex_at(i1, ray.time) - v0;
+        let e2 = self.vertex_at(i2, ray.time) - v0;
         let p = ray.direction.cross(&e2);
         let det = e1.dot(&p);
         if det.abs() < 1e-14 {
@@ -116,22 +157,26 @@ impl Mesh {
         Some(([s, t], density))
     }
 
-    /// Interpolated (or geometric) local-space normal for a hit.
-    fn local_normal(&self, tri: u32, u: f64, v: f64) -> Vec3 {
+    /// Interpolated (or geometric, at shutter time) local-space normal.
+    fn local_normal(&self, tri: u32, u: f64, v: f64, time: f64) -> Vec3 {
         let i0 = self.indices[tri as usize * 3] as usize;
         let i1 = self.indices[tri as usize * 3 + 1] as usize;
         let i2 = self.indices[tri as usize * 3 + 2] as usize;
-        if let Some(normals) = &self.normals {
-            let n = |i: usize| {
-                let n = normals[i];
-                Vec3::new(n[0] as f64, n[1] as f64, n[2] as f64)
-            };
-            let w = 1.0 - u - v;
-            return (n(i0) * w + n(i1) * u + n(i2) * v).normalize();
+        // Vertex normals are authored for the rest pose; a deforming mesh
+        // falls back to the time-correct geometric normal.
+        if self.positions1.is_none() {
+            if let Some(normals) = &self.normals {
+                let n = |i: usize| {
+                    let n = normals[i];
+                    Vec3::new(n[0] as f64, n[1] as f64, n[2] as f64)
+                };
+                let w = 1.0 - u - v;
+                return (n(i0) * w + n(i1) * u + n(i2) * v).normalize();
+            }
         }
-        let v0 = self.vertex(self.indices[tri as usize * 3]);
-        let e1 = self.vertex(self.indices[tri as usize * 3 + 1]) - v0;
-        let e2 = self.vertex(self.indices[tri as usize * 3 + 2]) - v0;
+        let v0 = self.vertex_at(i0 as u32, time);
+        let e1 = self.vertex_at(i1 as u32, time) - v0;
+        let e2 = self.vertex_at(i2 as u32, time) - v0;
         e1.cross(&e2).normalize()
     }
 }
@@ -142,6 +187,10 @@ pub struct Instance {
     pub material_id: usize,
     pub transform: Matrix4,
     pub inverse: Matrix4,
+    /// Transform-motion endpoint (shutter close); world bounds cover both.
+    /// Interpolation is component-wise, fine for the small per-frame
+    /// rotations shutters actually see.
+    pub transform1: Option<Matrix4>,
     pub world_bounds: Aabb,
     /// Isotropic length scale of the transform (for st-density transfer
     /// from local to world space).
@@ -150,32 +199,60 @@ pub struct Instance {
 
 impl Instance {
     pub fn new(mesh_id: u32, material_id: usize, transform: Matrix4, mesh: &Mesh) -> Self {
+        Self::with_motion(mesh_id, material_id, transform, None, mesh)
+    }
+
+    pub fn with_motion(
+        mesh_id: u32,
+        material_id: usize,
+        transform: Matrix4,
+        transform1: Option<Matrix4>,
+        mesh: &Mesh,
+    ) -> Self {
         let inverse = transform.inverse().unwrap_or(Matrix4::identity());
-        // World bounds from the 8 transformed corners of the local box.
+        // World bounds from the 8 transformed corners of the local box, at
+        // both shutter endpoints when moving.
         let lb = &mesh.local_bounds;
         let mut world_bounds = Aabb::empty();
-        for i in 0..8 {
-            let corner = Point3::new(
-                if i & 1 == 0 { lb.min.x } else { lb.max.x },
-                if i & 2 == 0 { lb.min.y } else { lb.max.y },
-                if i & 4 == 0 { lb.min.z } else { lb.max.z },
-            );
-            let w = transform.transform_point(&corner);
-            world_bounds.grow_point(&Vec3::new(w.x, w.y, w.z));
+        for xf in std::iter::once(&transform).chain(transform1.iter()) {
+            for i in 0..8 {
+                let corner = Point3::new(
+                    if i & 1 == 0 { lb.min.x } else { lb.max.x },
+                    if i & 2 == 0 { lb.min.y } else { lb.max.y },
+                    if i & 4 == 0 { lb.min.z } else { lb.max.z },
+                );
+                let w = xf.transform_point(&corner);
+                world_bounds.grow_point(&Vec3::new(w.x, w.y, w.z));
+            }
         }
         let scale = transform.approx_scale();
-        Self { mesh_id, material_id, transform, inverse, world_bounds, scale }
+        Self { mesh_id, material_id, transform, inverse, transform1, world_bounds, scale }
+    }
+
+    /// (forward, inverse) at shutter time.
+    #[inline]
+    fn transforms_at(&self, time: f64) -> (Matrix4, Matrix4) {
+        match &self.transform1 {
+            Some(t1) if time > 0.0 => {
+                let fwd = self.transform.lerp(t1, time);
+                let inv = fwd.inverse().unwrap_or(Matrix4::identity());
+                (fwd, inv)
+            }
+            _ => (self.transform, self.inverse),
+        }
     }
 
     /// Closest hit in *parametric* t (along the world ray direction).
     pub fn intersect(&self, meshes: &[Mesh], world_ray: &Ray, t_max: f64) -> Option<MeshHit> {
         let mesh = &meshes[self.mesh_id as usize];
+        let (_, inverse) = self.transforms_at(world_ray.time);
         // Affine transform WITHOUT normalizing the direction keeps the
         // parametric t identical in local and world space (Ray::new would
         // normalize, so construct the struct directly).
         let local_ray = Ray {
-            origin: self.inverse.transform_point(&world_ray.origin),
-            direction: self.inverse.transform_vec(&world_ray.direction),
+            origin: inverse.transform_point(&world_ray.origin),
+            direction: inverse.transform_vec(&world_ray.direction),
+            time: world_ray.time,
         };
         let mut hit_uv = (0.0, 0.0);
         let (tri, t) = mesh.blas.traverse(&local_ray, t_max, |tri, cur_max| {
@@ -185,8 +262,8 @@ impl Instance {
             })
         })?;
         // hit_uv holds the uv of the LAST accepted (i.e. winning) triangle.
-        let local_n = mesh.local_normal(tri, hit_uv.0, hit_uv.1);
-        let world_n = self.inverse.transform_normal(&local_n).normalize();
+        let local_n = mesh.local_normal(tri, hit_uv.0, hit_uv.1, world_ray.time);
+        let world_n = inverse.transform_normal(&local_n).normalize();
         let (st, st_density) = mesh
             .st_at(tri, hit_uv.0, hit_uv.1)
             .map(|(st, d)| (st, d / self.scale))
@@ -197,9 +274,11 @@ impl Instance {
     /// Any hit strictly before parametric `t_limit`.
     pub fn occludes(&self, meshes: &[Mesh], world_ray: &Ray, t_limit: f64) -> bool {
         let mesh = &meshes[self.mesh_id as usize];
+        let (_, inverse) = self.transforms_at(world_ray.time);
         let local_ray = Ray {
-            origin: self.inverse.transform_point(&world_ray.origin),
-            direction: self.inverse.transform_vec(&world_ray.direction),
+            origin: inverse.transform_point(&world_ray.origin),
+            direction: inverse.transform_vec(&world_ray.direction),
+            time: world_ray.time,
         };
         mesh.blas.any_hit(&local_ray, t_limit, |tri, lim| {
             mesh.intersect_triangle(&local_ray, tri, lim).is_some()

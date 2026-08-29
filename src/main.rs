@@ -55,6 +55,12 @@ struct Args {
     /// product from the RIB, or 64 if unset there)
     #[arg(long)]
     spp: Option<u32>,
+
+    /// Adaptive sampling tolerance (CPU path integrator only): pixels stop
+    /// once their 95% CI relative error drops below this; --spp caps the
+    /// budget. Try 0.02.
+    #[arg(long)]
+    adaptive: Option<f64>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, clap::ValueEnum)]
@@ -143,8 +149,15 @@ fn main() -> Result<()> {
                 let (sx, sy) = scene.pixel_samples;
                 (sx * sy).max(64)
             });
-            println!("Path tracing at {spp} spp...");
-            render_rs::raytracer::pt::render(&scene, spp)
+            if let Some(tol) = args.adaptive {
+                println!("Adaptive path tracing (tol {tol}, max {spp} spp)...");
+                let (image, avg) = render_rs::raytracer::pt::render_adaptive(&scene, spp, tol);
+                println!("Adaptive sampling averaged {avg:.1} spp");
+                image
+            } else {
+                println!("Path tracing at {spp} spp...");
+                render_rs::raytracer::pt::render(&scene, spp)
+            }
         }
         (Integrator::Path, Backend::Metal) => {
             let spp = args.spp.unwrap_or_else(|| {

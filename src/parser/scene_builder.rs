@@ -47,6 +47,10 @@ struct GraphicsState {
     bxdf_bindings: Vec<(BoundField, u32)>,
     /// Displacement applied to tessellated geometry (Displace request).
     displace: Option<DisplaceParams>,
+    /// Transform-motion endpoints from a MotionBegin block: the composed
+    /// transform at shutter open / close when the block closed.
+    motion_t0: Option<Matrix4>,
+    motion_t1: Option<Matrix4>,
     basis_u: (Basis4, usize),
     basis_v: (Basis4, usize),
 }
@@ -65,6 +69,8 @@ impl Default for GraphicsState {
             bxdf: None,
             bxdf_bindings: Vec::new(),
             displace: None,
+            motion_t0: None,
+            motion_t1: None,
             basis_u: (BEZIER, 3),
             basis_v: (BEZIER, 3),
         }
@@ -94,6 +100,12 @@ pub struct SceneBuilder {
     width: u32,
     height: u32,
     fov: f64,
+    projection: Projection,
+    /// DepthOfField positional args: (fstop, focallength, focaldistance).
+    depth_of_field: Option<(f64, f64, f64)>,
+    pixel_filter: PixelFilter,
+    shutter: (f64, f64),
+    screen_window: Option<(f64, f64, f64, f64)>,
     pixel_samples: (u32, u32),
     state: GraphicsState,
     attribute_stack: Vec<GraphicsState>,
@@ -106,7 +118,10 @@ pub struct SceneBuilder {
     passthrough: HashMap<String, Vec<RibValue>>,
     warned: HashSet<String>,
     in_motion: bool,
-    motion_sample_taken: bool,
+    /// Requests collected inside the open MotionBegin block.
+    motion_requests: Vec<RibRequest>,
+    /// Deformation endpoint "P" captured for the next mesh build.
+    pending_deform_p: Option<Vec<f64>>,
     /// Base directory for resolving ReadArchive paths.
     base_dir: Option<PathBuf>,
     /// Inline archives (ArchiveBegin/End) by name.
@@ -131,6 +146,11 @@ impl SceneBuilder {
             width: 640,
             height: 480,
             fov: 45.0,
+            projection: Projection::Perspective,
+            depth_of_field: None,
+            pixel_filter: PixelFilter::Box { width: 1.0 },
+            shutter: (0.0, 0.0),
+            screen_window: None,
             pixel_samples: (1, 1),
             state: GraphicsState::default(),
             attribute_stack: Vec::new(),
@@ -140,7 +160,8 @@ impl SceneBuilder {
             passthrough: HashMap::new(),
             warned: HashSet::new(),
             in_motion: false,
-            motion_sample_taken: false,
+            motion_requests: Vec::new(),
+            pending_deform_p: None,
             base_dir: None,
             background: Vec3::zero(),
             archives: HashMap::new(),
@@ -163,7 +184,19 @@ impl SceneBuilder {
         let mut data = SceneData::default();
         self.run(requests, &mut data)?;
 
-        let camera = Camera::new(self.width, self.height, self.fov);
+        let mut camera = Camera::new(self.width, self.height, self.fov);
+        camera.projection = self.projection;
+        camera.filter = self.pixel_filter;
+        camera.shutter = self.shutter;
+        if let Some((fstop, focal_len, focal_dist)) = self.depth_of_field {
+            if fstop.is_finite() && fstop > 0.0 {
+                camera.lens_radius = focal_len / (2.0 * fstop);
+                camera.focal_distance = focal_dist;
+            }
+        }
+        if let Some((l, r, b, t)) = self.screen_window {
+            camera.ortho_half = ((r - l).abs() * 0.5, (t - b).abs() * 0.5);
+        }
         let mut scene = Scene::new(camera);
         scene.objects = data.objects;
         scene.meshes = data.meshes;
@@ -173,6 +206,8 @@ impl SceneBuilder {
         scene.pixel_samples = self.pixel_samples;
         scene.background_color = self.background;
         scene.patterns = self.pattern_nodes;
+        scene.has_motion = scene.instances.iter().any(|i| i.transform1.is_some())
+            || scene.meshes.iter().any(|m| m.positions1.is_some());
         scene.build_tlas();
         Ok(scene)
     }
@@ -189,12 +224,10 @@ impl SceneBuilder {
                 }
                 continue;
             }
-            // Motion blocks: use the first time sample, skip the rest.
+            // Motion blocks: collect the samples, resolved at MotionEnd.
             if self.in_motion && request.name != "MotionEnd" {
-                if self.motion_sample_taken {
-                    continue;
-                }
-                self.motion_sample_taken = true;
+                self.motion_requests.push(request.clone());
+                continue;
             }
             self.process(request, data)?;
         }
@@ -219,11 +252,12 @@ impl SceneBuilder {
             "TransformEnd" => self.transform_stack.pop(),
             "MotionBegin" => {
                 self.in_motion = true;
-                self.motion_sample_taken = false;
+                self.motion_requests.clear();
             }
             "MotionEnd" => {
                 self.in_motion = false;
-                self.motion_sample_taken = false;
+                let block = std::mem::take(&mut self.motion_requests);
+                self.finish_motion_block(block, data)?;
             }
             // Conditional RIB: conditions are not evaluated; bodies process.
             "IfBegin" | "ElseIf" | "Else" | "IfEnd" => {}
@@ -270,13 +304,15 @@ impl SceneBuilder {
                     .unwrap_or_else(|| "0".to_string());
                 if let Some(entries) = self.object_defs.get(&handle) {
                     let placement = self.transform_stack.current();
+                    let placement1 = self.motion_endpoint(&placement);
                     for entry in entries {
                         data.materials.push(entry.material.clone());
                         let material_id = data.materials.len() - 1;
-                        data.instances.push(Instance::new(
+                        data.instances.push(Instance::with_motion(
                             entry.mesh_id,
                             material_id,
                             placement * entry.local_transform,
+                            placement1.map(|p1| p1 * entry.local_transform),
                             &data.meshes[entry.mesh_id as usize],
                         ));
                     }
@@ -293,10 +329,47 @@ impl SceneBuilder {
                 }
             }
             "Projection" => {
-                if req.string(0) == Some("perspective") {
-                    if let Some(fov) = req.params_from(1).get_number("fov") {
-                        self.fov = fov;
+                match req.string(0) {
+                    Some("perspective") => {
+                        self.projection = Projection::Perspective;
+                        if let Some(fov) = req.params_from(1).get_number("fov") {
+                            self.fov = fov;
+                        }
                     }
+                    Some("orthographic") => self.projection = Projection::Orthographic,
+                    other => {
+                        if let Some(name) = other {
+                            self.warn_once(&format!(
+                                "Projection \"{name}\" not implemented; using perspective"
+                            ));
+                        }
+                    }
+                }
+            }
+            "DepthOfField" => {
+                if let (Some(fstop), Some(fl), Some(fd)) =
+                    (req.number(0), req.number(1), req.number(2))
+                {
+                    self.depth_of_field = Some((fstop, fl, fd));
+                }
+            }
+            "Shutter" => {
+                if let (Some(open), Some(close)) = (req.number(0), req.number(1)) {
+                    self.shutter = (open, close);
+                }
+            }
+            "PixelFilter" => {
+                if let Some(name) = req.string(0) {
+                    let xw = req.number(1).unwrap_or(2.0);
+                    let yw = req.number(2).unwrap_or(xw);
+                    self.pixel_filter = PixelFilter::from_name(name, xw, yw);
+                }
+            }
+            "ScreenWindow" => {
+                if let (Some(l), Some(r), Some(b), Some(t)) =
+                    (req.number(0), req.number(1), req.number(2), req.number(3))
+                {
+                    self.screen_window = Some((l, r, b, t));
                 }
             }
             "PixelSamples" => {
@@ -327,10 +400,10 @@ impl SceneBuilder {
                 }
             }
             // Recorded (no render effect yet); see COMPLIANCE.md.
-            "Display" | "Clipping" | "ClippingPlane" | "CropWindow" | "ScreenWindow"
-            | "FrameAspectRatio" | "Shutter" | "PixelFilter" | "PixelVariance" | "Exposure"
+            "Display" | "Clipping" | "ClippingPlane" | "CropWindow"
+            | "FrameAspectRatio" | "PixelVariance" | "Exposure"
             | "Quantize" | "Hider" | "Integrator" | "TextureCoordinates"
-            | "ShadingInterpolation" | "DepthOfField" | "RelativeDetail" => {
+            | "ShadingInterpolation" | "RelativeDetail" => {
                 self.record(req);
             }
             "Basis" => {
@@ -777,7 +850,14 @@ impl SceneBuilder {
             return;
         }
 
-        let mesh = Mesh::new(positions, indices, normals, st);
+        let positions1 = self.pending_deform_p.take().and_then(|p1| {
+            (p1.len() == p.len()).then(|| {
+                p1.chunks_exact(3)
+                    .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+                    .collect::<Vec<_>>()
+            })
+        });
+        let mesh = Mesh::with_motion(positions, indices, normals, st, positions1);
         self.add_tessellated_mesh(mesh, data);
     }
 
@@ -828,10 +908,12 @@ impl SceneBuilder {
         } else {
             data.materials.push(material);
             let material_id = data.materials.len() - 1;
-            data.instances.push(Instance::new(
+            let placement = self.transform_stack.current();
+            data.instances.push(Instance::with_motion(
                 mesh_id,
                 material_id,
-                self.transform_stack.current(),
+                placement,
+                self.motion_endpoint(&placement),
                 &data.meshes[mesh_id as usize],
             ));
         }
@@ -1219,6 +1301,66 @@ impl SceneBuilder {
         }
     }
 
+    /// Resolve a closed MotionBegin block. Transform blocks record shutter
+    /// open/close transforms (applied to geometry that follows);
+    /// deformation blocks capture the last sample's "P" as the endpoint.
+    /// Everything else takes the first sample and warns.
+    fn finish_motion_block(
+        &mut self,
+        block: Vec<RibRequest>,
+        data: &mut SceneData,
+    ) -> Result<()> {
+        let (Some(first), Some(last)) = (block.first(), block.last()) else {
+            return Ok(());
+        };
+        const TRANSFORM_REQS: [&str; 6] =
+            ["Translate", "Rotate", "Scale", "ConcatTransform", "Transform", "Identity"];
+        if block.iter().all(|r| TRANSFORM_REQS.contains(&r.name.as_str())) {
+            let base = self.transform_stack.current();
+            let first = first.clone();
+            let last = last.clone();
+            self.process(&first, data)?;
+            let t0 = self.transform_stack.current();
+            if block.len() > 1 {
+                self.transform_stack.set(base);
+                self.process(&last, data)?;
+                let t1 = self.transform_stack.current();
+                self.transform_stack.set(t0);
+                self.state.motion_t0 = Some(t0);
+                self.state.motion_t1 = Some(t1);
+            }
+            return Ok(());
+        }
+        if block.iter().all(|r| r.name == first.name)
+            && matches!(first.name.as_str(), "PointsPolygons" | "PointsGeneralPolygons")
+        {
+            if block.len() > 1 {
+                self.pending_deform_p =
+                    last.params_from(2).get_numbers("P").map(|p| p.to_vec());
+            }
+            let first = first.clone();
+            self.process(&first, data)?;
+            self.pending_deform_p = None;
+            return Ok(());
+        }
+        self.warn_once(&format!(
+            "MotionBegin over \"{}\" not supported (transforms and \
+             PointsPolygons deformation only); using the first sample",
+            first.name
+        ));
+        let first = first.clone();
+        self.process(&first, data)
+    }
+
+    /// Shutter-close transform for geometry created now: the motion
+    /// block's T1 endpoint with any post-block transforms composed on.
+    fn motion_endpoint(&self, current: &Matrix4) -> Option<Matrix4> {
+        let t0 = self.state.motion_t0?;
+        let t1 = self.state.motion_t1?;
+        let post = t0.inverse()? * *current;
+        Some(t1 * post)
+    }
+
     /// Resolve a resource filename against the RIB's directory.
     fn resource_path(&self, name: &str) -> PathBuf {
         match &self.base_dir {
@@ -1444,6 +1586,47 @@ impl Default for SceneBuilder {
 mod tests {
     use super::*;
     use crate::parser::parse_rib;
+
+    #[test]
+    fn motion_blocks_record_endpoints() {
+        let input = r#"
+            Format 64 64 1.0
+            Shutter 0 1
+            WorldBegin
+                AttributeBegin
+                    MotionBegin [0 1]
+                        Translate 0 0 5
+                        Translate 2 0 5
+                    MotionEnd
+                    PointsPolygons [4] [0 1 2 3]
+                        "P" [-1 -1 0  1 -1 0  1 1 0  -1 1 0]
+                AttributeEnd
+                AttributeBegin
+                    Translate 0 0 8
+                    MotionBegin [0 1]
+                        PointsPolygons [4] [0 1 2 3] "P" [-1 -1 0  1 -1 0  1 1 0  -1 1 0]
+                        PointsPolygons [4] [0 1 2 3] "P" [-1 -1 2  1 -1 2  1 1 2  -1 1 2]
+                    MotionEnd
+                AttributeEnd
+            WorldEnd
+        "#;
+        let scene = SceneBuilder::new().build(&parse_rib(input).unwrap()).unwrap();
+        assert!(scene.has_motion);
+        assert_eq!(scene.instances.len(), 2);
+        // Transform motion: endpoint shifted +2 in x.
+        let t1 = scene.instances[0].transform1.expect("transform motion");
+        let p0 = scene.instances[0]
+            .transform
+            .transform_point(&Point3::new(0.0, 0.0, 0.0));
+        let p1 = t1.transform_point(&Point3::new(0.0, 0.0, 0.0));
+        assert!((p1.x - p0.x - 2.0).abs() < 1e-9, "endpoint {p1:?}");
+        // Deformation motion: second mesh carries positions1 (+2 in z).
+        let mesh = &scene.meshes[1];
+        let d = mesh.positions1.as_ref().expect("deform endpoint");
+        assert!((d[0][2] - mesh.positions[0][2] - 2.0).abs() < 1e-6);
+        // World bounds cover both endpoints.
+        assert!(scene.instances[0].world_bounds.max.x > 2.9);
+    }
 
     #[test]
     fn pattern_graph_binds_to_bxdf() {

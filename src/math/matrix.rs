@@ -226,6 +226,20 @@ impl Matrix4 {
         Vec3::new(x, y, z)
     }
 
+    /// Component-wise interpolation toward `other`. Correct for
+    /// translation and scale; small rotations (a shutter interval's worth)
+    /// interpolate acceptably, large ones shear — the standard cheap
+    /// motion-blur transform blend.
+    pub fn lerp(&self, other: &Matrix4, t: f64) -> Matrix4 {
+        let mut m = [[0.0; 4]; 4];
+        for r in 0..4 {
+            for c in 0..4 {
+                m[r][c] = self.m[r][c] + (other.m[r][c] - self.m[r][c]) * t;
+            }
+        }
+        Matrix4 { m }
+    }
+
     /// Average length scale of the linear part (geometric mean of the
     /// transformed basis lengths) — the isotropic approximation used for
     /// texture-footprint estimates.

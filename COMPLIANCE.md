@@ -13,7 +13,7 @@ skipped forever.
 | FrameBegin/FrameEnd | 🟡 | treated as grouping only |
 | AttributeBegin/AttributeEnd | ✅ | full graphics-state save/restore |
 | TransformBegin/TransformEnd | ✅ | |
-| MotionBegin/MotionEnd | ⏭ P7 | first sample used until then |
+| MotionBegin/MotionEnd | ✅ | transform motion (lerped endpoints, any prim via instances) + PointsPolygons deformation; other motion types warn and use the first sample |
 | ObjectBegin/ObjectEnd/ObjectInstance | ✅ | mesh geometry instanced via TLAS; quadrics inside blocks warn+skip |
 | SolidBegin/SolidEnd (CSG) | 🚫 | PRMan RIS barely supports it either |
 | IfBegin/ElseIf/Else/IfEnd | 🟡 | condition ignored, body processed |
@@ -23,12 +23,13 @@ skipped forever.
 | Request | Status | Notes |
 |---|---|---|
 | Format | ✅ | |
-| Projection | ✅ | perspective fov; orthographic ⏭ P7 |
+| Projection | ✅ | perspective (fov) and orthographic (ScreenWindow sets extent) |
 | Clipping / ClippingPlane | 🟡 | |
-| CropWindow / ScreenWindow / FrameAspectRatio | 🟡 | render effect ⏭ P7 |
-| Shutter | 🟡 | ⏭ P7 motion blur |
+| CropWindow / ScreenWindow / FrameAspectRatio | 🟡 / ✅ / 🟡 | ScreenWindow drives the orthographic extent |
+| Shutter | ✅ | enables per-ray shutter times over motion endpoints |
 | PixelSamples | ✅ | |
-| PixelFilter / PixelVariance | 🟡 | filters ⏭ P7 |
+| PixelFilter / PixelVariance | ✅ / 🟡 | box/triangle/gaussian via filter importance sampling; adaptive variance stopping via the --adaptive CLI flag (CPU) |
+| DepthOfField | ✅ | thin-lens bokeh: fstop / focallength / focaldistance |
 | Exposure / Quantize | 🟡 | |
 | Display | 🟡 | filename/driver recorded; CLI overrides |
 | Hider / Integrator | ⏭ P1/P4 | |

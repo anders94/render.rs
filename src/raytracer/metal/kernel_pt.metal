@@ -38,6 +38,14 @@ struct PtUniforms {
     uint  env_width;
     uint  env_height;
     float env_total;
+    float lens_radius;      // 0 = pinhole
+    float focal_distance;
+    uint  projection;       // 0 perspective, 1 orthographic
+    float ortho_half_w;
+    float ortho_half_h;
+    uint  filter_kind;      // 0 box, 1 triangle, 2 gaussian
+    float filter_width;
+    uint  has_motion;
 };
 
 // PtMaterial is defined in pattern_prelude.metal (compiled just before
@@ -67,16 +75,17 @@ struct MeshInfoG {
     uint vertex_offset;
     uint has_normals;
     uint has_st;
-    uint pad;
+    uint has_deform;    // vertices1 holds shutter-close positions
 };
 
 struct InstanceG {
     float inv[16];
     float fwd[16];
+    float fwd1[16];      // transform-motion endpoint (== fwd when static)
     uint  mesh_id;
     uint  material_id;
     float scale;         // isotropic transform scale (st-density transfer)
-    uint  pad;
+    uint  has_motion;
 };
 
 // All scene pointers bundled so helpers have sane signatures.
@@ -93,6 +102,7 @@ struct PtScene {
     device const float*     normals;
     device const MeshInfoG* mesh_infos;
     device const float*     st;
+    device const float*     vertices1;
     device const float*     tex_data;
     device const TexMipG*   tex_mips;
     device const float*     env_pixels;
@@ -202,15 +212,63 @@ inline float3 fetch_v3(device const float* buf, uint index3) {
     return float3(buf[index3 * 3u], buf[index3 * 3u + 1u], buf[index3 * 3u + 2u]);
 }
 
+inline Affine affine_lerp(Affine a, Affine b, float t) {
+    Affine o;
+    o.r0 = mix(a.r0, b.r0, t);
+    o.r1 = mix(a.r1, b.r1, t);
+    o.r2 = mix(a.r2, b.r2, t);
+    return o;
+}
+
+// Inverse of an affine transform: adjugate of the 3x3 + back-solved
+// translation (mirrors Matrix4::inverse for the affine case).
+inline Affine affine_inverse(Affine a) {
+    float3 c0 = float3(a.r0.x, a.r1.x, a.r2.x);
+    float3 c1 = float3(a.r0.y, a.r1.y, a.r2.y);
+    float3 c2 = float3(a.r0.z, a.r1.z, a.r2.z);
+    float3 tr = float3(a.r0.w, a.r1.w, a.r2.w);
+    float3 r0 = cross(c1, c2);
+    float3 r1 = cross(c2, c0);
+    float3 r2 = cross(c0, c1);
+    float det = dot(c0, r0);
+    float inv_det = 1.0f / (fabs(det) > 1e-20f ? det : 1e-20f);
+    r0 *= inv_det; r1 *= inv_det; r2 *= inv_det;
+    Affine o;
+    o.r0 = float4(r0, -dot(r0, tr));
+    o.r1 = float4(r1, -dot(r1, tr));
+    o.r2 = float4(r2, -dot(r2, tr));
+    return o;
+}
+
+// Instance inverse at shutter time (lerp + invert only when moving).
+inline Affine instance_inverse_at(device const InstanceG& inst, float time) {
+    if (inst.has_motion != 0u && time > 0.0f) {
+        return affine_inverse(
+            affine_lerp(load_affine(inst.fwd), load_affine(inst.fwd1), time));
+    }
+    return load_affine(inst.inv);
+}
+
+// Mesh vertex at shutter time (deformation lerp).
+inline float3 fetch_vertex_at(thread const PtScene& s, device const MeshInfoG& mesh,
+                              uint idx, float time) {
+    float3 v0 = fetch_v3(s.vertices, idx);
+    if (mesh.has_deform != 0u && time > 0.0f) {
+        float3 v1 = fetch_v3(s.vertices1, idx);
+        return mix(v0, v1, time);
+    }
+    return v0;
+}
+
 // Closest hit within one instance's BLAS. t stays parametric along the
 // world direction (the instance transform is applied without normalizing).
 inline bool instance_hit(thread const PtScene& s, uint inst_id,
-                         float3 wo_pos, float3 wd, float t_max,
+                         float3 wo_pos, float3 wd, float time, float t_max,
                          thread float& t_out, thread float3& n_out,
                          thread float2& st_out, thread float& st_density_out) {
     device const InstanceG& inst = s.instances[inst_id];
     device const MeshInfoG& mesh = s.mesh_infos[inst.mesh_id];
-    Affine inv = load_affine(inst.inv);
+    Affine inv = instance_inverse_at(inst, time);
     float3 o = xf_point(inv, wo_pos);
     float3 d = xf_vec(inv, wd);
     float3 inv_d = safe_inv(d);
@@ -231,9 +289,9 @@ inline bool instance_hit(thread const PtScene& s, uint inst_id,
             for (uint i = 0u; i < node.count; i++) {
                 uint tri = node.left_or_first + i;
                 uint base = mesh.index_offset + tri * 3u;
-                float3 v0 = fetch_v3(s.vertices, mesh.vertex_offset + s.tri_indices[base]);
-                float3 v1 = fetch_v3(s.vertices, mesh.vertex_offset + s.tri_indices[base + 1u]);
-                float3 v2 = fetch_v3(s.vertices, mesh.vertex_offset + s.tri_indices[base + 2u]);
+                float3 v0 = fetch_vertex_at(s, mesh, mesh.vertex_offset + s.tri_indices[base], time);
+                float3 v1 = fetch_vertex_at(s, mesh, mesh.vertex_offset + s.tri_indices[base + 1u], time);
+                float3 v2 = fetch_vertex_at(s, mesh, mesh.vertex_offset + s.tri_indices[base + 2u], time);
                 float t, uu, vv;
                 if (tri_hit(o, d, v0, v1, v2, best_t, t, uu, vv)) {
                     best_t = t;
@@ -270,16 +328,18 @@ inline bool instance_hit(thread const PtScene& s, uint inst_id,
     uint i1 = s.tri_indices[base + 1u];
     uint i2 = s.tri_indices[base + 2u];
     float3 nl;
-    if (mesh.has_normals != 0u) {
+    // Deforming meshes use the time-correct geometric normal (authored
+    // normals describe the rest pose) — mirrors Mesh::local_normal.
+    if (mesh.has_normals != 0u && mesh.has_deform == 0u) {
         float3 n0 = fetch_v3(s.normals, mesh.vertex_offset + i0);
         float3 n1 = fetch_v3(s.normals, mesh.vertex_offset + i1);
         float3 n2 = fetch_v3(s.normals, mesh.vertex_offset + i2);
         float w = 1.0f - best_u - best_v;
         nl = normalize_cpu(n0 * w + n1 * best_u + n2 * best_v);
     } else {
-        float3 v0 = fetch_v3(s.vertices, mesh.vertex_offset + i0);
-        float3 v1 = fetch_v3(s.vertices, mesh.vertex_offset + i1);
-        float3 v2 = fetch_v3(s.vertices, mesh.vertex_offset + i2);
+        float3 v0 = fetch_vertex_at(s, mesh, mesh.vertex_offset + i0, time);
+        float3 v1 = fetch_vertex_at(s, mesh, mesh.vertex_offset + i1, time);
+        float3 v2 = fetch_vertex_at(s, mesh, mesh.vertex_offset + i2, time);
         nl = normalize_cpu(cross(v1 - v0, v2 - v0));
     }
     t_out = best_t;
@@ -314,10 +374,10 @@ inline bool instance_hit(thread const PtScene& s, uint inst_id,
 
 // Any triangle hit within one instance before t_limit (shadow rays).
 inline bool instance_occludes(thread const PtScene& s, uint inst_id,
-                              float3 wo_pos, float3 wd, float t_limit) {
+                              float3 wo_pos, float3 wd, float time, float t_limit) {
     device const InstanceG& inst = s.instances[inst_id];
     device const MeshInfoG& mesh = s.mesh_infos[inst.mesh_id];
-    Affine inv = load_affine(inst.inv);
+    Affine inv = instance_inverse_at(inst, time);
     float3 o = xf_point(inv, wo_pos);
     float3 d = xf_vec(inv, wd);
     float3 inv_d = safe_inv(d);
@@ -333,9 +393,9 @@ inline bool instance_occludes(thread const PtScene& s, uint inst_id,
             for (uint i = 0u; i < node.count; i++) {
                 uint tri = node.left_or_first + i;
                 uint base = mesh.index_offset + tri * 3u;
-                float3 v0 = fetch_v3(s.vertices, mesh.vertex_offset + s.tri_indices[base]);
-                float3 v1 = fetch_v3(s.vertices, mesh.vertex_offset + s.tri_indices[base + 1u]);
-                float3 v2 = fetch_v3(s.vertices, mesh.vertex_offset + s.tri_indices[base + 2u]);
+                float3 v0 = fetch_vertex_at(s, mesh, mesh.vertex_offset + s.tri_indices[base], time);
+                float3 v1 = fetch_vertex_at(s, mesh, mesh.vertex_offset + s.tri_indices[base + 1u], time);
+                float3 v2 = fetch_vertex_at(s, mesh, mesh.vertex_offset + s.tri_indices[base + 2u], time);
                 float t, uu, vv;
                 if (tri_hit(o, d, v0, v1, v2, t_limit, t, uu, vv)) return true;
             }
@@ -349,7 +409,7 @@ inline bool instance_occludes(thread const PtScene& s, uint inst_id,
 
 // Closest hit across quadrics + instanced meshes. World directions are
 // unit length, so quadric euclidean t and mesh parametric t agree.
-inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
+inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d, float time) {
     PtHit best;
     best.hit = false;
     best.t = PT_BIG;
@@ -388,7 +448,7 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
                     float3 n;
                     float2 st;
                     float st_density;
-                    if (instance_hit(s, inst_id, o, d, best.t, t, n, st, st_density)) {
+                    if (instance_hit(s, inst_id, o, d, time, best.t, t, n, st, st_density)) {
                         best.hit = true;
                         best.t = t;
                         best.p = o + d * t;
@@ -424,7 +484,7 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
 
 // Any hit strictly before t_limit (shadow rays; dir unit length).
 inline bool pt_occluded(thread const PtScene& s, float3 p, float3 n,
-                        float3 dir, float dist) {
+                        float3 dir, float dist, float time) {
     float3 o = p + n * PT_RAY_OFFSET;
     float limit = dist - 1e-3f;
     for (uint i = 0u; i < s.u->object_count; i++) {
@@ -442,7 +502,7 @@ inline bool pt_occluded(thread const PtScene& s, float3 p, float3 n,
             if (!aabb_hit(node, o, inv_d, limit, tn)) continue;
             if (node.count > 0u) {
                 for (uint i = 0u; i < node.count; i++) {
-                    if (instance_occludes(s, node.left_or_first + i, o, dir, limit)) {
+                    if (instance_occludes(s, node.left_or_first + i, o, dir, time, limit)) {
                         return true;
                     }
                 }
@@ -805,12 +865,12 @@ inline float light_pdf_solid_angle(PtLight l, float3 origin, float3 hit_p) {
 
 // Fractional visibility (presence cutouts attenuate; opaque kills).
 inline float pt_visibility(thread const PtScene& s, float3 p, float3 n,
-                           float3 dir, float dist) {
+                           float3 dir, float dist, float time) {
     float3 origin = p + n * PT_RAY_OFFSET;
     float remaining = dist - 1e-3f;
     float vis = 1.0f;
     for (int i = 0; i < 16; i++) {
-        PtHit h = pt_trace_scene(s, origin, dir);
+        PtHit h = pt_trace_scene(s, origin, dir, time);
         if (!h.hit || h.t >= remaining) return vis;
         PtMaterial pm = s.materials[h.material];
         apply_patterns(h.material, pm, h.st, h.p, h.n, 0.0f, s.tex_data, s.tex_mips);
@@ -826,7 +886,7 @@ inline float pt_visibility(thread const PtScene& s, float3 p, float3 n,
 
 inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
                                FrameL frame, float3 wo_l, PtMaterial m,
-                               float eta, thread Pcg32& rng) {
+                               float eta, float time, thread Pcg32& rng) {
     float3 n = frame.n;
     float3 rad = m3(l.radiance);
 
@@ -841,7 +901,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float pdf;
         bsdf_eval_pdf(m, wo_l, wi_l, eta, f, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-        float vis = pt_visibility(s, p, n, wi, dist);
+        float vis = pt_visibility(s, p, n, wi, dist, time);
         return f * rad * (max(wi_l.z, 0.0f) * vis / dist2);
     }
     if (l.kind == 1u) {                       // distant (soft when area>0)
@@ -863,7 +923,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float pdf;
         bsdf_eval_pdf(m, wo_l, wi_l, eta, f, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-        float vis = pt_visibility(s, p, n, wi, PT_BIG);
+        float vis = pt_visibility(s, p, n, wi, PT_BIG, time);
         return f * rad * (max(wi_l.z, 0.0f) * vis);
     }
     if (l.kind == 2u || l.kind == 4u) {       // rect / disk
@@ -889,7 +949,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float bp;
         bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-        float vis = pt_visibility(s, p, n, wi, dist);
+        float vis = pt_visibility(s, p, n, wi, dist, time);
         if (vis <= 0.0f) return float3(0.0f);
         float pdf_sa = dist2 / (cl * l.area);
         float w = power_heuristic(pdf_sa, bp);
@@ -918,7 +978,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float dist = sqrt(dist2) * ct
             - sqrt(max(radius * radius - dist2 * st * st, 0.0f));
-        float vis = pt_visibility(s, p, n, wi, dist);
+        float vis = pt_visibility(s, p, n, wi, dist, time);
         if (vis <= 0.0f) return float3(0.0f);
         float pdf_sa = 1.0f / max(2.0f * PT_PI * (1.0f - cm), 1e-12f);
         float w = power_heuristic(pdf_sa, bp);
@@ -935,7 +995,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
     float bp;
     bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
     if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-    float vis = pt_visibility(s, p, n, wi, PT_BIG);
+    float vis = pt_visibility(s, p, n, wi, PT_BIG, time);
     if (vis <= 0.0f) return float3(0.0f);
     float w = power_heuristic(pdf_sa, bp);
     return f * (er * rad) * (max(wi_l.z, 0.0f) * vis / pdf_sa) * w;
@@ -944,7 +1004,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
 // ---- the path integrator (mirror of pt::trace) --------------------------
 
 inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
-                    thread Pcg32& rng) {
+                    float time, thread Pcg32& rng) {
     constant PtUniforms& u = *s.u;
     float3 l = float3(0.0f);
     float3 beta = float3(1.0f);
@@ -959,7 +1019,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
 
     uint depth = 0u;
     while (depth < u.max_bounces) {
-        PtHit h = pt_trace_scene(s, origin, dir);
+        PtHit h = pt_trace_scene(s, origin, dir, time);
         if (!h.hit) {
             if (u.dome_index != 0xFFFFFFFFu) {
                 float3 d = normalize_cpu(dir);
@@ -1010,7 +1070,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
 
         if (u.light_count > 0u && wsum > 0.0f) {
             uint li = min((uint)(pcg_f32(rng) * num_lights), u.light_count - 1u);
-            float3 c = sample_one_light(s, s.lights[li], h.p, frame, wo_l, m, eta, rng);
+            float3 c = sample_one_light(s, s.lights[li], h.p, frame, wo_l, m, eta, time, rng);
             l += beta * c * num_lights;
         }
 
@@ -1039,6 +1099,24 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
     return l;
 }
 
+// Filter importance sampling: subpixel offset from one uniform,
+// mirroring PixelFilter::sample_1d on the CPU.
+inline float filter_offset_1d(uint kind, float width, float u) {
+    if (kind == 1u) {                      // triangle
+        float half_w = width * 0.5f;
+        return u < 0.5f ? (sqrt(2.0f * u) - 1.0f) * half_w
+                        : (1.0f - sqrt(2.0f * (1.0f - u))) * half_w;
+    }
+    if (kind == 2u) {                      // truncated gaussian
+        float u1 = max(u, 1e-12f);
+        float u2 = fract(u * 2654435761.0f);
+        float sigma = width / 4.0f;
+        float g = sqrt(-2.0f * log(u1)) * cos(2.0f * PT_PI * u2);
+        return clamp(g * sigma, -width * 0.5f, width * 0.5f);
+    }
+    return (u - 0.5f) * width;             // box
+}
+
 // ---- entry: one thread per pixel, one sample per dispatch ---------------
 
 kernel void render_pt(device const Object*     objects          [[buffer(0)]],
@@ -1058,8 +1136,9 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const float*      st               [[buffer(14)]],
                       device const float*      tex_data         [[buffer(15)]],
                       device const TexMipG*    tex_mips         [[buffer(16)]],
-                      constant PtUniforms&     u                [[buffer(17)]],
-                      device float*            accum            [[buffer(18)]],
+                      device const float*      vertices1        [[buffer(17)]],
+                      constant PtUniforms&     u                [[buffer(18)]],
+                      device float*            accum            [[buffer(19)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint py_row = gid.y + u.y_offset;
     if (gid.x >= u.width || py_row >= u.height) return;
@@ -1077,6 +1156,7 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
     s.normals = normals;
     s.mesh_infos = mesh_infos;
     s.st = st;
+    s.vertices1 = vertices1;
     s.tex_data = tex_data;
     s.tex_mips = tex_mips;
     s.env_pixels = env_pixels;
@@ -1093,14 +1173,39 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
     float3 sum = float3(0.0f);
     for (uint sidx = 0u; sidx < u.sample_count; sidx++) {
         Pcg32 rng = pcg_for_pixel_sample(pixel, (ulong)(u.sample_start + sidx));
-        float jx = pcg_f32(rng);
-        float jy = pcg_f32(rng);
-        float px = (float)gid.x + jx;
-        float py = (float)py_row + jy;
+        // Camera sample: filter-importance-sampled subpixel offset, then
+        // (optionally) lens position and shutter time — the same draw
+        // order as pt::camera_ray on the CPU.
+        float fu = pcg_f32(rng);
+        float fv = pcg_f32(rng);
+        float px = (float)gid.x + 0.5f + filter_offset_1d(u.filter_kind, u.filter_width, fu);
+        float py = (float)py_row + 0.5f + filter_offset_1d(u.filter_kind, u.filter_width, fv);
         float uu = (px / (float)u.width) * 2.0f - 1.0f;
         float vv = 1.0f - (py / (float)u.height) * 2.0f;
-        float3 d = normalize_cpu(fwd + rgt * (uu * u.half_width) + upv * (vv * u.half_height));
-        float3 li = pt_li(s, eye, d, rng);
+
+        float3 ray_o;
+        float3 d;
+        if (u.projection == 1u) {          // orthographic
+            ray_o = eye + rgt * (uu * u.ortho_half_w) + upv * (vv * u.ortho_half_h);
+            d = fwd;
+        } else {
+            float3 dir = fwd + rgt * (uu * u.half_width) + upv * (vv * u.half_height);
+            if (u.lens_radius > 0.0f) {
+                float lu = pcg_f32(rng);
+                float lv = pcg_f32(rng);
+                float r = u.lens_radius * sqrt(lu);
+                float phi = 2.0f * PT_PI * lv;
+                float3 offset = rgt * (r * cos(phi)) + upv * (r * sin(phi));
+                float3 focus = eye + dir * u.focal_distance;
+                ray_o = eye + offset;
+                d = normalize_cpu(focus - ray_o);
+            } else {
+                ray_o = eye;
+                d = normalize_cpu(dir);
+            }
+        }
+        float rtime = (u.has_motion != 0u) ? pcg_f32(rng) : 0.0f;
+        float3 li = pt_li(s, ray_o, d, rtime, rng);
         float lum = 0.2126f * li.x + 0.7152f * li.y + 0.0722f * li.z;
         if (lum > u.firefly_clamp) li *= u.firefly_clamp / lum;
         sum += li;

@@ -40,7 +40,8 @@ pub struct GpuMeshInfo {
     pub has_normals: u32,
     /// 1 when per-vertex st coordinates are present.
     pub has_st: u32,
-    pub pad: u32,
+    /// 1 when the mesh deforms (vertices1 holds shutter-close positions).
+    pub has_deform: u32,
 }
 
 #[repr(C)]
@@ -48,11 +49,14 @@ pub struct GpuMeshInfo {
 pub struct GpuInstance {
     pub inv: [f32; 16],
     pub fwd: [f32; 16],
+    /// Transform-motion endpoint (== fwd when static).
+    pub fwd1: [f32; 16],
     pub mesh_id: u32,
     pub material_id: u32,
     /// Isotropic transform scale (st-density transfer to world space).
     pub scale: f32,
-    pub pad: u32,
+    /// 1 when fwd1 differs (kernel lerps + inverts per ray).
+    pub has_motion: u32,
 }
 
 #[repr(C)]
@@ -125,14 +129,27 @@ pub struct GpuPtUniforms {
     pub env_width: u32,
     pub env_height: u32,
     pub env_total: f32,
+    /// Thin-lens aperture radius (0 = pinhole).
+    pub lens_radius: f32,
+    pub focal_distance: f32,
+    /// 0 perspective, 1 orthographic.
+    pub projection: u32,
+    /// Ortho screen half-extents.
+    pub ortho_half_w: f32,
+    pub ortho_half_h: f32,
+    /// 0 box, 1 triangle, 2 gaussian.
+    pub filter_kind: u32,
+    pub filter_width: f32,
+    /// 1 when rays draw a shutter time.
+    pub has_motion: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
 const _: () = assert!(std::mem::size_of::<GpuMeshInfo>() == 24);
-const _: () = assert!(std::mem::size_of::<GpuInstance>() == 144);
+const _: () = assert!(std::mem::size_of::<GpuInstance>() == 208);
 const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 140);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
-const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 128);
+const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 160);
 
 pub struct GpuPtScene {
     pub objects: Vec<GpuObject>,
@@ -150,6 +167,8 @@ pub struct GpuPtScene {
     pub normals: Vec<f32>,
     /// Per-vertex st pairs, all meshes concatenated (zeros when absent).
     pub st: Vec<f32>,
+    /// Shutter-close vertex positions (== vertices where static).
+    pub vertices1: Vec<f32>,
     pub mesh_infos: Vec<GpuMeshInfo>,
     /// Packed texture table + generated pattern MSL (pattern_codegen).
     pub tex_data: Vec<f32>,
@@ -307,6 +326,7 @@ impl GpuPtScene {
         let mut vertices = Vec::new();
         let mut normals = Vec::new();
         let mut st = Vec::new();
+        let mut vertices1 = Vec::new();
         let mut mesh_infos = Vec::with_capacity(scene.meshes.len());
         for mesh in &scene.meshes {
             let node_offset = blas_nodes.len() as u32;
@@ -321,6 +341,18 @@ impl GpuPtScene {
             }
             for p in &mesh.positions {
                 vertices.extend_from_slice(p);
+            }
+            match &mesh.positions1 {
+                Some(p1) => {
+                    for p in p1 {
+                        vertices1.extend_from_slice(p);
+                    }
+                }
+                None => {
+                    for p in &mesh.positions {
+                        vertices1.extend_from_slice(p);
+                    }
+                }
             }
             match &mesh.normals {
                 Some(ns) => {
@@ -344,7 +376,7 @@ impl GpuPtScene {
                 vertex_offset,
                 has_normals: mesh.normals.is_some() as u32,
                 has_st: mesh.st.is_some() as u32,
-                pad: 0,
+                has_deform: mesh.positions1.is_some() as u32,
             });
         }
 
@@ -361,10 +393,11 @@ impl GpuPtScene {
                 Ok(GpuInstance {
                     inv: matrix_to_f32(&inst.inverse)?,
                     fwd: matrix_to_f32(&inst.transform)?,
+                    fwd1: matrix_to_f32(inst.transform1.as_ref().unwrap_or(&inst.transform))?,
                     mesh_id: inst.mesh_id,
                     material_id: inst.material_id as u32,
                     scale: inst.scale as f32,
-                    pad: 0,
+                    has_motion: inst.transform1.is_some() as u32,
                 })
             })
             .collect::<Result<_>>()?;
@@ -401,6 +434,22 @@ impl GpuPtScene {
             env_width: env_dims.0,
             env_height: env_dims.1,
             env_total: env_dims.2,
+            lens_radius: cam.lens_radius as f32,
+            focal_distance: cam.focal_distance as f32,
+            projection: matches!(cam.projection, crate::scene::Projection::Orthographic) as u32,
+            ortho_half_w: cam.ortho_half.0 as f32,
+            ortho_half_h: cam.ortho_half.1 as f32,
+            filter_kind: match cam.filter {
+                crate::scene::PixelFilter::Box { .. } => 0,
+                crate::scene::PixelFilter::Triangle { .. } => 1,
+                crate::scene::PixelFilter::Gaussian { .. } => 2,
+            },
+            filter_width: match cam.filter {
+                crate::scene::PixelFilter::Box { width }
+                | crate::scene::PixelFilter::Triangle { width }
+                | crate::scene::PixelFilter::Gaussian { width } => width as f32,
+            },
+            has_motion: scene.has_motion as u32,
         };
 
         let patterns = super::pattern_codegen::build(scene);
@@ -416,6 +465,7 @@ impl GpuPtScene {
             vertices,
             normals,
             st,
+            vertices1,
             mesh_infos,
             tex_data: patterns.tex_data,
             tex_mips: patterns.tex_mips,
@@ -462,6 +512,9 @@ impl GpuPtScene {
         }
         if self.st.is_empty() {
             self.st.extend_from_slice(&[0.0, 0.0]);
+        }
+        if self.vertices1.is_empty() {
+            self.vertices1.extend_from_slice(&[0.0, 0.0, 0.0]);
         }
         if self.tex_data.is_empty() {
             self.tex_data.extend_from_slice(&[0.0; 3]);
@@ -515,6 +568,9 @@ impl GpuPtScene {
     }
     pub fn st_bytes(&self) -> &[u8] {
         as_bytes(&self.st)
+    }
+    pub fn vertices1_bytes(&self) -> &[u8] {
+        as_bytes(&self.vertices1)
     }
     pub fn tex_data_bytes(&self) -> &[u8] {
         as_bytes(&self.tex_data)

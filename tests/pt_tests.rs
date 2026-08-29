@@ -93,3 +93,21 @@ fn converges_with_spp() {
         "no convergence: rmse@4spp={coarse:.4}, rmse@64spp={fine:.4}"
     );
 }
+
+#[test]
+fn adaptive_sampling_converges_and_saves_samples() {
+    // Background- and direct-light-dominated scene: most pixels are easy,
+    // so adaptive sampling should bank real savings (a GI box like
+    // Cornell legitimately burns the whole budget instead).
+    let scene = load_fixture_scene("quadric_zoo.rib", 64, 64);
+    let (adaptive, avg_spp) = pt::render_adaptive(&scene, 256, 0.05);
+    assert!(avg_spp < 160.0, "adaptive averaged {avg_spp} spp");
+    assert!(avg_spp >= 32.0, "warmup floor violated: {avg_spp}");
+    // And the result matches a fixed-spp render statistically.
+    let reference = pt::render(&scene, 256);
+    let ma = mean_of(&adaptive.iter().flatten().copied().collect::<Vec<_>>());
+    let mr = mean_of(&reference.iter().flatten().copied().collect::<Vec<_>>());
+    let rel = ((ma.x - mr.x).abs() + (ma.y - mr.y).abs() + (ma.z - mr.z).abs())
+        / (mr.x + mr.y + mr.z).max(0.05);
+    assert!(rel < 0.03, "adaptive mean {ma:?} vs reference {mr:?} (rel {rel:.4})");
+}

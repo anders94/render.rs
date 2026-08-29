@@ -4,6 +4,9 @@ use crate::math::{Point3, Vec3};
 pub struct Ray {
     pub origin: Point3,
     pub direction: Vec3,
+    /// Shutter time in [0,1); motion-blurred primitives interpolate their
+    /// endpoints by this. 0 for rays that don't carry a time.
+    pub time: f64,
 }
 
 impl Ray {
@@ -11,7 +14,13 @@ impl Ray {
         Self {
             origin,
             direction: direction.normalize(),
+            time: 0.0,
         }
+    }
+
+    pub fn with_time(mut self, time: f64) -> Self {
+        self.time = time;
+        self
     }
 
     pub fn at(&self, t: f64) -> Point3 {
