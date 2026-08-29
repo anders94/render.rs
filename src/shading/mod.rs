@@ -16,8 +16,11 @@ pub fn shade(intersection: &Intersection, scene: &Scene) -> Vec3 {
     }
 
     for light in &scene.lights {
-        // Area lights are path-tracer only; Whitted shading skips them.
-        if matches!(light.light_type, crate::scene::LightType::Rect { .. }) {
+        // Area/dome lights are path-tracer only; Whitted shading skips them.
+        if !matches!(
+            light.light_type,
+            crate::scene::LightType::Point { .. } | crate::scene::LightType::Distant { .. }
+        ) {
             continue;
         }
         let light_dir = light.direction_from(&intersection.point);

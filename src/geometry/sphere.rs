@@ -52,13 +52,17 @@ impl Intersectable for Sphere {
 
         let sqrt_discriminant = discriminant.sqrt();
         let t1 = (-b - sqrt_discriminant) / (2.0 * a);
+        let t2 = (-b + sqrt_discriminant) / (2.0 * a);
 
-        // Only render if nearest intersection is in front of camera
-        // If t1 is behind camera, camera is inside sphere - don't render
-        if t1 <= EPSILON {
+        // Near root, falling back to the far root when the ray starts
+        // inside the sphere (required for glass refraction).
+        let t = if t1 > EPSILON {
+            t1
+        } else if t2 > EPSILON {
+            t2
+        } else {
             return None;
-        }
-        let t = t1;
+        };
 
         let local_hit_point = local_ray.at(t);
 
@@ -80,12 +84,10 @@ impl Intersectable for Sphere {
         let local_normal = (local_hit_point - Point3::origin()).normalize();
         let world_normal = self.inverse_transform.transform_normal(&local_normal).normalize();
 
-        Some(Intersection::new(
-            t_world,
-            world_hit_point,
-            world_normal,
-            self.material_id,
-        ))
+        Some(
+            Intersection::new(t_world, world_hit_point, world_normal, self.material_id)
+                .with_front_face(ray.direction.dot(&world_normal) < 0.0),
+        )
     }
 
     fn describe(&self) -> PrimitiveDesc {

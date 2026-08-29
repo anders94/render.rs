@@ -217,13 +217,17 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 - `--integrator whitted` (default): direct lighting + hard shadows + mirror
   reflections. Fast, deterministic, what the GPU backends speak.
-- `--integrator path`: progressive Monte Carlo **global illumination** —
-  soft shadows, color bleeding, area lights (via `AreaLightSource` on quad
-  polygons), physically-based lobes (Lambert / GGX), next-event estimation
-  with multiple importance sampling, Russian roulette. `--spp N` controls
-  samples per pixel; `-f exr` writes linear HDR. Runs on the CPU (f64
-  reference) or the GPU with `--backend metal` (f32, statistically
-  identical, much faster). See `tests/fixtures/cornell.rib`.
+- `--integrator path`: progressive Monte Carlo **global illumination**
+  with a physically-based material system (`Bxdf "PxrSurface"`: Oren-Nayar
+  diffuse, GGX specular with VNDF sampling, clearcoat, fuzz, rough glass
+  with true refraction, glow, presence cutouts) and physical lights
+  (`Light "PxrRectLight" / PxrSphereLight / PxrDiskLight / PxrDistantLight
+  / PxrDomeLight` with HDRI importance sampling), plus the legacy
+  `AreaLightSource`/`LightSource` forms. NEE + MIS, Russian roulette,
+  energy validated by white-furnace tests. `--spp N` controls samples per
+  pixel; `-f exr` writes linear HDR. Runs on the CPU (f64 reference) or
+  `--backend metal` (f32, statistically identical, faster). See
+  `tests/fixtures/cornell.rib` and `tests/fixtures/shaderball.rib`.
 
 ## Features (rendering)
 

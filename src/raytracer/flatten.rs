@@ -127,12 +127,12 @@ impl FlatScene {
                     LightType::Point { position } => FlatLightKind::Point {
                         position: [position.x as f32, position.y as f32, position.z as f32],
                     },
-                    LightType::Distant { direction } => FlatLightKind::Distant {
+                    LightType::Distant { direction, .. } => FlatLightKind::Distant {
                         direction: [direction.x as f32, direction.y as f32, direction.z as f32],
                     },
-                    // Area lights are path-tracer only; the Whitted GPU
-                    // backends skip them.
-                    LightType::Rect { .. } => return None,
+                    // Area/dome lights are path-tracer only; the Whitted
+                    // GPU backend skips them.
+                    _ => return None,
                 };
                 Some(FlatLight {
                     kind,

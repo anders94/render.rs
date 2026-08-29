@@ -1,27 +1,30 @@
-//! Progressive Monte Carlo path tracer (Phase 1 of ROADMAP.md) — the CPU
-//! reference integrator. Unidirectional path tracing with next-event
-//! estimation, multiple importance sampling (power heuristic), and Russian
-//! roulette. Materials map onto physically-based lobes: matte → Lambert,
-//! plastic → Lambert + GGX coat, metal → GGX conductor.
-//!
-//! The legacy Whitted integrator remains the default until Phase 3
-//! (`--integrator path` opts in); it is also what the GPU backends speak,
-//! so image-parity tests stay pinned to it.
+//! Progressive Monte Carlo path tracer — the CPU reference integrator.
+//! Unidirectional path tracing with next-event estimation, multiple
+//! importance sampling (power heuristic), and Russian roulette, over the
+//! physically-based lobe system in `bxdf` (roadmap Phase 4): Oren-Nayar
+//! diffuse, GGX/VNDF specular, clearcoat, fuzz, rough glass with true
+//! refraction, glow, and presence cutouts. Lights: point, soft distant,
+//! rect/sphere/disk area lights, and HDRI dome with importance sampling.
 
+pub mod bxdf;
 pub mod sampler;
 
 use crate::math::{Point3, Vec3};
 use crate::output::Image;
 use crate::raytracer::{Intersection, Ray};
-use crate::scene::{Light, LightType, Material, MaterialType, Scene};
+use crate::scene::{Light, LightType, Material, Scene};
+use bxdf::Frame;
 use rayon::prelude::*;
 use sampler::Pcg32;
+use std::f64::consts::PI;
 
-const MAX_BOUNCES: usize = 8;
+const MAX_BOUNCES: usize = 10;
 const RR_START: usize = 3;
 /// Clamp per-sample luminance to tame fireflies (small bias, big variance win).
 const FIREFLY_CLAMP: f64 = 60.0;
 const RAY_OFFSET: f64 = 1e-4;
+/// Presence pass-through events do not count as bounces (up to this many).
+const MAX_PRESENCE_SKIPS: usize = 16;
 
 pub fn render(scene: &Scene, spp: u32) -> Image {
     let width = scene.camera.width as usize;
@@ -62,6 +65,33 @@ fn max_component(c: &Vec3) -> f64 {
     c.x.max(c.y).max(c.z)
 }
 
+fn emission_of(material: &Material) -> Vec3 {
+    material.emission + material.pbr.glow
+}
+
+/// Dome light lookup: (index, light) when the scene has one.
+fn dome_of(scene: &Scene) -> Option<(usize, &Light)> {
+    scene
+        .lights
+        .iter()
+        .enumerate()
+        .find(|(_, l)| matches!(l.light_type, LightType::Dome))
+}
+
+fn dome_radiance(light: &Light, dir: &Vec3) -> Vec3 {
+    match &light.env {
+        Some(env) => env.eval(dir) * light.radiance(),
+        None => light.radiance(),
+    }
+}
+
+fn dome_pdf(light: &Light, dir: &Vec3) -> f64 {
+    match &light.env {
+        Some(env) => env.pdf(dir),
+        None => 1.0 / (4.0 * PI),
+    }
+}
+
 fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
     let mut l = Vec3::zero();
     let mut beta = Vec3::one();
@@ -69,55 +99,96 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
     let mut prev_pdf = 0.0f64;
     let mut prev_origin = ray.origin;
     let mut from_camera = true;
+    let mut presence_skips = 0usize;
+    let num_lights = scene.lights.len() as f64;
 
-    for depth in 0..MAX_BOUNCES {
+    let mut depth = 0usize;
+    while depth < MAX_BOUNCES {
         let Some(hit) = scene.intersect(&ray) else {
-            l = l + beta * scene.background_color;
+            // Miss: dome light (with MIS) or flat background.
+            if let Some((_, dome)) = dome_of(scene) {
+                let dir = ray.direction.normalize();
+                let weight = if from_camera {
+                    1.0
+                } else {
+                    let pdf_light = dome_pdf(dome, &dir) / num_lights;
+                    power_heuristic(prev_pdf, pdf_light)
+                };
+                l = l + beta * dome_radiance(dome, &dir) * weight;
+            } else {
+                l = l + beta * scene.background_color;
+            }
             break;
         };
         let material = &scene.materials[hit.material_id];
         let wo = -ray.direction.normalize();
-        // Double-sided shading: normal faces the viewer.
-        let n = if hit.normal.dot(&wo) < 0.0 { -hit.normal } else { hit.normal };
 
-        // Emitter hit: full weight from the camera; MIS-weighted after a
-        // BSDF bounce (NEE already sampled this light directly).
-        if max_component(&material.emission) > 0.0 {
+        // Presence cutout: stochastically pass through.
+        let presence = material.pbr.presence.clamp(0.0, 1.0);
+        if presence < 1.0 && rng.next_f64() >= presence && presence_skips < MAX_PRESENCE_SKIPS {
+            presence_skips += 1;
+            ray = Ray::new(hit.point + ray.direction.normalize() * RAY_OFFSET, ray.direction);
+            continue;
+        }
+
+        // Geometric side decides the relative IOR for glass; shading uses
+        // the viewer-facing normal.
+        let entering = hit.front_face;
+        let n = if hit.normal.dot(&wo) >= 0.0 { hit.normal } else { -hit.normal };
+        let eta_rel = if entering {
+            material.pbr.glass_ior
+        } else {
+            1.0 / material.pbr.glass_ior
+        };
+
+        // Emitter hit.
+        let emission = emission_of(material);
+        if max_component(&emission) > 0.0 {
             let weight = if from_camera {
                 1.0
             } else if let Some(light_idx) = material.area_light {
                 let light = &scene.lights[light_idx];
                 let pdf_light =
-                    rect_pdf_solid_angle(light, &prev_origin, &hit) / scene.lights.len() as f64;
+                    light_pdf_solid_angle(light, &prev_origin, &hit) / num_lights;
                 power_heuristic(prev_pdf, pdf_light)
             } else {
                 1.0
             };
-            l = l + beta * material.emission * weight;
+            l = l + beta * emission * weight;
         }
 
+        let frame = Frame::new(n);
+        let wo_l = frame.to_local(&wo);
+
         // Next-event estimation: sample one light uniformly.
-        if !scene.lights.is_empty() {
+        if !scene.lights.is_empty() && material.pbr.lobe_weights().is_some() {
             let light_idx = rng.next_below(scene.lights.len());
-            let contribution =
-                sample_light(scene, &scene.lights[light_idx], &hit.point, &n, &wo, material, rng);
-            l = l + beta * contribution * scene.lights.len() as f64;
+            let contribution = sample_light(
+                scene,
+                &scene.lights[light_idx],
+                &hit.point,
+                &frame,
+                &wo_l,
+                material,
+                eta_rel,
+                rng,
+            );
+            l = l + beta * contribution * num_lights;
         }
 
         // Continue the path with a BSDF sample.
-        let Some(bsdf_sample) = sample_bsdf(material, &wo, &n, rng) else {
+        let Some(s) = bxdf::sample(&material.pbr, &wo_l, eta_rel, rng) else {
             break;
         };
-        let cos = bsdf_sample.wi.dot(&n).max(0.0);
-        if bsdf_sample.pdf <= 0.0 || cos <= 0.0 {
-            break;
-        }
-        beta = beta * bsdf_sample.f * (cos / bsdf_sample.pdf);
-        prev_pdf = bsdf_sample.pdf;
+        let wi_world = frame.to_world(&s.wi);
+        beta = beta * s.f * (s.wi.z.abs() / s.pdf);
+        prev_pdf = s.pdf;
         prev_origin = hit.point;
         from_camera = false;
 
-        ray = Ray::new(hit.point + n * RAY_OFFSET, bsdf_sample.wi);
+        let offset = if s.transmitted { -RAY_OFFSET } else { RAY_OFFSET };
+        ray = Ray::new(hit.point + n * offset, wi_world);
+        depth += 1;
 
         // Russian roulette.
         if depth >= RR_START {
@@ -137,230 +208,259 @@ fn power_heuristic(pdf_a: f64, pdf_b: f64) -> f64 {
     if a2 + b2 <= 0.0 { 0.0 } else { a2 / (a2 + b2) }
 }
 
-/// Solid-angle pdf of a rect light generating the direction that produced
-/// `hit`, as seen from `origin`.
-fn rect_pdf_solid_angle(light: &Light, origin: &Point3, hit: &Intersection) -> f64 {
-    let LightType::Rect { normal, area, .. } = &light.light_type else {
-        return 0.0;
-    };
-    let d = hit.point - *origin;
-    let dist2 = d.length_squared();
-    let cos_light = (d.normalize().dot(normal)).abs();
-    if cos_light < 1e-9 || *area <= 0.0 {
-        return 0.0;
+/// Solid-angle pdf of an area light generating the direction that produced
+/// `hit`, as seen from `origin` (for MIS weighting of emitter hits).
+fn light_pdf_solid_angle(light: &Light, origin: &Point3, hit: &Intersection) -> f64 {
+    match &light.light_type {
+        LightType::Rect { normal, area, .. } | LightType::DiskArea { normal, area, .. } => {
+            let d = hit.point - *origin;
+            let dist2 = d.length_squared();
+            let cos_light = (d.normalize().dot(normal)).abs();
+            if cos_light < 1e-9 || *area <= 0.0 {
+                return 0.0;
+            }
+            dist2 / (cos_light * area)
+        }
+        LightType::SphereArea { center, radius } => {
+            let dist2 = center.distance_squared(origin);
+            let sin2 = (radius * radius / dist2).min(1.0);
+            let cos_max = (1.0 - sin2).max(0.0).sqrt();
+            let solid_angle = 2.0 * PI * (1.0 - cos_max);
+            if solid_angle < 1e-12 {
+                return 0.0;
+            }
+            1.0 / solid_angle
+        }
+        _ => 0.0,
     }
-    dist2 / (cos_light * area)
 }
 
-/// Direct lighting for one light (contribution already divided by the
-/// light-selection pdf handled by the caller).
+/// Direct lighting for one light. `wo_l` is the outgoing direction in the
+/// shading frame.
+#[allow(clippy::too_many_arguments)]
 fn sample_light(
     scene: &Scene,
     light: &Light,
     p: &Point3,
-    n: &Vec3,
-    wo: &Vec3,
+    frame: &Frame,
+    wo_l: &Vec3,
     material: &Material,
+    eta_rel: f64,
     rng: &mut Pcg32,
 ) -> Vec3 {
+    let n = frame.to_world(&Vec3::new(0.0, 0.0, 1.0));
+    let eval = |wi_world: &Vec3| -> (Vec3, f64) {
+        let wi_l = frame.to_local(wi_world);
+        if wi_l.z <= 0.0 {
+            return (Vec3::zero(), 0.0);
+        }
+        bxdf::eval_pdf(&material.pbr, wo_l, &wi_l, eta_rel)
+    };
+
     match &light.light_type {
         LightType::Point { position } => {
             let to_light = *position - *p;
             let dist2 = to_light.length_squared().max(1e-12);
             let wi = to_light.normalize();
-            let cos = wi.dot(n).max(0.0);
-            if cos <= 0.0 || occluded_between(scene, p, n, position) {
+            let (f, _) = eval(&wi);
+            if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            // Physically-based inverse-square falloff (the path tracer is
-            // physical even where the Whitted integrator is not).
-            bsdf_eval(material, wo, &wi, n) * light.radiance() * (cos / dist2)
+            let vis = visibility_to(scene, p, &n, position);
+            if vis <= 0.0 {
+                return Vec3::zero();
+            }
+            f * light.radiance() * (wi.dot(&n).max(0.0) * vis / dist2)
         }
-        LightType::Distant { direction } => {
-            let wi = -*direction;
-            let cos = wi.dot(n).max(0.0);
-            if cos <= 0.0 || occluded_toward(scene, p, n, &wi) {
+        LightType::Distant { direction, angular_radius } => {
+            let base = -*direction;
+            let (wi, pdf_sa) = if *angular_radius > 1e-5 {
+                let cos_max = angular_radius.cos();
+                let (u, v) = rng.next_2d();
+                let cos_t = 1.0 - u * (1.0 - cos_max);
+                let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
+                let phi = 2.0 * PI * v;
+                let lf = Frame::new(base);
+                let wi = lf.to_world(&Vec3::new(
+                    sin_t * phi.cos(),
+                    sin_t * phi.sin(),
+                    cos_t,
+                ));
+                (wi, 1.0 / (2.0 * PI * (1.0 - cos_max)))
+            } else {
+                (base, 0.0)
+            };
+            let (f, _) = eval(&wi);
+            if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            bsdf_eval(material, wo, &wi, n) * light.radiance() * cos
+            let vis = visibility_toward(scene, p, &n, &wi);
+            if vis <= 0.0 {
+                return Vec3::zero();
+            }
+            let cos = wi.dot(&n).max(0.0);
+            if pdf_sa > 0.0 {
+                // Soft sun: radiance constant over the cone; dividing the
+                // cone pdf by itself leaves f * L * cos.
+                f * light.radiance() * (cos * vis)
+            } else {
+                f * light.radiance() * (cos * vis)
+            }
         }
         LightType::Rect { corner, edge1, edge2, normal, area } => {
             let (u, v) = rng.next_2d();
             let sample_point = *corner + *edge1 * u + *edge2 * v;
-            let to_light = sample_point - *p;
-            let dist2 = to_light.length_squared().max(1e-12);
-            let wi = to_light.normalize();
-            let cos_surface = wi.dot(n).max(0.0);
-            let cos_light = wi.dot(normal).abs(); // double-sided emitter
-            if cos_surface <= 0.0 || cos_light < 1e-9 || *area <= 0.0 {
+            area_light_contribution(
+                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, material, eta_rel,
+            )
+        }
+        LightType::DiskArea { center, e1, e2, normal, area } => {
+            // Uniform disk sample.
+            let (u, v) = rng.next_2d();
+            let r = u.sqrt();
+            let phi = 2.0 * PI * v;
+            let sample_point = *center + *e1 * (r * phi.cos()) + *e2 * (r * phi.sin());
+            area_light_contribution(
+                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, material, eta_rel,
+            )
+        }
+        LightType::SphereArea { center, radius } => {
+            let to_center = *center - *p;
+            let dist2 = to_center.length_squared();
+            if dist2 <= radius * radius * 1.0001 {
+                return Vec3::zero(); // inside the light
+            }
+            let sin2 = (radius * radius / dist2).min(1.0);
+            let cos_max = (1.0 - sin2).max(0.0).sqrt();
+            let (u, v) = rng.next_2d();
+            let cos_t = 1.0 - u * (1.0 - cos_max);
+            let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
+            let phi = 2.0 * PI * v;
+            let lf = Frame::new(to_center.normalize());
+            let wi = lf.to_world(&Vec3::new(sin_t * phi.cos(), sin_t * phi.sin(), cos_t));
+            let (f, bsdf_pdf) = eval(&wi);
+            if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            if occluded_between(scene, p, n, &sample_point) {
+            // Occlusion up to the sphere surface along wi.
+            let dist = dist2.sqrt() * cos_t
+                - (radius * radius - dist2 * sin_t * sin_t).max(0.0).sqrt();
+            let target = *p + wi * dist;
+            let vis = visibility_to(scene, p, &n, &target);
+            if vis <= 0.0 {
                 return Vec3::zero();
             }
-            let pdf_sa = dist2 / (cos_light * area);
-            let f = bsdf_eval(material, wo, &wi, n);
-            let bsdf_pdf = bsdf_pdf(material, wo, &wi, n);
+            let pdf_sa = 1.0 / (2.0 * PI * (1.0 - cos_max)).max(1e-12);
             let weight = power_heuristic(pdf_sa, bsdf_pdf);
-            f * light.radiance() * (cos_surface / pdf_sa) * weight
+            f * light.radiance() * (wi.dot(&n).max(0.0) * vis / pdf_sa) * weight
+        }
+        LightType::Dome => {
+            let (wi, radiance, pdf_sa) = match &light.env {
+                Some(env) => {
+                    let (u, v) = rng.next_2d();
+                    let (dir, rad, pdf) = env.sample(u, v);
+                    (dir, rad * light.radiance(), pdf)
+                }
+                None => {
+                    // Constant dome: uniform sphere, matching dome_pdf()
+                    // exactly (the MIS weights must use the same density on
+                    // both the NEE and BSDF-hit sides).
+                    let (u, v) = rng.next_2d();
+                    let z = 1.0 - 2.0 * u;
+                    let r = (1.0 - z * z).max(0.0).sqrt();
+                    let phi = 2.0 * PI * v;
+                    let wi = Vec3::new(r * phi.cos(), r * phi.sin(), z);
+                    (wi, light.radiance(), 1.0 / (4.0 * PI))
+                }
+            };
+            if pdf_sa <= 0.0 {
+                return Vec3::zero();
+            }
+            let (f, bsdf_pdf) = eval(&wi);
+            if max_component(&f) <= 0.0 {
+                return Vec3::zero();
+            }
+            let vis = visibility_toward(scene, p, &n, &wi);
+            if vis <= 0.0 {
+                return Vec3::zero();
+            }
+            let weight = power_heuristic(pdf_sa, bsdf_pdf);
+            f * radiance * (wi.dot(&n).max(0.0) * vis / pdf_sa) * weight
         }
     }
 }
 
-fn occluded_between(scene: &Scene, p: &Point3, n: &Vec3, target: &Point3) -> bool {
-    let dir = *target - *p;
-    let dist = dir.length();
-    let ray = Ray::new(*p + *n * RAY_OFFSET, dir.normalize());
-    match scene.intersect(&ray) {
-        Some(hit) => hit.t < dist - 1e-3,
-        None => false,
-    }
-}
-
-fn occluded_toward(scene: &Scene, p: &Point3, n: &Vec3, wi: &Vec3) -> bool {
-    let ray = Ray::new(*p + *n * RAY_OFFSET, *wi);
-    scene.intersect(&ray).is_some()
-}
-
-// ---------------------------------------------------------------------------
-// BSDF lobes: matte → Lambert; plastic → Lambert + GGX (F0 = 0.04);
-// metal → GGX conductor (F0 = base color). Roughness maps to alpha = r².
-
-struct BsdfSample {
-    wi: Vec3,
-    f: Vec3,
-    pdf: f64,
-}
-
-fn material_lobes(material: &Material) -> (Vec3, f64, f64) {
-    // (diffuse albedo, ggx alpha, probability of sampling the specular lobe)
-    match material.material_type {
-        MaterialType::Matte => (material.color, 0.0, 0.0),
-        MaterialType::Plastic { roughness } => {
-            (material.color, alpha_from(roughness), 0.25)
-        }
-        MaterialType::Metal { roughness } => (Vec3::zero(), alpha_from(roughness), 1.0),
-    }
-}
-
-fn alpha_from(roughness: f64) -> f64 {
-    (roughness * roughness).clamp(1e-4, 1.0)
-}
-
-fn fresnel_schlick(f0: Vec3, cos: f64) -> Vec3 {
-    let m = (1.0 - cos).clamp(0.0, 1.0).powi(5);
-    f0 + (Vec3::one() - f0) * m
-}
-
-fn specular_f0(material: &Material) -> Vec3 {
-    match material.material_type {
-        MaterialType::Metal { .. } => material.color,
-        _ => Vec3::new(0.04, 0.04, 0.04),
-    }
-}
-
-fn ggx_d(n_dot_h: f64, alpha: f64) -> f64 {
-    let a2 = alpha * alpha;
-    let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
-    a2 / (std::f64::consts::PI * d * d)
-}
-
-fn ggx_g1(n_dot_v: f64, alpha: f64) -> f64 {
-    let a2 = alpha * alpha;
-    let denom = n_dot_v + (a2 + (1.0 - a2) * n_dot_v * n_dot_v).sqrt();
-    if denom <= 0.0 { 0.0 } else { 2.0 * n_dot_v / denom }
-}
-
-/// Build an orthonormal basis around n.
-fn basis(n: &Vec3) -> (Vec3, Vec3) {
-    let t = if n.x.abs() > 0.9 {
-        Vec3::new(0.0, 1.0, 0.0)
-    } else {
-        Vec3::new(1.0, 0.0, 0.0)
-    };
-    let b1 = n.cross(&t).normalize();
-    let b2 = n.cross(&b1);
-    (b1, b2)
-}
-
-fn cosine_sample(n: &Vec3, rng: &mut Pcg32) -> (Vec3, f64) {
-    let (u, v) = rng.next_2d();
-    let r = u.sqrt();
-    let phi = 2.0 * std::f64::consts::PI * v;
-    let (b1, b2) = basis(n);
-    let wi = (b1 * (r * phi.cos()) + b2 * (r * phi.sin()) + *n * (1.0 - u).sqrt()).normalize();
-    let pdf = wi.dot(n).max(0.0) / std::f64::consts::PI;
-    (wi, pdf)
-}
-
-fn ggx_sample_half(n: &Vec3, alpha: f64, rng: &mut Pcg32) -> Vec3 {
-    let (u, v) = rng.next_2d();
-    let phi = 2.0 * std::f64::consts::PI * v;
-    let cos_theta = ((1.0 - u) / (u * (alpha * alpha - 1.0) + 1.0)).sqrt();
-    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
-    let (b1, b2) = basis(n);
-    (b1 * (sin_theta * phi.cos()) + b2 * (sin_theta * phi.sin()) + *n * cos_theta).normalize()
-}
-
-fn bsdf_eval(material: &Material, wo: &Vec3, wi: &Vec3, n: &Vec3) -> Vec3 {
-    let n_dot_o = n.dot(wo).max(0.0);
-    let n_dot_i = n.dot(wi).max(0.0);
-    if n_dot_o <= 0.0 || n_dot_i <= 0.0 {
+#[allow(clippy::too_many_arguments)]
+fn area_light_contribution(
+    scene: &Scene,
+    p: &Point3,
+    frame: &Frame,
+    n: &Vec3,
+    sample_point: &Point3,
+    light_normal: &Vec3,
+    area: f64,
+    light: &Light,
+    wo_l: &Vec3,
+    material: &Material,
+    eta_rel: f64,
+) -> Vec3 {
+    let to_light = *sample_point - *p;
+    let dist2 = to_light.length_squared().max(1e-12);
+    let wi = to_light.normalize();
+    let wi_l = frame.to_local(&wi);
+    if wi_l.z <= 0.0 {
         return Vec3::zero();
     }
-    let (albedo, alpha, p_spec) = material_lobes(material);
-    let mut f = Vec3::zero();
-    if p_spec < 1.0 {
-        f = f + albedo * (1.0 / std::f64::consts::PI);
+    let cos_light = wi.dot(light_normal).abs(); // double-sided emitter
+    if cos_light < 1e-9 || area <= 0.0 {
+        return Vec3::zero();
     }
-    if p_spec > 0.0 {
-        let h = (*wo + *wi).normalize();
-        let n_dot_h = n.dot(&h).max(0.0);
-        let o_dot_h = wo.dot(&h).max(1e-9);
-        let d = ggx_d(n_dot_h, alpha);
-        let g = ggx_g1(n_dot_o, alpha) * ggx_g1(n_dot_i, alpha);
-        let fresnel = fresnel_schlick(specular_f0(material), o_dot_h);
-        f = f + fresnel * (d * g / (4.0 * n_dot_o * n_dot_i).max(1e-9));
+    let (f, bsdf_pdf) = bxdf::eval_pdf(&material.pbr, wo_l, &wi_l, eta_rel);
+    if max_component(&f) <= 0.0 {
+        return Vec3::zero();
     }
-    f
+    let vis = visibility_to(scene, p, n, sample_point);
+    if vis <= 0.0 {
+        return Vec3::zero();
+    }
+    let pdf_sa = dist2 / (cos_light * area);
+    let weight = power_heuristic(pdf_sa, bsdf_pdf);
+    f * light.radiance() * (wi_l.z.max(0.0) * vis / pdf_sa) * weight
 }
 
-fn bsdf_pdf(material: &Material, wo: &Vec3, wi: &Vec3, n: &Vec3) -> f64 {
-    let n_dot_i = n.dot(wi).max(0.0);
-    if n_dot_i <= 0.0 {
-        return 0.0;
-    }
-    let (_, alpha, p_spec) = material_lobes(material);
-    let pdf_diffuse = n_dot_i / std::f64::consts::PI;
-    if p_spec <= 0.0 {
-        return pdf_diffuse;
-    }
-    let h = (*wo + *wi).normalize();
-    let n_dot_h = n.dot(&h).max(0.0);
-    let o_dot_h = wo.dot(&h).abs().max(1e-9);
-    let pdf_spec = ggx_d(n_dot_h, alpha) * n_dot_h / (4.0 * o_dot_h);
-    (1.0 - p_spec) * pdf_diffuse + p_spec * pdf_spec
+/// Fractional visibility toward a point (presence cutouts attenuate).
+fn visibility_to(scene: &Scene, p: &Point3, n: &Vec3, target: &Point3) -> f64 {
+    let dir = *target - *p;
+    let dist = dir.length();
+    transmittance(scene, *p + *n * RAY_OFFSET, dir.normalize(), dist - 1e-3)
 }
 
-fn sample_bsdf(material: &Material, wo: &Vec3, n: &Vec3, rng: &mut Pcg32) -> Option<BsdfSample> {
-    let (_, alpha, p_spec) = material_lobes(material);
-    let wi = if rng.next_f64() < p_spec {
-        let h = ggx_sample_half(n, alpha, rng);
-        let wi = (-*wo).reflect(&h);
-        if wi.dot(n) <= 0.0 {
-            return None;
+fn visibility_toward(scene: &Scene, p: &Point3, n: &Vec3, wi: &Vec3) -> f64 {
+    transmittance(scene, *p + *n * RAY_OFFSET, *wi, f64::INFINITY)
+}
+
+/// Walks blockers along a shadow ray; opaque surfaces kill it, presence
+/// cutouts multiply through.
+fn transmittance(scene: &Scene, mut origin: Point3, dir: Vec3, mut remaining: f64) -> f64 {
+    let mut vis = 1.0;
+    for _ in 0..MAX_PRESENCE_SKIPS {
+        let ray = Ray::new(origin, dir);
+        let Some(hit) = scene.intersect(&ray) else {
+            return vis;
+        };
+        if hit.t >= remaining {
+            return vis;
         }
-        wi
-    } else {
-        cosine_sample(n, rng).0
-    };
-    let pdf = bsdf_pdf(material, wo, &wi, n);
-    if pdf <= 0.0 {
-        return None;
+        let presence = scene.materials[hit.material_id].pbr.presence.clamp(0.0, 1.0);
+        if presence >= 1.0 {
+            return 0.0;
+        }
+        vis *= 1.0 - presence;
+        if vis < 1e-4 {
+            return 0.0;
+        }
+        origin = hit.point + dir * RAY_OFFSET;
+        remaining -= hit.t + RAY_OFFSET;
     }
-    Some(BsdfSample {
-        f: bsdf_eval(material, wo, &wi, n),
-        wi,
-        pdf,
-    })
+    vis
 }

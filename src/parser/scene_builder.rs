@@ -12,6 +12,7 @@ use crate::geometry::{
 };
 use crate::math::{Matrix4, Point3, Vec3};
 use crate::scene::*;
+use std::sync::Arc as StdArc;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -32,6 +33,8 @@ struct GraphicsState {
     /// Active AreaLightSource: (intensity, color). Subsequent geometry in
     /// this attribute block becomes emissive.
     area_light: Option<(f64, Vec3)>,
+    /// Modern material from a `Bxdf` request; overrides `Surface` mapping.
+    bxdf: Option<PbrParams>,
 }
 
 impl Default for GraphicsState {
@@ -45,6 +48,7 @@ impl Default for GraphicsState {
             sides: 2,
             shading_rate: 1.0,
             area_light: None,
+            bxdf: None,
         }
     }
 }
@@ -386,6 +390,20 @@ impl SceneBuilder {
                     data.lights.push(light);
                 }
             }
+            "Bxdf" => {
+                let bxdf_type = req.string(0).unwrap_or("");
+                if bxdf_type != "PxrSurface" {
+                    self.warn_once(&format!(
+                        "Bxdf \"{bxdf_type}\" not implemented; treating as PxrSurface"
+                    ));
+                }
+                let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
+                self.state.bxdf =
+                    Some(PbrParams::from_bxdf_params(&req.params_from(params_start)));
+            }
+            "Light" => {
+                self.build_light(req, data);
+            }
             "AreaLightSource" => {
                 let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
                 let params = req.params_from(params_start);
@@ -709,6 +727,104 @@ impl SceneBuilder {
             .insert(format!("request:{}", req.name), req.values.clone());
     }
 
+    /// Modern `Light "PxrX" "handle" params...` — the light's shape comes
+    /// from the current transform (unit primitives in light space, PRMan
+    /// style), and area lights get matching emissive geometry so BSDF rays
+    /// see them (with MIS via material.area_light).
+    fn build_light(&mut self, req: &RibRequest, data: &mut SceneData) {
+        let Some(light_type) = req.string(0) else { return };
+        let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
+        let params = req.params_from(params_start);
+        let intensity = params.get_number("intensity").unwrap_or(1.0);
+        let exposure = params.get_number("exposure").unwrap_or(0.0);
+        let scale = intensity * exposure.exp2();
+        let color = params
+            .get_numbers("lightColor")
+            .and_then(|v| (v.len() >= 3).then(|| Vec3::new(v[0], v[1], v[2])))
+            .unwrap_or(Vec3::one());
+        let xf = self.transform_stack.current();
+        let origin = xf.transform_point(&Point3::new(0.0, 0.0, 0.0));
+
+        // Emissive stand-in material for area lights: black lobes, pure
+        // emitter, tagged with the light index for MIS.
+        let mut emitter = Material::matte(Vec3::zero());
+        emitter.emission = color * scale;
+        let light_idx = data.lights.len();
+        emitter.area_light = Some(light_idx);
+
+        match light_type {
+            "PxrRectLight" => {
+                // Unit square in light-space XY.
+                let corner = xf.transform_point(&Point3::new(-0.5, -0.5, 0.0));
+                let e1 = xf.transform_vec(&Vec3::new(1.0, 0.0, 0.0));
+                let e2 = xf.transform_vec(&Vec3::new(0.0, 1.0, 0.0));
+                data.lights.push(Light::rect(corner, e1, e2, scale, color));
+                data.materials.push(emitter);
+                let id = data.materials.len() - 1;
+                let v = |x: f64, y: f64| [x, y, 0.0];
+                data.objects.push(StdArc::new(Triangle::new(
+                    v(-0.5, -0.5),
+                    v(0.5, -0.5),
+                    v(0.5, 0.5),
+                    id,
+                    xf,
+                )));
+                data.objects.push(StdArc::new(Triangle::new(
+                    v(-0.5, -0.5),
+                    v(0.5, 0.5),
+                    v(-0.5, 0.5),
+                    id,
+                    xf,
+                )));
+            }
+            "PxrSphereLight" => {
+                let radius = xf.transform_vec(&Vec3::new(0.5, 0.0, 0.0)).length();
+                data.lights.push(Light::sphere_area(origin, radius, scale, color));
+                data.materials.push(emitter);
+                let id = data.materials.len() - 1;
+                data.objects
+                    .push(StdArc::new(Sphere::new(0.5, -0.5, 0.5, 360.0, id, xf)));
+            }
+            "PxrDiskLight" => {
+                let e1 = xf.transform_vec(&Vec3::new(0.5, 0.0, 0.0));
+                let e2 = xf.transform_vec(&Vec3::new(0.0, 0.5, 0.0));
+                data.lights.push(Light::disk_area(origin, e1, e2, scale, color));
+                data.materials.push(emitter);
+                let id = data.materials.len() - 1;
+                data.objects
+                    .push(StdArc::new(crate::geometry::Disk::new(0.0, 0.5, 360.0, id, xf)));
+            }
+            "PxrDistantLight" => {
+                let direction = xf.transform_vec(&Vec3::new(0.0, 0.0, -1.0)).normalize();
+                let angle_deg = params.get_number("angleExtent").unwrap_or(0.53);
+                let angular_radius = (angle_deg * 0.5).to_radians();
+                data.lights
+                    .push(Light::distant_soft(direction, angular_radius, scale, color));
+            }
+            "PxrDomeLight" => {
+                let env = params.get_string("lightColorMap").and_then(|file| {
+                    let path = match &self.base_dir {
+                        Some(dir) => dir.join(file),
+                        None => PathBuf::from(file),
+                    };
+                    match crate::scene::EnvMap::load(&path) {
+                        Ok(map) => Some(StdArc::new(map)),
+                        Err(e) => {
+                            self.warn_once(&format!("PxrDomeLight map: {e:#}"));
+                            None
+                        }
+                    }
+                });
+                data.lights.push(Light::dome(scale, color, env));
+            }
+            other => {
+                self.warn_once(&format!(
+                    "Light \"{other}\" not implemented (see COMPLIANCE.md); skipping"
+                ));
+            }
+        }
+    }
+
     fn parse_light(&self, req: &RibRequest) -> Option<Light> {
         let light_type = req.string(0)?;
         // `LightSource "type" <handle> params...` — the handle (number or
@@ -744,6 +860,13 @@ impl SceneBuilder {
 
     /// Material from the current attribute state.
     fn make_material(&self) -> Material {
+        if let Some(pbr) = &self.state.bxdf {
+            // Whitted fallback terms approximated from the lobe params.
+            let mut m = Material::matte(pbr.diffuse_color);
+            m.pbr = pbr.clone();
+            m.emission = Vec3::zero();
+            return m;
+        }
         match self.state.surface.as_str() {
             "plastic" => Material::plastic(self.state.color, self.state.roughness),
             "metal" => Material::metal(self.state.color, self.state.roughness),

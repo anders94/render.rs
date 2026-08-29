@@ -1,0 +1,88 @@
+##RenderMan RIB-Structure 1.1
+# Phase 4 demo gate: material lineup under an HDRI dome.
+# Requires tests/fixtures/sky.hdr (scripts/gen_hdri.py).
+version 3.04
+Display "shaderball.exr" "file" "rgb"
+Format 1280 640 1.0
+Projection "perspective" "fov" [33]
+# Camera: up 2.2, pitched down 8 degrees.
+Rotate -8 1 0 0
+Translate 0 -2.2 0
+
+WorldBegin
+    Light "PxrDomeLight" "sky" "intensity" [1] "lightColorMap" ["sky.hdr"]
+
+    # Ground
+    Bxdf "PxrSurface" "ground" "diffuseColor" [0.42 0.42 0.44] "diffuseRoughness" [0.4]
+        "specularIor" [1.4] "specularRoughness" [0.5]
+    Polygon "P" [-200 0 -20  200 0 -20  200 0 400  -200 0 400]
+
+    # --- lineup, left to right ------------------------------------------
+
+    # Gold
+    AttributeBegin
+        Bxdf "PxrSurface" "gold"
+            "diffuseGain" [0]
+            "specularFaceColor" [1.0 0.71 0.29]
+            "specularEdgeColor" [1.0 0.9 0.7]
+            "specularRoughness" [0.12]
+        Translate -5.0 1.0 14
+        Sphere 1 -1 1 360
+    AttributeEnd
+
+    # Copper (rougher)
+    AttributeBegin
+        Bxdf "PxrSurface" "copper"
+            "diffuseGain" [0]
+            "specularFaceColor" [0.95 0.54 0.43]
+            "specularEdgeColor" [1.0 0.8 0.7]
+            "specularRoughness" [0.3]
+        Translate -3.0 1.0 14
+        Sphere 1 -1 1 360
+    AttributeEnd
+
+    # Glass
+    AttributeBegin
+        Bxdf "PxrSurface" "glass"
+            "diffuseGain" [0]
+            "glassRefractionGain" [1]
+            "glassIor" [1.5]
+            "glassRoughness" [0.02]
+        Translate -1.0 1.0 14
+        Sphere 1 -1 1 360
+    AttributeEnd
+
+    # Red plastic
+    AttributeBegin
+        Bxdf "PxrSurface" "plastic"
+            "diffuseColor" [0.55 0.06 0.04]
+            "specularIor" [1.5]
+            "specularRoughness" [0.08]
+        Translate 1.0 1.0 14
+        Sphere 1 -1 1 360
+    AttributeEnd
+
+    # Velvet (fuzz-dominant)
+    AttributeBegin
+        Bxdf "PxrSurface" "velvet"
+            "diffuseColor" [0.12 0.02 0.18]
+            "diffuseGain" [0.7]
+            "specularIor" [1]
+            "fuzzGain" [2.5]
+            "fuzzColor" [0.65 0.35 0.85]
+        Translate 3.0 1.0 14
+        Sphere 1 -1 1 360
+    AttributeEnd
+
+    # Car paint: deep red + clearcoat
+    AttributeBegin
+        Bxdf "PxrSurface" "carpaint"
+            "diffuseColor" [0.32 0.015 0.02]
+            "specularFaceColor" [0.05 0.01 0.01]
+            "specularRoughness" [0.35]
+            "clearcoatGain" [1]
+            "clearcoatRoughness" [0.02]
+        Translate 5.0 1.0 14
+        Sphere 1 -1 1 360
+    AttributeEnd
+WorldEnd

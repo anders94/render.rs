@@ -48,11 +48,13 @@ skipped forever.
 ## Attributes & shading state
 | Request | Status | Notes |
 |---|---|---|
-| Color / Opacity | ✅ / 🟡 | opacity render effect ⏭ P4 |
+| Color / Opacity | ✅ / 🟡 | use PxrSurface "presence" for cutouts (transparent shadows) |
 | Surface | ✅ | legacy matte/plastic/metal mapping |
-| Bxdf / Pattern / Displace / Light | ⏭ P4/P6 | the modern requests |
+| Bxdf "PxrSurface" | ✅ | full lobe stack: Oren-Nayar diffuse, GGX/VNDF specular (F0/F90 or IOR), clearcoat, fuzz, rough glass with refraction, glow, presence |
+| Light "PxrRect/Sphere/Disk/Distant/DomeLight" | ✅ | shapes from the current transform; dome takes "lightColorMap" HDRI with 2D-CDF importance sampling |
+| Pattern / Displace | ⏭ P6/P5 | |
 | LightSource / AreaLightSource | ✅ / ✅ | point+distant; quad polygons under AreaLightSource become sampleable rect lights (path integrator) |
-| Illuminate (light linking) | ⏭ P4 | |
+| Illuminate (light linking) | ⏭ P6 | |
 | Atmosphere / Interior / Exterior | ⏭ P10 | |
 | Displacement (RSL-era) | 🚫 | RSL-only; `Displace` is the modern path |
 | Orientation / ReverseOrientation / Sides | 🟡 | honored for meshes at P2 |

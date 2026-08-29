@@ -8,7 +8,7 @@
 use super::scene_buffers::{as_bytes, gpu_object, GpuObject};
 use crate::accel::Bvh;
 use crate::raytracer::flatten::{matrix_to_f32, FlatObject};
-use crate::scene::{LightType, MaterialType, Scene};
+use crate::scene::{LightType, Scene};
 use anyhow::Result;
 
 pub const MAX_BOUNCES: u32 = 8;
@@ -53,26 +53,37 @@ pub struct GpuInstance {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GpuPtMaterial {
-    pub color: [f32; 3],
-    /// 0 matte, 1 plastic, 2 metal (mirrors pt::material_lobes).
-    pub kind: u32,
+    pub diffuse_gain: f32,
+    pub diffuse_color: [f32; 3],
+    pub diffuse_sigma: f32,
+    pub spec_f0: [f32; 3],
+    pub spec_f90: [f32; 3],
+    pub spec_alpha: f32,
+    pub coat_gain: f32,
+    pub coat_alpha: f32,
+    pub fuzz_gain: f32,
+    pub fuzz_color: [f32; 3],
+    pub glass_gain: f32,
+    pub glass_ior: f32,
+    pub glass_alpha: f32,
+    pub refr_color: [f32; 3],
     pub emission: [f32; 3],
-    /// GGX alpha = roughness^2 (clamped as on CPU).
-    pub alpha: f32,
-    /// Index into the light table when this material is an area light;
-    /// u32::MAX otherwise.
+    pub presence: f32,
+    /// Precomputed under_layer_scale (energy layering).
+    pub under_scale: f32,
+    /// Precomputed normalized lobe-selection weights (d, s, c, f, g);
+    /// all-zero when the material reflects nothing.
+    pub weights: [f32; 5],
     pub area_light: u32,
-    /// Probability of sampling the specular lobe.
-    pub p_spec: f32,
-    pub pad: [f32; 2],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GpuPtLight {
-    /// 0 point, 1 distant, 2 rect.
+    /// 0 point, 1 distant, 2 rect, 3 sphere, 4 disk, 5 dome.
+    /// distant reuses `area` as angular_radius; sphere reuses it as radius.
     pub kind: u32,
-    /// point: position; distant: direction; rect: corner.
+    /// point/sphere: position; distant: direction; rect: corner; disk: center.
     pub a: [f32; 3],
     pub e1: [f32; 3],
     pub e2: [f32; 3],
@@ -104,14 +115,19 @@ pub struct GpuPtUniforms {
     pub up: [f32; 3],
     pub half_width: f32,
     pub half_height: f32,
+    /// Index of the dome light, or u32::MAX.
+    pub dome_index: u32,
+    pub env_width: u32,
+    pub env_height: u32,
+    pub env_total: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
 const _: () = assert!(std::mem::size_of::<GpuMeshInfo>() == 16);
 const _: () = assert!(std::mem::size_of::<GpuInstance>() == 144);
-const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 48);
+const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 140);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
-const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 112);
+const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 128);
 
 pub struct GpuPtScene {
     pub objects: Vec<GpuObject>,
@@ -128,6 +144,9 @@ pub struct GpuPtScene {
     /// Parallel to vertices (zeros when a mesh has none).
     pub normals: Vec<f32>,
     pub mesh_infos: Vec<GpuMeshInfo>,
+    pub env_pixels: Vec<f32>,
+    pub env_marginal: Vec<f32>,
+    pub env_conditional: Vec<f32>,
     pub uniforms: GpuPtUniforms,
 }
 
@@ -161,55 +180,76 @@ impl GpuPtScene {
             object_materials.push(desc.material_id as u32);
         }
 
-        // Materials: mirror pt::material_lobes exactly.
+        // Materials: full PBR lobe parameters with values the kernel
+        // would otherwise re-derive (F0, alphas, layering, weights)
+        // precomputed on the CPU for exact agreement with pt::bxdf.
         let materials: Vec<GpuPtMaterial> = scene
             .materials
             .iter()
             .map(|m| {
-                let (kind, alpha, p_spec) = match m.material_type {
-                    MaterialType::Matte => (0u32, 0.0f32, 0.0f32),
-                    MaterialType::Plastic { roughness } => {
-                        (1, alpha_from(roughness), 0.25)
-                    }
-                    MaterialType::Metal { roughness } => (2, alpha_from(roughness), 1.0),
-                };
+                let p = &m.pbr;
+                let f0 = p.specular_f0();
+                let weights = p.lobe_weights().unwrap_or([0.0; 5]);
+                let spec_take = 0.2126 * f0.x + 0.7152 * f0.y + 0.0722 * f0.z;
+                let coat_take = 0.04 * p.clearcoat_gain;
+                let under = ((1.0 - spec_take) * (1.0 - coat_take)).clamp(0.0, 1.0);
+                let alpha = |r: f64| ((r * r).clamp(2.5e-5, 1.0)) as f32;
                 GpuPtMaterial {
-                    color: v3(&m.color),
-                    kind,
-                    emission: v3(&m.emission),
-                    alpha,
+                    diffuse_gain: p.diffuse_gain as f32,
+                    diffuse_color: v3(&p.diffuse_color),
+                    diffuse_sigma: p.diffuse_roughness as f32,
+                    spec_f0: v3(&f0),
+                    spec_f90: v3(&p.specular_edge_color),
+                    spec_alpha: alpha(p.specular_roughness),
+                    coat_gain: p.clearcoat_gain as f32,
+                    coat_alpha: alpha(p.clearcoat_roughness),
+                    fuzz_gain: p.fuzz_gain as f32,
+                    fuzz_color: v3(&p.fuzz_color),
+                    glass_gain: p.glass_gain as f32,
+                    glass_ior: p.glass_ior as f32,
+                    glass_alpha: alpha(p.glass_roughness),
+                    refr_color: v3(&p.refraction_color),
+                    emission: v3(&(m.emission + p.glow)),
+                    presence: p.presence as f32,
+                    under_scale: under as f32,
+                    weights: weights.map(|w| w as f32),
                     area_light: m.area_light.map(|i| i as u32).unwrap_or(u32::MAX),
-                    p_spec,
-                    pad: [0.0; 2],
                 }
             })
             .collect();
 
+        let mut env_pixels: Vec<f32> = Vec::new();
+        let mut env_marginal: Vec<f32> = Vec::new();
+        let mut env_conditional: Vec<f32> = Vec::new();
+        let mut dome_index = u32::MAX;
+        let mut env_dims = (0u32, 0u32, 0.0f32);
+
         let lights: Vec<GpuPtLight> = scene
             .lights
             .iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(i, l)| {
                 let radiance = v3(&(l.color * l.intensity));
+                let zero = GpuPtLight {
+                    kind: 0,
+                    a: [0.0; 3],
+                    e1: [0.0; 3],
+                    e2: [0.0; 3],
+                    normal: [0.0; 3],
+                    area: 0.0,
+                    radiance,
+                    pad: [0.0; 2],
+                };
                 match &l.light_type {
                     LightType::Point { position } => GpuPtLight {
-                        kind: 0,
                         a: [position.x as f32, position.y as f32, position.z as f32],
-                        e1: [0.0; 3],
-                        e2: [0.0; 3],
-                        normal: [0.0; 3],
-                        area: 0.0,
-                        radiance,
-                        pad: [0.0; 2],
+                        ..zero
                     },
-                    LightType::Distant { direction } => GpuPtLight {
+                    LightType::Distant { direction, angular_radius } => GpuPtLight {
                         kind: 1,
                         a: v3(direction),
-                        e1: [0.0; 3],
-                        e2: [0.0; 3],
-                        normal: [0.0; 3],
-                        area: 0.0,
-                        radiance,
-                        pad: [0.0; 2],
+                        area: *angular_radius as f32,
+                        ..zero
                     },
                     LightType::Rect { corner, edge1, edge2, normal, area } => GpuPtLight {
                         kind: 2,
@@ -218,9 +258,34 @@ impl GpuPtScene {
                         e2: v3(edge2),
                         normal: v3(normal),
                         area: *area as f32,
-                        radiance,
-                        pad: [0.0; 2],
+                        ..zero
                     },
+                    LightType::SphereArea { center, radius } => GpuPtLight {
+                        kind: 3,
+                        a: [center.x as f32, center.y as f32, center.z as f32],
+                        area: *radius as f32,
+                        ..zero
+                    },
+                    LightType::DiskArea { center, e1, e2, normal, area } => GpuPtLight {
+                        kind: 4,
+                        a: [center.x as f32, center.y as f32, center.z as f32],
+                        e1: v3(e1),
+                        e2: v3(e2),
+                        normal: v3(normal),
+                        area: *area as f32,
+                        ..zero
+                    },
+                    LightType::Dome => {
+                        dome_index = i as u32;
+                        if let Some(env) = &l.env {
+                            let (w, h, px, marg, cond, total) = env.export();
+                            env_dims = (w as u32, h as u32, total as f32);
+                            env_pixels = px;
+                            env_marginal = marg;
+                            env_conditional = cond;
+                        }
+                        GpuPtLight { kind: 5, ..zero }
+                    }
                 }
             })
             .collect();
@@ -309,6 +374,10 @@ impl GpuPtScene {
             up: [cam.up.x as f32, cam.up.y as f32, cam.up.z as f32],
             half_width: half_width as f32,
             half_height: half_height as f32,
+            dome_index,
+            env_width: env_dims.0,
+            env_height: env_dims.1,
+            env_total: env_dims.2,
         };
 
         let mut out = Self {
@@ -323,6 +392,9 @@ impl GpuPtScene {
             vertices,
             normals,
             mesh_infos,
+            env_pixels,
+            env_marginal,
+            env_conditional,
             uniforms,
         };
         out.ensure_nonempty();
@@ -363,6 +435,15 @@ impl GpuPtScene {
         if self.mesh_infos.is_empty() {
             self.mesh_infos.push(unsafe { std::mem::zeroed() });
         }
+        if self.env_pixels.is_empty() {
+            self.env_pixels.extend_from_slice(&[0.0; 3]);
+        }
+        if self.env_marginal.is_empty() {
+            self.env_marginal.push(0.0);
+        }
+        if self.env_conditional.is_empty() {
+            self.env_conditional.push(0.0);
+        }
     }
 
     pub fn objects_bytes(&self) -> &[u8] {
@@ -398,8 +479,14 @@ impl GpuPtScene {
     pub fn mesh_infos_bytes(&self) -> &[u8] {
         as_bytes(&self.mesh_infos)
     }
+    pub fn env_pixels_bytes(&self) -> &[u8] {
+        as_bytes(&self.env_pixels)
+    }
+    pub fn env_marginal_bytes(&self) -> &[u8] {
+        as_bytes(&self.env_marginal)
+    }
+    pub fn env_conditional_bytes(&self) -> &[u8] {
+        as_bytes(&self.env_conditional)
+    }
 }
 
-fn alpha_from(roughness: f64) -> f32 {
-    ((roughness * roughness).clamp(1e-4, 1.0)) as f32
-}

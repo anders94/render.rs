@@ -1,11 +1,15 @@
 mod camera;
+pub mod envmap;
 mod light;
 mod material;
+pub mod pbr;
 pub mod transform;
 
 pub use camera::Camera;
+pub use envmap::EnvMap;
 pub use light::{Light, LightType};
 pub use material::{Material, MaterialType};
+pub use pbr::PbrParams;
 pub use transform::TransformStack;
 
 use crate::accel::Bvh;

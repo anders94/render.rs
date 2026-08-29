@@ -1,4 +1,5 @@
 use crate::math::Vec3;
+use crate::scene::pbr::PbrParams;
 
 #[derive(Debug, Clone)]
 pub enum MaterialType {
@@ -19,6 +20,9 @@ pub struct Material {
     /// Index into scene.lights when this surface is an area light, so the
     /// path tracer can compute MIS weights on emitter hits.
     pub area_light: Option<usize>,
+    /// Physically-based lobe parameters used by the path tracer (the
+    /// Whitted integrator uses the Phong fields above instead).
+    pub pbr: PbrParams,
 }
 
 impl Material {
@@ -31,6 +35,7 @@ impl Material {
             ks: 0.0,
             emission: Vec3::zero(),
             area_light: None,
+            pbr: PbrParams::from_matte(color),
         }
     }
 
@@ -43,6 +48,7 @@ impl Material {
             ks: 0.4,
             emission: Vec3::zero(),
             area_light: None,
+            pbr: PbrParams::from_plastic(color, roughness),
         }
     }
 
@@ -55,6 +61,7 @@ impl Material {
             ks: 0.8,
             emission: Vec3::zero(),
             area_light: None,
+            pbr: PbrParams::from_metal(color, roughness),
         }
     }
 

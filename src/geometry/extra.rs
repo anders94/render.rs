@@ -636,18 +636,22 @@ impl Intersectable for Triangle {
 
         let p = lo + ld * t;
         let mut local_n = e1.cross(&e2).normalize();
-        // Double-sided: face the incoming ray.
-        if local_n.dot(&ld) > 0.0 {
+        // Record the geometric side before the double-sided flip.
+        let front_face = local_n.dot(&ld) < 0.0;
+        if !front_face {
             local_n = -local_n;
         }
-        Some(world_hit(
-            &self.transform,
-            &self.inverse_transform,
-            ray,
-            p,
-            local_n,
-            self.material_id,
-        ))
+        Some(
+            world_hit(
+                &self.transform,
+                &self.inverse_transform,
+                ray,
+                p,
+                local_n,
+                self.material_id,
+            )
+            .with_front_face(front_face),
+        )
     }
 
     fn describe(&self) -> PrimitiveDesc {

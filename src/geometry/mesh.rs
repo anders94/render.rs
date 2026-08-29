@@ -187,10 +187,12 @@ pub struct MeshHit {
 pub fn to_intersection(hit: &MeshHit, ray: &Ray, material_id: usize) -> Intersection {
     let point = ray.at(hit.t_param);
     let mut normal = hit.world_normal;
-    if normal.dot(&ray.direction) > 0.0 {
+    let front_face = normal.dot(&ray.direction) < 0.0;
+    if !front_face {
         normal = -normal;
     }
     Intersection::new(point.distance(&ray.origin), point, normal, material_id)
+        .with_front_face(front_face)
 }
 
 #[cfg(test)]

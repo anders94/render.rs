@@ -62,11 +62,12 @@ inline bool theta_ok(float x, float y, float thetamax) {
 
 // ---- intersection ----
 
-struct Hit { bool valid; float t; float3 p; float3 n; };
+struct Hit { bool valid; float t; float3 p; float3 n; bool front; };
 
 inline Hit miss_hit() {
     Hit h;
     h.valid = false; h.t = INFINITY; h.p = float3(0.0f); h.n = float3(0.0f);
+    h.front = true;
     return h;
 }
 
@@ -90,9 +91,13 @@ inline Hit isect_sphere(float3 wo, float3 lo, float3 ld, Affine fwd, Affine inv,
     float c = dot(lo, lo) - radius * radius;
     float disc = b * b - 4.0f * a * c;
     if (disc < 0.0f) return miss_hit();
-    float t1 = (-b - sqrt(disc)) / (2.0f * a);   // near root only; inside rays miss
-    if (t1 <= T_EPS) return miss_hit();
-    float3 p = lo + ld * t1;
+    float sq = sqrt(disc);
+    float t1 = (-b - sq) / (2.0f * a);
+    float t2 = (-b + sq) / (2.0f * a);
+    // Near root, far-root fallback for rays starting inside (glass).
+    float t1_sel = (t1 > T_EPS) ? t1 : t2;
+    if (t1_sel <= T_EPS) return miss_hit();
+    float3 p = lo + ld * t1_sel;
     if (p.z < zmin || p.z > zmax) return miss_hit();
     if (thetamax < 360.0f && !theta_ok(p.x, p.y, thetamax)) return miss_hit();
     return finish_hit(wo, p, normalize_cpu(p), fwd, inv);
@@ -362,8 +367,12 @@ inline Hit isect_triangle(float3 wo, float3 lo, float3 ld, Affine fwd, Affine in
     if (t <= T_EPS) return miss_hit();
     float3 p = lo + ld * t;
     float3 nrm = normalize_cpu(cross(e1, e2));
-    if (dot(nrm, ld) > 0.0f) nrm = -nrm;
-    return finish_hit(wo, p, nrm, fwd, inv);
+    // Record the geometric side before the double-sided flip.
+    bool front = dot(nrm, ld) < 0.0f;
+    if (!front) nrm = -nrm;
+    Hit h = finish_hit(wo, p, nrm, fwd, inv);
+    h.front = front;
+    return h;
 }
 
 inline Hit isect_object(device const Object& obj, float3 wo, float3 wd) {
@@ -372,20 +381,25 @@ inline Hit isect_object(device const Object& obj, float3 wo, float3 wd) {
     float3 lo = xf_point(inv, wo);
     float3 ld = normalize_cpu(xf_vec(inv, wd));  // CPU normalizes local direction
     device const float* p = obj.params;
+    Hit h;
     switch (obj.kind) {
-        case 0u: return isect_sphere(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3]);
-        case 1u: return isect_cylinder(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3]);
-        case 2u: return isect_cone(wo, lo, ld, fwd, inv, p[0], p[1], p[2]);
-        case 3u: return isect_torus(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3], p[4]);
-        case 4u: return isect_disk(wo, lo, ld, fwd, inv, p[0], p[1], p[2]);
-        case 5u: return isect_paraboloid(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3]);
-        case 6u: return isect_hyperboloid(wo, lo, ld, fwd, inv,
-                                          float3(p[0], p[1], p[2]),
-                                          float3(p[3], p[4], p[5]), p[6]);
+        case 0u: h = isect_sphere(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3]); break;
+        case 1u: h = isect_cylinder(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3]); break;
+        case 2u: h = isect_cone(wo, lo, ld, fwd, inv, p[0], p[1], p[2]); break;
+        case 3u: h = isect_torus(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3], p[4]); break;
+        case 4u: h = isect_disk(wo, lo, ld, fwd, inv, p[0], p[1], p[2]); break;
+        case 5u: h = isect_paraboloid(wo, lo, ld, fwd, inv, p[0], p[1], p[2], p[3]); break;
+        case 6u: h = isect_hyperboloid(wo, lo, ld, fwd, inv,
+                                       float3(p[0], p[1], p[2]),
+                                       float3(p[3], p[4], p[5]), p[6]); break;
         default: return isect_triangle(wo, lo, ld, fwd, inv,
                                        float3(p[0], p[1], p[2]),
                                        float3(p[3], p[4], p[5]),
                                        float3(p[6], p[7], p[8]));
     }
+    // Quadrics report unflipped (outward) normals: the geometric side falls
+    // out of the dot with the ray direction.
+    if (h.valid) h.front = dot(h.n, wd) < 0.0f;
+    return h;
 }
 

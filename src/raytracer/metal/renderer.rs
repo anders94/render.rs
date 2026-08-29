@@ -181,6 +181,9 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
         gpu.vertices_bytes(),
         gpu.normals_bytes(),
         gpu.mesh_infos_bytes(),
+        gpu.env_pixels_bytes(),
+        gpu.env_marginal_bytes(),
+        gpu.env_conditional_bytes(),
     ]
     .into_iter()
     .map(|bytes| upload(&device, bytes))
@@ -223,9 +226,9 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
                 enc.setBytes_length_atIndex(
                     NonNull::new(&uniforms as *const GpuPtUniforms as *mut c_void).unwrap(),
                     std::mem::size_of::<GpuPtUniforms>(),
-                    11,
+                    14,
                 );
-                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 12);
+                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 15);
             }
             let grid = MTLSize { width: w, height: band, depth: 1 };
             enc.dispatchThreads_threadsPerThreadgroup(grid, tg);

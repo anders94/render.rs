@@ -34,20 +34,36 @@ struct PtUniforms {
     float up[3];
     float half_width;
     float half_height;
+    uint  dome_index;       // 0xFFFFFFFF = none
+    uint  env_width;
+    uint  env_height;
+    float env_total;
 };
 
 struct PtMaterial {
-    float color[3];
-    uint  kind;          // 0 matte, 1 plastic, 2 metal
+    float diffuse_gain;
+    float diffuse_color[3];
+    float diffuse_sigma;
+    float spec_f0[3];
+    float spec_f90[3];
+    float spec_alpha;
+    float coat_gain;
+    float coat_alpha;
+    float fuzz_gain;
+    float fuzz_color[3];
+    float glass_gain;
+    float glass_ior;
+    float glass_alpha;
+    float refr_color[3];
     float emission[3];
-    float alpha;         // GGX alpha = roughness^2
-    uint  area_light;    // light index or 0xFFFFFFFF
-    float p_spec;
-    float pad[2];
+    float presence;
+    float under_scale;
+    float weights[5];       // d, s, c, f, g (normalized; all zero = dead)
+    uint  area_light;
 };
 
 struct PtLight {
-    uint  kind;          // 0 point, 1 distant, 2 rect
+    uint  kind;          // 0 point, 1 distant, 2 rect, 3 sphere, 4 disk, 5 dome
     float a[3];          // position / direction / corner
     float e1[3];
     float e2[3];
@@ -92,6 +108,9 @@ struct PtScene {
     device const float*     vertices;
     device const float*     normals;
     device const MeshInfoG* mesh_infos;
+    device const float*     env_pixels;
+    device const float*     env_marginal;
+    device const float*     env_conditional;
     constant PtUniforms*    u;
 };
 
@@ -163,6 +182,7 @@ struct PtHit {
     float3 p;
     float3 n;
     uint  material;
+    bool  front;
 };
 
 // Möller–Trumbore; returns t (parametric along dir) with barycentrics.
@@ -321,6 +341,7 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
     best.p = float3(0.0f);
     best.n = float3(0.0f);
     best.material = 0u;
+    best.front = true;
 
     for (uint i = 0u; i < s.u->object_count; i++) {
         Hit h = isect_object(s.objects[i], o, d);
@@ -330,6 +351,7 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
             best.p = h.p;
             best.n = h.n;
             best.material = s.object_materials[i];
+            best.front = h.front;
         }
     }
 
@@ -351,6 +373,8 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
                         best.hit = true;
                         best.t = t;
                         best.p = o + d * t;
+                        // Unflipped mesh normal: side falls out of the dot.
+                        best.front = dot(n, d) < 0.0f;
                         best.n = n;
                         best.material = s.instances[inst_id].material_id;
                     }
@@ -410,123 +434,250 @@ inline bool pt_occluded(thread const PtScene& s, float3 p, float3 n,
     return false;
 }
 
-// ---- BSDF lobes (mirror of pt/mod.rs) ----
+// ---- BSDF lobes (mirror of pt/bxdf.rs: Oren-Nayar, GGX/VNDF with
+//      height-correlated Smith, clearcoat, fuzz, rough glass R/T) ----
 
-inline void lobes_of(PtMaterial m, thread float3& albedo, thread float& alpha,
-                     thread float& p_spec) {
-    albedo = (m.kind == 2u) ? float3(0.0f) : float3(m.color[0], m.color[1], m.color[2]);
-    alpha = m.alpha;
-    p_spec = m.p_spec;
+inline float3 m3(thread const float* a) { return float3(a[0], a[1], a[2]); }
+inline float3 m3(device const float* a) { return float3(a[0], a[1], a[2]); }
+inline float3 c3(constant const float* a) { return float3(a[0], a[1], a[2]); }
+
+inline float3 schlick3(float3 f0, float3 f90, float c) {
+    float m = pow(clamp(1.0f - c, 0.0f, 1.0f), 5.0f);
+    return f0 + (f90 - f0) * m;
 }
 
-inline float3 f0_of(PtMaterial m) {
-    return (m.kind == 2u) ? float3(m.color[0], m.color[1], m.color[2])
-                          : float3(0.04f);
+inline float fresnel_dielectric(float ci, float eta) {
+    ci = clamp(ci, 0.0f, 1.0f);
+    float s2 = (1.0f - ci * ci) / (eta * eta);
+    if (s2 >= 1.0f) return 1.0f;
+    float ct = sqrt(1.0f - s2);
+    float rp = (eta * ci - ct) / (eta * ci + ct);
+    float rs = (ci - eta * ct) / (ci + eta * ct);
+    return 0.5f * (rp * rp + rs * rs);
 }
 
-inline float3 fresnel_schlick(float3 f0, float c) {
-    float mfac = pow(clamp(1.0f - c, 0.0f, 1.0f), 5.0f);
-    return f0 + (float3(1.0f) - f0) * mfac;
-}
-
-inline float ggx_d(float ndh, float alpha) {
+inline float ggx_d(float3 h, float alpha) {
+    if (h.z <= 0.0f) return 0.0f;
     float a2 = alpha * alpha;
-    float dd = ndh * ndh * (a2 - 1.0f) + 1.0f;
-    return a2 / (PT_PI * dd * dd);
+    float d = h.z * h.z * (a2 - 1.0f) + 1.0f;
+    return a2 / (PT_PI * d * d);
 }
 
-inline float ggx_g1(float ndv, float alpha) {
-    float a2 = alpha * alpha;
-    float denom = ndv + sqrt(a2 + (1.0f - a2) * ndv * ndv);
-    return denom <= 0.0f ? 0.0f : 2.0f * ndv / denom;
+inline float ggx_lambda(float3 w, float alpha) {
+    float c2 = w.z * w.z;
+    if (c2 <= 0.0f) return 0.0f;
+    float t2 = max(1.0f - c2, 0.0f) / c2;
+    return (sqrt(1.0f + alpha * alpha * t2) - 1.0f) * 0.5f;
 }
 
-inline void basis_of(float3 n, thread float3& b1, thread float3& b2) {
-    float3 t = (fabs(n.x) > 0.9f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-    b1 = normalize_cpu(cross(n, t));
-    b2 = cross(n, b1);
+inline float ggx_g1(float3 w, float alpha) { return 1.0f / (1.0f + ggx_lambda(w, alpha)); }
+inline float ggx_g2(float3 wo, float3 wi, float alpha) {
+    return 1.0f / (1.0f + ggx_lambda(wo, alpha) + ggx_lambda(wi, alpha));
 }
 
-inline float3 cosine_sample(float3 n, thread Pcg32& rng) {
+inline float3 ggx_sample_vndf(float3 wo, float alpha, float u1, float u2) {
+    float3 v = normalize_cpu(float3(alpha * wo.x, alpha * wo.y, wo.z));
+    float lensq = v.x * v.x + v.y * v.y;
+    float3 t1 = lensq > 1e-12f ? float3(-v.y, v.x, 0.0f) / sqrt(lensq)
+                               : float3(1.0f, 0.0f, 0.0f);
+    float3 t2 = cross(v, t1);
+    float r = sqrt(u1);
+    float phi = 2.0f * PT_PI * u2;
+    float p1 = r * cos(phi);
+    float p2 = r * sin(phi);
+    float sfac = 0.5f * (1.0f + v.z);
+    p2 = (1.0f - sfac) * sqrt(max(1.0f - p1 * p1, 0.0f)) + sfac * p2;
+    float3 nh = t1 * p1 + t2 * p2 + v * sqrt(max(1.0f - p1 * p1 - p2 * p2, 0.0f));
+    return normalize_cpu(float3(alpha * nh.x, alpha * nh.y, max(nh.z, 1e-9f)));
+}
+
+inline float ggx_pdf_h(float3 wo, float3 h, float alpha) {
+    float odh = dot(wo, h);
+    if (odh <= 0.0f || wo.z <= 0.0f) return 0.0f;
+    return ggx_g1(wo, alpha) * odh * ggx_d(h, alpha) / wo.z;
+}
+
+inline float3 eval_diffuse(PtMaterial m, float3 wo, float3 wi) {
+    float s2 = m.diffuse_sigma * m.diffuse_sigma;
+    float a = 1.0f - s2 / (2.0f * (s2 + 0.33f));
+    float b = 0.45f * s2 / (s2 + 0.09f);
+    float so = sqrt(max(1.0f - wo.z * wo.z, 0.0f));
+    float si = sqrt(max(1.0f - wi.z * wi.z, 0.0f));
+    float cd = (so > 1e-6f && si > 1e-6f)
+        ? clamp((wo.x * wi.x + wo.y * wi.y) / (so * si), -1.0f, 1.0f)
+        : 0.0f;
+    float sa, tb;
+    if (wo.z < wi.z) { sa = so; tb = si / max(wi.z, 1e-6f); }
+    else { sa = si; tb = so / max(wo.z, 1e-6f); }
+    return m3(m.diffuse_color) * (m.diffuse_gain * m.under_scale / PT_PI)
+        * (a + b * max(cd, 0.0f) * sa * tb);
+}
+
+inline float3 eval_fuzz(PtMaterial m, float3 wo, float3 wi) {
+    float rim = 0.5f * (pow(1.0f - wi.z, 4.0f) + pow(1.0f - wo.z, 4.0f));
+    return m3(m.fuzz_color) * (m.fuzz_gain / PT_PI) * rim;
+}
+
+inline float3 eval_spec_lobe(float3 f0, float3 f90, float alpha, float3 wo, float3 wi) {
+    float3 h = normalize_cpu(wo + wi);
+    float d = ggx_d(h, alpha);
+    float g = ggx_g2(wo, wi, alpha);
+    float3 fr = schlick3(f0, f90, max(dot(wo, h), 0.0f));
+    return fr * (d * g / max(4.0f * wo.z * wi.z, 1e-9f));
+}
+
+inline float spec_pdf(float3 wo, float3 wi, float alpha) {
+    float3 h = normalize_cpu(wo + wi);
+    float odh = max(dot(wo, h), 1e-9f);
+    return ggx_pdf_h(wo, h, alpha) / (4.0f * odh);
+}
+
+// Glass transmission (PBRT-3 microfacet transmission, radiance transport).
+inline void glass_transmit(PtMaterial m, float3 wo, float3 wi, float eta,
+                           thread float3& f_out, thread float& pdf_out) {
+    f_out = float3(0.0f);
+    pdf_out = 0.0f;
+    float alpha = m.glass_alpha;
+    float3 h = normalize_cpu(wo + wi * eta);
+    if (h.z < 0.0f) h = -h;
+    float odh = dot(wo, h);
+    float idh = dot(wi, h);
+    if (odh <= 0.0f || idh >= 0.0f) return;
+    float fres = fresnel_dielectric(odh, eta);
+    float d = ggx_d(h, alpha);
+    float g = ggx_g2(wo, float3(wi.x, wi.y, -wi.z), alpha);
+    float sq = odh + eta * idh;
+    if (fabs(sq) < 1e-9f) return;
+    f_out = m3(m.refr_color)
+        * (m.glass_gain * m.under_scale * (1.0f - fres) * d * g
+           * fabs(idh * odh / (wi.z * wo.z)) / (sq * sq));
+    float dwh = fabs(eta * eta * idh) / (sq * sq);
+    pdf_out = ggx_pdf_h(wo, h, alpha) * dwh;
+}
+
+// Full composite eval + pdf; wo.z > 0, wi either hemisphere.
+inline void bsdf_eval_pdf(PtMaterial m, float3 wo, float3 wi, float eta,
+                          thread float3& f_out, thread float& pdf_out) {
+    f_out = float3(0.0f);
+    pdf_out = 0.0f;
+    float wd = m.weights[0], ws = m.weights[1], wc = m.weights[2],
+          wf = m.weights[3], wg = m.weights[4];
+    if (wd + ws + wc + wf + wg <= 0.0f) return;
+
+    if (wi.z > 0.0f) {
+        float cos_pdf = wi.z / PT_PI;
+        if (wd > 0.0f) { f_out += eval_diffuse(m, wo, wi); pdf_out += wd * cos_pdf; }
+        if (wf > 0.0f) { f_out += eval_fuzz(m, wo, wi); pdf_out += wf * cos_pdf; }
+        if (ws > 0.0f) {
+            f_out += eval_spec_lobe(m3(m.spec_f0), m3(m.spec_f90), m.spec_alpha, wo, wi);
+            pdf_out += ws * spec_pdf(wo, wi, m.spec_alpha);
+        }
+        if (wc > 0.0f) {
+            float3 cf0 = float3(0.04f) * m.coat_gain;
+            f_out += eval_spec_lobe(cf0, float3(m.coat_gain), m.coat_alpha, wo, wi);
+            pdf_out += wc * spec_pdf(wo, wi, m.coat_alpha);
+        }
+        if (wg > 0.0f) {
+            float3 h = normalize_cpu(wo + wi);
+            float fres = fresnel_dielectric(max(dot(wo, h), 0.0f), eta);
+            float d = ggx_d(h, m.glass_alpha);
+            float g = ggx_g2(wo, wi, m.glass_alpha);
+            f_out += float3(m.glass_gain * m.under_scale * fres * d * g
+                / max(4.0f * wo.z * wi.z, 1e-9f));
+            pdf_out += wg * fres * spec_pdf(wo, wi, m.glass_alpha);
+        }
+    } else if (wg > 0.0f) {
+        float3 f;
+        float pl;
+        glass_transmit(m, wo, wi, eta, f, pl);
+        float3 h = normalize_cpu(wo + wi * eta);
+        if (h.z < 0.0f) h = -h;
+        float fres = fresnel_dielectric(max(dot(wo, h), 0.0f), eta);
+        f_out = f;
+        pdf_out = wg * (1.0f - fres) * pl;
+    }
+}
+
+inline float3 cosine_sample_local(thread Pcg32& rng) {
     float u = pcg_f32(rng);
     float v = pcg_f32(rng);
     float r = sqrt(u);
     float phi = 2.0f * PT_PI * v;
-    float3 b1, b2;
-    basis_of(n, b1, b2);
-    return normalize_cpu(b1 * (r * cos(phi)) + b2 * (r * sin(phi)) + n * sqrt(1.0f - u));
+    return float3(r * cos(phi), r * sin(phi), sqrt(max(1.0f - u, 0.0f)));
 }
 
-inline float3 ggx_sample_half(float3 n, float alpha, thread Pcg32& rng) {
-    float u = pcg_f32(rng);
-    float v = pcg_f32(rng);
-    float phi = 2.0f * PT_PI * v;
-    float ct = sqrt((1.0f - u) / (u * (alpha * alpha - 1.0f) + 1.0f));
-    float st = sqrt(max(1.0f - ct * ct, 0.0f));
-    float3 b1, b2;
-    basis_of(n, b1, b2);
-    return normalize_cpu(b1 * (st * cos(phi)) + b2 * (st * sin(phi)) + n * ct);
-}
-
-inline float3 bsdf_eval(PtMaterial m, float3 wo, float3 wi, float3 n) {
-    float ndo = max(dot(n, wo), 0.0f);
-    float ndi = max(dot(n, wi), 0.0f);
-    if (ndo <= 0.0f || ndi <= 0.0f) return float3(0.0f);
-    float3 albedo;
-    float alpha, p_spec;
-    lobes_of(m, albedo, alpha, p_spec);
-    float3 f = float3(0.0f);
-    if (p_spec < 1.0f) f += albedo * (1.0f / PT_PI);
-    if (p_spec > 0.0f) {
-        float3 h = normalize_cpu(wo + wi);
-        float ndh = max(dot(n, h), 0.0f);
-        float odh = max(dot(wo, h), 1e-9f);
-        float dtr = ggx_d(ndh, alpha);
-        float g = ggx_g1(ndo, alpha) * ggx_g1(ndi, alpha);
-        float3 fr = fresnel_schlick(f0_of(m), odh);
-        f += fr * (dtr * g / max(4.0f * ndo * ndi, 1e-9f));
-    }
-    return f;
-}
-
-inline float bsdf_pdf(PtMaterial m, float3 wo, float3 wi, float3 n) {
-    float ndi = max(dot(n, wi), 0.0f);
-    if (ndi <= 0.0f) return 0.0f;
-    float3 albedo;
-    float alpha, p_spec;
-    lobes_of(m, albedo, alpha, p_spec);
-    float pdf_diffuse = ndi / PT_PI;
-    if (p_spec <= 0.0f) return pdf_diffuse;
-    float3 h = normalize_cpu(wo + wi);
-    float ndh = max(dot(n, h), 0.0f);
-    float odh = max(fabs(dot(wo, h)), 1e-9f);
-    float pdf_spec = ggx_d(ndh, alpha) * ndh / (4.0f * odh);
-    return (1.0f - p_spec) * pdf_diffuse + p_spec * pdf_spec;
-}
-
-inline bool sample_bsdf(PtMaterial m, float3 wo, float3 n, thread Pcg32& rng,
+// Composite sample; returns false on rejection.
+inline bool bsdf_sample(PtMaterial m, float3 wo, float eta, thread Pcg32& rng,
                         thread float3& wi_out, thread float3& f_out,
-                        thread float& pdf_out) {
-    float3 albedo;
-    float alpha, p_spec;
-    lobes_of(m, albedo, alpha, p_spec);
+                        thread float& pdf_out, thread bool& transmitted) {
+    float wd = m.weights[0], ws = m.weights[1], wc = m.weights[2],
+          wf = m.weights[3], wg = m.weights[4];
+    if (wd + ws + wc + wf + wg <= 0.0f) return false;
+    transmitted = false;
+    float pick = pcg_f32(rng);
     float3 wi;
-    if (pcg_f32(rng) < p_spec) {
-        float3 h = ggx_sample_half(n, alpha, rng);
+    if (pick < wd + wf) {
+        wi = cosine_sample_local(rng);
+    } else if (pick < wd + wf + ws) {
+        float u1 = pcg_f32(rng);
+        float u2 = pcg_f32(rng);
+        float3 h = ggx_sample_vndf(wo, m.spec_alpha, u1, u2);
         wi = reflect(-wo, h);
-        if (dot(wi, n) <= 0.0f) return false;
+        if (wi.z <= 0.0f) return false;
+    } else if (pick < wd + wf + ws + wc) {
+        float u1 = pcg_f32(rng);
+        float u2 = pcg_f32(rng);
+        float3 h = ggx_sample_vndf(wo, m.coat_alpha, u1, u2);
+        wi = reflect(-wo, h);
+        if (wi.z <= 0.0f) return false;
+    } else if (wg > 0.0f) {
+        float u1 = pcg_f32(rng);
+        float u2 = pcg_f32(rng);
+        float3 h = ggx_sample_vndf(wo, m.glass_alpha, u1, u2);
+        float fres = fresnel_dielectric(max(dot(wo, h), 0.0f), eta);
+        if (pcg_f32(rng) < fres) {
+            wi = reflect(-wo, h);
+            if (wi.z <= 0.0f) return false;
+        } else {
+            float ci = dot(wo, h);
+            float s2 = (1.0f - ci * ci) / (eta * eta);
+            if (s2 >= 1.0f) return false;
+            float ct = sqrt(1.0f - s2);
+            wi = normalize_cpu((-wo) / eta + h * (ci / eta - ct));
+            if (wi.z >= 0.0f) return false;
+            transmitted = true;
+        }
     } else {
-        wi = cosine_sample(n, rng);
+        return false;
     }
-    float pdf = bsdf_pdf(m, wo, wi, n);
+    float3 f;
+    float pdf;
+    bsdf_eval_pdf(m, wo, wi, eta, f, pdf);
     if (pdf <= 0.0f) return false;
     wi_out = wi;
-    f_out = bsdf_eval(m, wo, wi, n);
+    f_out = f;
     pdf_out = pdf;
     return true;
 }
 
-// ---- lights ----
+// Local shading frame.
+struct FrameL { float3 t; float3 b; float3 n; };
+inline FrameL frame_of(float3 n) {
+    float3 t0 = fabs(n.x) > 0.9f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+    FrameL f;
+    f.n = n;
+    f.t = normalize_cpu(cross(n, t0));
+    f.b = cross(n, f.t);
+    return f;
+}
+inline float3 to_local(FrameL f, float3 w) {
+    return float3(dot(w, f.t), dot(w, f.b), dot(w, f.n));
+}
+inline float3 to_world(FrameL f, float3 w) {
+    return f.t * w.x + f.b * w.y + f.n * w.z;
+}
+
+// ---- lights + dome ------------------------------------------------------
 
 inline float power_heuristic(float a, float b) {
     float a2 = a * a;
@@ -534,59 +685,240 @@ inline float power_heuristic(float a, float b) {
     return (a2 + b2 <= 0.0f) ? 0.0f : a2 / (a2 + b2);
 }
 
-inline float rect_pdf_solid_angle(PtLight l, float3 origin, float3 hit_p) {
-    float3 d = hit_p - origin;
-    float dist2 = dot(d, d);
-    float3 ln = float3(l.normal[0], l.normal[1], l.normal[2]);
-    float cl = fabs(dot(normalize_cpu(d), ln));
-    if (cl < 1e-9f || l.area <= 0.0f) return 0.0f;
-    return dist2 / (cl * l.area);
+// Environment map helpers (lat-long, y-up; mirrors scene/envmap.rs).
+inline float2 env_uv_of(float3 d) {
+    float u = atan2(d.x, -d.z) / (2.0f * PT_PI);
+    u = u - floor(u);
+    float v = clamp(acos(clamp(d.y, -1.0f, 1.0f)) / PT_PI, 0.0f, 1.0f);
+    return float2(u, v);
 }
 
-inline float3 sample_light(thread const PtScene& s, PtLight l, float3 p,
-                           float3 n, float3 wo, PtMaterial m,
-                           thread Pcg32& rng) {
-    float3 rad = float3(l.radiance[0], l.radiance[1], l.radiance[2]);
-    if (l.kind == 0u) {                      // point, inverse-square
-        float3 pos = float3(l.a[0], l.a[1], l.a[2]);
-        float3 to_l = pos - p;
+inline float3 env_eval(thread const PtScene& s, float3 d) {
+    constant PtUniforms& u = *s.u;
+    if (u.env_width == 0u) return float3(1.0f);
+    float2 uv = env_uv_of(d);
+    uint x = min((uint)(uv.x * (float)u.env_width), u.env_width - 1u);
+    uint y = min((uint)(uv.y * (float)u.env_height), u.env_height - 1u);
+    uint i = (y * u.env_width + x) * 3u;
+    return float3(s.env_pixels[i], s.env_pixels[i + 1u], s.env_pixels[i + 2u]);
+}
+
+inline float env_pdf(thread const PtScene& s, float3 d) {
+    constant PtUniforms& u = *s.u;
+    if (u.env_width == 0u) return 1.0f / (4.0f * PT_PI);
+    float2 uv = env_uv_of(d);
+    uint x = min((uint)(uv.x * (float)u.env_width), u.env_width - 1u);
+    uint y = min((uint)(uv.y * (float)u.env_height), u.env_height - 1u);
+    float st = sin(PT_PI * ((float)y + 0.5f) / (float)u.env_height);
+    if (st < 1e-9f) return 0.0f;
+    uint i = (y * u.env_width + x) * 3u;
+    float l = 0.2126f * s.env_pixels[i] + 0.7152f * s.env_pixels[i + 1u]
+        + 0.0722f * s.env_pixels[i + 2u];
+    return l * st * (float)u.env_width * (float)u.env_height
+        / (max(u.env_total, 1e-12f) * 2.0f * PT_PI * PT_PI * st);
+}
+
+inline uint upper_bound(device const float* cdf, uint count, float target) {
+    uint lo = 0u;
+    uint hi = count;
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2u;
+        if (cdf[mid] <= target) lo = mid + 1u; else hi = mid;
+    }
+    return lo == 0u ? 0u : lo - 1u;
+}
+
+inline void env_sample(thread const PtScene& s, thread Pcg32& rng,
+                       thread float3& dir, thread float3& rad, thread float& pdf) {
+    constant PtUniforms& u = *s.u;
+    if (u.env_width == 0u) {
+        // Constant dome: uniform sphere.
+        float uu = pcg_f32(rng);
+        float vv = pcg_f32(rng);
+        float z = 1.0f - 2.0f * uu;
+        float r = sqrt(max(1.0f - z * z, 0.0f));
+        float phi = 2.0f * PT_PI * vv;
+        dir = float3(r * cos(phi), r * sin(phi), z);
+        rad = float3(1.0f);
+        pdf = 1.0f / (4.0f * PT_PI);
+        return;
+    }
+    float t1 = pcg_f32(rng) * u.env_total;
+    uint y = min(upper_bound(s.env_marginal, u.env_height + 1u, t1), u.env_height - 1u);
+    float row_lo = s.env_marginal[y];
+    float row_hi = s.env_marginal[y + 1u];
+    float t2 = pcg_f32(rng) * max(row_hi - row_lo, 1e-12f);
+    uint base = y * (u.env_width + 1u);
+    uint x = min(upper_bound(s.env_conditional + base, u.env_width + 1u, t2), u.env_width - 1u);
+    float uu = ((float)x + 0.5f) / (float)u.env_width;
+    float vv = ((float)y + 0.5f) / (float)u.env_height;
+    float phi = uu * 2.0f * PT_PI;
+    float theta = vv * PT_PI;
+    float st = sin(theta);
+    dir = float3(st * sin(phi), cos(theta), -st * cos(phi));
+    uint i = (y * u.env_width + x) * 3u;
+    rad = float3(s.env_pixels[i], s.env_pixels[i + 1u], s.env_pixels[i + 2u]);
+    pdf = env_pdf(s, dir);
+}
+
+// pdf of an area light producing the direction toward hit_p (for MIS).
+inline float light_pdf_solid_angle(PtLight l, float3 origin, float3 hit_p) {
+    if (l.kind == 2u || l.kind == 4u) {
+        float3 d = hit_p - origin;
+        float dist2 = dot(d, d);
+        float3 ln = m3(l.normal);
+        float cl = fabs(dot(normalize_cpu(d), ln));
+        if (cl < 1e-9f || l.area <= 0.0f) return 0.0f;
+        return dist2 / (cl * l.area);
+    }
+    if (l.kind == 3u) {
+        float3 c = m3(l.a);
+        float dist2 = dot(c - origin, c - origin);
+        float s2 = min(l.area * l.area / dist2, 1.0f);
+        float cm = sqrt(max(1.0f - s2, 0.0f));
+        float sa = 2.0f * PT_PI * (1.0f - cm);
+        return sa < 1e-12f ? 0.0f : 1.0f / sa;
+    }
+    return 0.0f;
+}
+
+// Fractional visibility (presence cutouts attenuate; opaque kills).
+inline float pt_visibility(thread const PtScene& s, float3 p, float3 n,
+                           float3 dir, float dist) {
+    float3 origin = p + n * PT_RAY_OFFSET;
+    float remaining = dist - 1e-3f;
+    float vis = 1.0f;
+    for (int i = 0; i < 16; i++) {
+        PtHit h = pt_trace_scene(s, origin, dir);
+        if (!h.hit || h.t >= remaining) return vis;
+        float presence = clamp(s.materials[h.material].presence, 0.0f, 1.0f);
+        if (presence >= 1.0f) return 0.0f;
+        vis *= 1.0f - presence;
+        if (vis < 1e-4f) return 0.0f;
+        origin = h.p + dir * PT_RAY_OFFSET;
+        remaining -= h.t + PT_RAY_OFFSET;
+    }
+    return vis;
+}
+
+inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
+                               FrameL frame, float3 wo_l, PtMaterial m,
+                               float eta, thread Pcg32& rng) {
+    float3 n = frame.n;
+    float3 rad = m3(l.radiance);
+
+    if (l.kind == 0u) {                       // point
+        float3 to_l = m3(l.a) - p;
         float dist2 = max(dot(to_l, to_l), 1e-12f);
         float dist = sqrt(dist2);
         float3 wi = to_l / dist;
-        float c = max(dot(wi, n), 0.0f);
-        if (c <= 0.0f || pt_occluded(s, p, n, wi, dist)) return float3(0.0f);
-        return bsdf_eval(m, wo, wi, n) * rad * (c / dist2);
+        float3 wi_l = to_local(frame, wi);
+        if (wi_l.z <= 0.0f) return float3(0.0f);
+        float3 f;
+        float pdf;
+        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, pdf);
+        if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
+        float vis = pt_visibility(s, p, n, wi, dist);
+        return f * rad * (max(wi_l.z, 0.0f) * vis / dist2);
     }
-    if (l.kind == 1u) {                      // distant
-        float3 wi = -float3(l.a[0], l.a[1], l.a[2]);
-        float c = max(dot(wi, n), 0.0f);
-        if (c <= 0.0f || pt_occluded(s, p, n, wi, PT_BIG)) return float3(0.0f);
-        return bsdf_eval(m, wo, wi, n) * rad * c;
+    if (l.kind == 1u) {                       // distant (soft when area>0)
+        float3 base = -m3(l.a);
+        float3 wi = base;
+        if (l.area > 1e-5f) {
+            float cm = cos(l.area);
+            float uu = pcg_f32(rng);
+            float vv = pcg_f32(rng);
+            float ct = 1.0f - uu * (1.0f - cm);
+            float st = sqrt(max(1.0f - ct * ct, 0.0f));
+            float phi = 2.0f * PT_PI * vv;
+            FrameL lf = frame_of(base);
+            wi = to_world(lf, float3(st * cos(phi), st * sin(phi), ct));
+        }
+        float3 wi_l = to_local(frame, wi);
+        if (wi_l.z <= 0.0f) return float3(0.0f);
+        float3 f;
+        float pdf;
+        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, pdf);
+        if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
+        float vis = pt_visibility(s, p, n, wi, PT_BIG);
+        return f * rad * (max(wi_l.z, 0.0f) * vis);
     }
-    // rect with MIS
-    float u = pcg_f32(rng);
-    float v = pcg_f32(rng);
-    float3 corner = float3(l.a[0], l.a[1], l.a[2]);
-    float3 e1 = float3(l.e1[0], l.e1[1], l.e1[2]);
-    float3 e2 = float3(l.e2[0], l.e2[1], l.e2[2]);
-    float3 sp = corner + e1 * u + e2 * v;
-    float3 to_l = sp - p;
-    float dist2 = max(dot(to_l, to_l), 1e-12f);
-    float dist = sqrt(dist2);
-    float3 wi = to_l / dist;
-    float cs = max(dot(wi, n), 0.0f);
-    float3 ln = float3(l.normal[0], l.normal[1], l.normal[2]);
-    float cl = fabs(dot(wi, ln));
-    if (cs <= 0.0f || cl < 1e-9f || l.area <= 0.0f) return float3(0.0f);
-    if (pt_occluded(s, p, n, wi, dist)) return float3(0.0f);
-    float pdf_sa = dist2 / (cl * l.area);
-    float3 f = bsdf_eval(m, wo, wi, n);
-    float bp = bsdf_pdf(m, wo, wi, n);
+    if (l.kind == 2u || l.kind == 4u) {       // rect / disk
+        float uu = pcg_f32(rng);
+        float vv = pcg_f32(rng);
+        float3 sp;
+        if (l.kind == 2u) {
+            sp = m3(l.a) + m3(l.e1) * uu + m3(l.e2) * vv;
+        } else {
+            float r = sqrt(uu);
+            float phi = 2.0f * PT_PI * vv;
+            sp = m3(l.a) + m3(l.e1) * (r * cos(phi)) + m3(l.e2) * (r * sin(phi));
+        }
+        float3 to_l = sp - p;
+        float dist2 = max(dot(to_l, to_l), 1e-12f);
+        float dist = sqrt(dist2);
+        float3 wi = to_l / dist;
+        float3 wi_l = to_local(frame, wi);
+        if (wi_l.z <= 0.0f) return float3(0.0f);
+        float cl = fabs(dot(wi, m3(l.normal)));
+        if (cl < 1e-9f || l.area <= 0.0f) return float3(0.0f);
+        float3 f;
+        float bp;
+        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
+        if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
+        float vis = pt_visibility(s, p, n, wi, dist);
+        if (vis <= 0.0f) return float3(0.0f);
+        float pdf_sa = dist2 / (cl * l.area);
+        float w = power_heuristic(pdf_sa, bp);
+        return f * rad * (max(wi_l.z, 0.0f) * vis / pdf_sa) * w;
+    }
+    if (l.kind == 3u) {                       // sphere area: visible cone
+        float3 c = m3(l.a);
+        float3 to_c = c - p;
+        float dist2 = dot(to_c, to_c);
+        float radius = l.area;
+        if (dist2 <= radius * radius * 1.0001f) return float3(0.0f);
+        float s2 = min(radius * radius / dist2, 1.0f);
+        float cm = sqrt(max(1.0f - s2, 0.0f));
+        float uu = pcg_f32(rng);
+        float vv = pcg_f32(rng);
+        float ct = 1.0f - uu * (1.0f - cm);
+        float st = sqrt(max(1.0f - ct * ct, 0.0f));
+        float phi = 2.0f * PT_PI * vv;
+        FrameL lf = frame_of(normalize_cpu(to_c));
+        float3 wi = to_world(lf, float3(st * cos(phi), st * sin(phi), ct));
+        float3 wi_l = to_local(frame, wi);
+        if (wi_l.z <= 0.0f) return float3(0.0f);
+        float3 f;
+        float bp;
+        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
+        if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
+        float dist = sqrt(dist2) * ct
+            - sqrt(max(radius * radius - dist2 * st * st, 0.0f));
+        float vis = pt_visibility(s, p, n, wi, dist);
+        if (vis <= 0.0f) return float3(0.0f);
+        float pdf_sa = 1.0f / max(2.0f * PT_PI * (1.0f - cm), 1e-12f);
+        float w = power_heuristic(pdf_sa, bp);
+        return f * rad * (max(wi_l.z, 0.0f) * vis / pdf_sa) * w;
+    }
+    // dome
+    float3 wi, er;
+    float pdf_sa;
+    env_sample(s, rng, wi, er, pdf_sa);
+    if (pdf_sa <= 0.0f) return float3(0.0f);
+    float3 wi_l = to_local(frame, wi);
+    if (wi_l.z <= 0.0f) return float3(0.0f);
+    float3 f;
+    float bp;
+    bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
+    if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
+    float vis = pt_visibility(s, p, n, wi, PT_BIG);
+    if (vis <= 0.0f) return float3(0.0f);
     float w = power_heuristic(pdf_sa, bp);
-    return f * rad * (cs / pdf_sa) * w;
+    return f * (er * rad) * (max(wi_l.z, 0.0f) * vis / pdf_sa) * w;
 }
 
-// ---- the path integrator (mirror of pt::trace) ----
+// ---- the path integrator (mirror of pt::trace) --------------------------
 
 inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                     thread Pcg32& rng) {
@@ -596,48 +928,77 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
     float prev_pdf = 0.0f;
     float3 prev_origin = origin;
     bool from_camera = true;
+    uint presence_skips = 0u;
+    float num_lights = (float)u.light_count;
 
-    for (uint depth = 0u; depth < u.max_bounces; depth++) {
+    uint depth = 0u;
+    while (depth < u.max_bounces) {
         PtHit h = pt_trace_scene(s, origin, dir);
         if (!h.hit) {
-            l += beta * float3(u.background[0], u.background[1], u.background[2]);
+            if (u.dome_index != 0xFFFFFFFFu) {
+                float3 d = normalize_cpu(dir);
+                float w = 1.0f;
+                if (!from_camera) {
+                    float pl = env_pdf(s, d) / num_lights;
+                    w = power_heuristic(prev_pdf, pl);
+                }
+                float3 dome_rad = env_eval(s, d) * m3(s.lights[u.dome_index].radiance);
+                l += beta * dome_rad * w;
+            } else {
+                l += beta * c3(u.background);
+            }
             break;
         }
         PtMaterial m = s.materials[h.material];
         float3 wo = -normalize_cpu(dir);
-        float3 n = (dot(h.n, wo) < 0.0f) ? -h.n : h.n;
 
-        float3 em = float3(m.emission[0], m.emission[1], m.emission[2]);
+        float presence = clamp(m.presence, 0.0f, 1.0f);
+        if (presence < 1.0f && pcg_f32(rng) >= presence && presence_skips < 16u) {
+            presence_skips++;
+            origin = h.p + normalize_cpu(dir) * PT_RAY_OFFSET;
+            continue;
+        }
+
+        bool entering = h.front;
+        float3 n = dot(h.n, wo) >= 0.0f ? h.n : -h.n;
+        float eta = entering ? m.glass_ior : 1.0f / max(m.glass_ior, 1e-6f);
+
+        float3 em = m3(m.emission);
         if (max(max(em.x, em.y), em.z) > 0.0f) {
             float w = 1.0f;
             if (!from_camera && m.area_light != 0xFFFFFFFFu) {
-                float pdf_light = rect_pdf_solid_angle(s.lights[m.area_light],
-                                                       prev_origin, h.p)
-                    / (float)u.light_count;
-                w = power_heuristic(prev_pdf, pdf_light);
+                float pl = light_pdf_solid_angle(s.lights[m.area_light], prev_origin, h.p)
+                    / num_lights;
+                w = power_heuristic(prev_pdf, pl);
             }
             l += beta * em * w;
         }
 
-        if (u.light_count > 0u) {
-            uint li = min((uint)(pcg_f32(rng) * (float)u.light_count),
-                          u.light_count - 1u);
-            float3 c = sample_light(s, s.lights[li], h.p, n, wo, m, rng);
-            l += beta * c * (float)u.light_count;
+        FrameL frame = frame_of(n);
+        float3 wo_l = to_local(frame, wo);
+        float wsum = m.weights[0] + m.weights[1] + m.weights[2] + m.weights[3]
+            + m.weights[4];
+
+        if (u.light_count > 0u && wsum > 0.0f) {
+            uint li = min((uint)(pcg_f32(rng) * num_lights), u.light_count - 1u);
+            float3 c = sample_one_light(s, s.lights[li], h.p, frame, wo_l, m, eta, rng);
+            l += beta * c * num_lights;
         }
 
-        float3 wi, f;
+        float3 wi_l, f;
         float pdf;
-        if (!sample_bsdf(m, wo, n, rng, wi, f, pdf)) break;
-        float c = max(dot(wi, n), 0.0f);
-        if (pdf <= 0.0f || c <= 0.0f) break;
-        beta *= f * (c / pdf);
+        bool transmitted;
+        if (!bsdf_sample(m, wo_l, eta, rng, wi_l, f, pdf, transmitted)) break;
+        float3 wi = to_world(frame, wi_l);
+        beta *= f * (fabs(wi_l.z) / pdf);
         prev_pdf = pdf;
         prev_origin = h.p;
         from_camera = false;
 
-        origin = h.p + n * PT_RAY_OFFSET;
+        float off = transmitted ? -PT_RAY_OFFSET : PT_RAY_OFFSET;
+        origin = h.p + n * off;
         dir = wi;
+        depth++;
 
         if (depth >= u.rr_start) {
             float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
@@ -648,7 +1009,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
     return l;
 }
 
-// ---- entry: one thread per pixel, a batch of samples per dispatch ----
+// ---- entry: one thread per pixel, one sample per dispatch ---------------
 
 kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const uint*       object_materials [[buffer(1)]],
@@ -661,8 +1022,11 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const float*      vertices         [[buffer(8)]],
                       device const float*      normals          [[buffer(9)]],
                       device const MeshInfoG*  mesh_infos       [[buffer(10)]],
-                      constant PtUniforms&     u                [[buffer(11)]],
-                      device float*            accum            [[buffer(12)]],
+                      device const float*      env_pixels       [[buffer(11)]],
+                      device const float*      env_marginal     [[buffer(12)]],
+                      device const float*      env_conditional  [[buffer(13)]],
+                      constant PtUniforms&     u                [[buffer(14)]],
+                      device float*            accum            [[buffer(15)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint py_row = gid.y + u.y_offset;
     if (gid.x >= u.width || py_row >= u.height) return;
@@ -679,12 +1043,15 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
     s.vertices = vertices;
     s.normals = normals;
     s.mesh_infos = mesh_infos;
+    s.env_pixels = env_pixels;
+    s.env_marginal = env_marginal;
+    s.env_conditional = env_conditional;
     s.u = &u;
 
-    float3 eye = float3(u.eye[0], u.eye[1], u.eye[2]);
-    float3 fwd = float3(u.forward[0], u.forward[1], u.forward[2]);
-    float3 rgt = float3(u.right[0], u.right[1], u.right[2]);
-    float3 upv = float3(u.up[0], u.up[1], u.up[2]);
+    float3 eye = c3(u.eye);
+    float3 fwd = c3(u.forward);
+    float3 rgt = c3(u.right);
+    float3 upv = c3(u.up);
 
     ulong pixel = (ulong)(py_row * u.width + gid.x);
     float3 sum = float3(0.0f);
@@ -696,8 +1063,8 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
         float py = (float)py_row + jy;
         float uu = (px / (float)u.width) * 2.0f - 1.0f;
         float vv = 1.0f - (py / (float)u.height) * 2.0f;
-        float3 dir = normalize_cpu(fwd + rgt * (uu * u.half_width) + upv * (vv * u.half_height));
-        float3 li = pt_li(s, eye, dir, rng);
+        float3 d = normalize_cpu(fwd + rgt * (uu * u.half_width) + upv * (vv * u.half_height));
+        float3 li = pt_li(s, eye, d, rng);
         float lum = 0.2126f * li.x + 0.7152f * li.y + 0.0722f * li.z;
         if (lum > u.firefly_clamp) li *= u.firefly_clamp / lum;
         sum += li;
