@@ -28,6 +28,8 @@ pub struct Scene {
     pub instances: Vec<Instance>,
     pub lights: Vec<Light>,
     pub materials: Vec<Material>,
+    /// Pattern node graph shared by all materials (see Material::pattern_bindings).
+    pub patterns: Vec<crate::texture::pattern::PatternNode>,
     pub background_color: Vec3,
     /// Samples per pixel in x and y (from the PixelSamples directive).
     pub pixel_samples: (u32, u32),
@@ -43,6 +45,7 @@ impl Scene {
             instances: Vec::new(),
             lights: Vec::new(),
             materials: Vec::new(),
+            patterns: Vec::new(),
             background_color: Vec3::new(0.0, 0.0, 0.0),
             pixel_samples: (1, 1),
             tlas: Bvh::build(&[]),

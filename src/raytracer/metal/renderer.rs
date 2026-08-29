@@ -26,6 +26,7 @@ extern "C" {}
 const ISECT_COMMON_SRC: &str = include_str!("isect_common.metal");
 const WHITTED_SRC: &str = include_str!("kernel.metal");
 const PT_SRC: &str = include_str!("kernel_pt.metal");
+const PATTERN_PRELUDE_SRC: &str = include_str!("pattern_prelude.metal");
 /// GPU-watchdog insurance: bounded work per command buffer.
 const ROWS_PER_BAND: usize = 256;
 /// The path tracer keeps each command buffer small — one sample over a
@@ -37,8 +38,10 @@ fn whitted_source() -> String {
     format!("{ISECT_COMMON_SRC}\n{WHITTED_SRC}")
 }
 
-fn pt_source() -> String {
-    format!("{ISECT_COMMON_SRC}\n{PT_SRC}")
+/// PT kernel source: common intersectors, the pattern runtime, the
+/// scene-specific generated pattern functions, then the kernel itself.
+fn pt_source(pattern_msl: &str) -> String {
+    format!("{ISECT_COMMON_SRC}\n{PATTERN_PRELUDE_SRC}\n{pattern_msl}\n{PT_SRC}")
 }
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -157,7 +160,10 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
     #[allow(deprecated)]
     options.setFastMathEnabled(true);
     let library = device
-        .newLibraryWithSource_options_error(&NSString::from_str(&pt_source()), Some(&options))
+        .newLibraryWithSource_options_error(
+            &NSString::from_str(&pt_source(&gpu.pattern_msl)),
+            Some(&options),
+        )
         .map_err(|e| anyhow!("PT MSL compilation failed:\n{}", e.localizedDescription()))?;
     let function = library
         .newFunctionWithName(ns_string!("render_pt"))
@@ -184,6 +190,9 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
         gpu.env_pixels_bytes(),
         gpu.env_marginal_bytes(),
         gpu.env_conditional_bytes(),
+        gpu.st_bytes(),
+        gpu.tex_data_bytes(),
+        gpu.tex_mips_bytes(),
     ]
     .into_iter()
     .map(|bytes| upload(&device, bytes))
@@ -226,9 +235,9 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
                 enc.setBytes_length_atIndex(
                     NonNull::new(&uniforms as *const GpuPtUniforms as *mut c_void).unwrap(),
                     std::mem::size_of::<GpuPtUniforms>(),
-                    14,
+                    17,
                 );
-                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 15);
+                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 18);
             }
             let grid = MTLSize { width: w, height: band, depth: 1 };
             enc.dispatchThreads_threadsPerThreadgroup(grid, tg);

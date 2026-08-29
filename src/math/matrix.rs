@@ -225,6 +225,16 @@ impl Matrix4 {
         let z = self.m[0][2] * n.x + self.m[1][2] * n.y + self.m[2][2] * n.z;
         Vec3::new(x, y, z)
     }
+
+    /// Average length scale of the linear part (geometric mean of the
+    /// transformed basis lengths) — the isotropic approximation used for
+    /// texture-footprint estimates.
+    pub fn approx_scale(&self) -> f64 {
+        let lx = self.transform_vec(&Vec3::new(1.0, 0.0, 0.0)).length();
+        let ly = self.transform_vec(&Vec3::new(0.0, 1.0, 0.0)).length();
+        let lz = self.transform_vec(&Vec3::new(0.0, 0.0, 1.0)).length();
+        (lx * ly * lz).cbrt().max(1e-12)
+    }
 }
 
 impl Mul<Matrix4> for Matrix4 {

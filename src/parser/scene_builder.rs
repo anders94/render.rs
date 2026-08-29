@@ -5,7 +5,7 @@
 //! the graphics state or passthrough dictionaries; everything else warns
 //! once and is skipped.
 
-use super::ast::{RibFile, RibRequest, RibValue};
+use super::ast::{ParamList, RibFile, RibRequest, RibValue};
 use crate::geometry::displace::DisplaceParams;
 use crate::geometry::patches::{
     basis_by_name, tessellate_bicubic, tessellate_bilinear, tessellate_nurbs, Basis4, NuPatchDef,
@@ -18,6 +18,8 @@ use crate::geometry::{
 };
 use crate::math::{Matrix4, Point3, Vec3};
 use crate::scene::*;
+use crate::texture::cache::Wrap;
+use crate::texture::pattern::{BoundField, PInput, PatternNode, TextureRef};
 use std::sync::Arc as StdArc;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -41,6 +43,8 @@ struct GraphicsState {
     area_light: Option<(f64, Vec3)>,
     /// Modern material from a `Bxdf` request; overrides `Surface` mapping.
     bxdf: Option<PbrParams>,
+    /// Pattern connections on the active Bxdf ("reference" params).
+    bxdf_bindings: Vec<(BoundField, u32)>,
     /// Displacement applied to tessellated geometry (Displace request).
     displace: Option<DisplaceParams>,
     basis_u: (Basis4, usize),
@@ -59,6 +63,7 @@ impl Default for GraphicsState {
             shading_rate: 1.0,
             area_light: None,
             bxdf: None,
+            bxdf_bindings: Vec::new(),
             displace: None,
             basis_u: (BEZIER, 3),
             basis_v: (BEZIER, 3),
@@ -114,6 +119,10 @@ pub struct SceneBuilder {
     /// Handle of the object definition currently open, with its entries.
     defining_object: Option<(String, Vec<ObjectDefEntry>)>,
     archive_depth: usize,
+    /// Pattern graph accumulated from `Pattern` requests (scene-global).
+    pattern_nodes: Vec<PatternNode>,
+    /// Pattern handle -> node index.
+    pattern_handles: HashMap<String, u32>,
 }
 
 impl SceneBuilder {
@@ -139,6 +148,8 @@ impl SceneBuilder {
             object_defs: HashMap::new(),
             defining_object: None,
             archive_depth: 0,
+            pattern_nodes: Vec::new(),
+            pattern_handles: HashMap::new(),
         }
     }
 
@@ -161,6 +172,7 @@ impl SceneBuilder {
         scene.materials = data.materials;
         scene.pixel_samples = self.pixel_samples;
         scene.background_color = self.background;
+        scene.patterns = self.pattern_nodes;
         scene.build_tlas();
         Ok(scene)
     }
@@ -438,8 +450,34 @@ impl SceneBuilder {
                     ));
                 }
                 let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
-                self.state.bxdf =
-                    Some(PbrParams::from_bxdf_params(&req.params_from(params_start)));
+                let params = req.params_from(params_start);
+                self.state.bxdf = Some(PbrParams::from_bxdf_params(&params));
+                // "reference <type> <param>" ["node:output"] connections.
+                let mut bindings = Vec::new();
+                for (token, value) in params.iter() {
+                    if !token.split_whitespace().any(|w| w == "reference") {
+                        continue;
+                    }
+                    let Some(param) = token.split_whitespace().last() else { continue };
+                    let Some(target) = value.as_str() else { continue };
+                    let handle = target.split(':').next().unwrap_or(target);
+                    let Some(field) = BoundField::from_param(param) else {
+                        self.warn_once(&format!(
+                            "reference to unsupported Bxdf param \"{param}\"; ignoring"
+                        ));
+                        continue;
+                    };
+                    match self.pattern_handles.get(handle) {
+                        Some(node) => bindings.push((field, *node)),
+                        None => self.warn_once(&format!(
+                            "Bxdf references unknown Pattern \"{handle}\"; ignoring"
+                        )),
+                    }
+                }
+                self.state.bxdf_bindings = bindings;
+            }
+            "Pattern" => {
+                self.pattern_request(req);
             }
             "Light" => {
                 self.build_light(req, data);
@@ -1181,6 +1219,162 @@ impl SceneBuilder {
         }
     }
 
+    /// Resolve a resource filename against the RIB's directory.
+    fn resource_path(&self, name: &str) -> PathBuf {
+        match &self.base_dir {
+            Some(dir) if !name.starts_with('/') => dir.join(name),
+            _ => PathBuf::from(name),
+        }
+    }
+
+    /// Open a texture through the global cache; `<UDIM>` filenames scan
+    /// for tile files 1001-1100.
+    fn open_texture(&mut self, filename: &str) -> TextureRef {
+        if filename.is_empty() {
+            self.warn_once("Pattern texture without \"filename\"; rendering magenta");
+            return TextureRef::Missing;
+        }
+        if filename.contains("<UDIM>") {
+            let mut tiles = HashMap::new();
+            for tile in 1001u16..=1100 {
+                let path = self.resource_path(&filename.replace("<UDIM>", &tile.to_string()));
+                if !path.exists() {
+                    continue;
+                }
+                match crate::texture::global_cache().open(&path) {
+                    Ok(id) => {
+                        tiles.insert(tile, id);
+                    }
+                    Err(e) => self.warn_once(&format!("texture {}: {e}", path.display())),
+                }
+            }
+            if tiles.is_empty() {
+                self.warn_once(&format!("no UDIM tiles found for \"{filename}\""));
+                return TextureRef::Missing;
+            }
+            return TextureRef::Udim(tiles);
+        }
+        let path = self.resource_path(filename);
+        match crate::texture::global_cache().open(&path) {
+            Ok(id) => TextureRef::Single(id),
+            Err(e) => {
+                self.warn_once(&format!("texture {}: {e}; rendering magenta", path.display()));
+                TextureRef::Missing
+            }
+        }
+    }
+
+    /// A pattern parameter that may be a constant or a reference to an
+    /// earlier node ("reference color mix" ["noise:resultRGB"]).
+    fn pattern_input(&self, params: &ParamList<'_>, name: &str, default: Vec3) -> PInput {
+        for (token, value) in params.iter() {
+            let mut words = token.split_whitespace();
+            let is_ref = token.split_whitespace().any(|w| w == "reference");
+            if is_ref && words.next_back() == Some(name) {
+                if let Some(target) = value.as_str() {
+                    let handle = target.split(':').next().unwrap_or(target);
+                    if let Some(node) = self.pattern_handles.get(handle) {
+                        return PInput::Node(*node);
+                    }
+                }
+            }
+        }
+        match params.get_numbers(name) {
+            Some(v) if v.len() >= 3 => PInput::Const(Vec3::new(v[0], v[1], v[2])),
+            Some(v) if !v.is_empty() => PInput::Const(Vec3::new(v[0], v[0], v[0])),
+            _ => PInput::Const(default),
+        }
+    }
+
+    /// `Pattern "type" "handle" params...` — build a graph node.
+    fn pattern_request(&mut self, req: &RibRequest) {
+        let ptype = req.string(0).unwrap_or("");
+        let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
+        let handle = if params_start == 2 { req.string(1) } else { None };
+        let Some(handle) = handle.map(str::to_string) else {
+            self.warn_once("Pattern without a handle; skipping");
+            return;
+        };
+        let params = req.params_from(params_start);
+        let color = |name: &str, default: Vec3| -> Vec3 {
+            params
+                .get_numbers(name)
+                .and_then(|v| (v.len() >= 3).then(|| Vec3::new(v[0], v[1], v[2])))
+                .unwrap_or(default)
+        };
+        let node = match ptype {
+            "PxrTexture" | "texture" => {
+                let filename = params.get_string("filename").unwrap_or("").to_string();
+                let tex = self.open_texture(&filename);
+                PatternNode::Texture {
+                    tex,
+                    wrap: Wrap::from_name(params.get_string("wrapMode").unwrap_or("periodic")),
+                    scale: [
+                        params.get_number("scaleS").unwrap_or(1.0),
+                        params.get_number("scaleT").unwrap_or(1.0),
+                    ],
+                }
+            }
+            "PxrChecker" | "checker" => PatternNode::Checker {
+                color_a: color("colorA", Vec3::one()),
+                color_b: color("colorB", Vec3::zero()),
+                scale: [
+                    params.get_number("sScale").unwrap_or(8.0),
+                    params.get_number("tScale").unwrap_or(8.0),
+                ],
+            },
+            "PxrFractal" | "fractal" | "noise" => PatternNode::Fractal {
+                frequency: params.get_number("frequency").unwrap_or(1.0),
+                octaves: params.get_number("layers").unwrap_or(4.0) as u32,
+                gain: params.get_number("gain").unwrap_or(0.5),
+                lacunarity: params.get_number("lacunarity").unwrap_or(2.0),
+            },
+            "PxrMix" | "mix" => PatternNode::Mix {
+                color1: self.pattern_input(&params, "color1", Vec3::zero()),
+                color2: self.pattern_input(&params, "color2", Vec3::one()),
+                mix: self.pattern_input(&params, "mix", Vec3::zero()),
+            },
+            "PxrColorCorrect" | "colorCorrect" => PatternNode::ColorCorrect {
+                input: self.pattern_input(&params, "inputRGB", Vec3::new(0.5, 0.5, 0.5)),
+                gain: color("gain", Vec3::one()),
+                offset: color("offset", Vec3::zero()),
+                gamma: params.get_number("gamma").unwrap_or(1.0),
+                saturation: params.get_number("saturation").unwrap_or(1.0),
+            },
+            "PxrRamp" | "ramp" => {
+                let positions = params
+                    .get_numbers("positions")
+                    .map(|v| v.to_vec())
+                    .unwrap_or_else(|| vec![0.0, 1.0]);
+                let colors = params
+                    .get_numbers("colors")
+                    .map(|v| v.chunks_exact(3).map(|c| Vec3::new(c[0], c[1], c[2])).collect())
+                    .unwrap_or_else(|| vec![Vec3::zero(), Vec3::one()]);
+                PatternNode::Ramp {
+                    positions,
+                    colors,
+                    use_t: params.get_string("axis") == Some("t"),
+                }
+            }
+            "triplanar" => {
+                let filename = params.get_string("filename").unwrap_or("").to_string();
+                let tex = self.open_texture(&filename);
+                PatternNode::Triplanar {
+                    tex,
+                    wrap: Wrap::from_name(params.get_string("wrapMode").unwrap_or("periodic")),
+                    frequency: params.get_number("frequency").unwrap_or(1.0),
+                }
+            }
+            other => {
+                self.warn_once(&format!("Pattern \"{other}\" not implemented; skipping"));
+                return;
+            }
+        };
+        let index = self.pattern_nodes.len() as u32;
+        self.pattern_nodes.push(node);
+        self.pattern_handles.insert(handle, index);
+    }
+
     /// Material from the current attribute state.
     fn make_material(&self) -> Material {
         if let Some(pbr) = &self.state.bxdf {
@@ -1188,6 +1382,7 @@ impl SceneBuilder {
             let mut m = Material::matte(pbr.diffuse_color);
             m.pbr = pbr.clone();
             m.emission = Vec3::zero();
+            m.pattern_bindings = self.state.bxdf_bindings.clone();
             return m;
         }
         match self.state.surface.as_str() {
@@ -1249,6 +1444,37 @@ impl Default for SceneBuilder {
 mod tests {
     use super::*;
     use crate::parser::parse_rib;
+
+    #[test]
+    fn pattern_graph_binds_to_bxdf() {
+        let input = r#"
+            Format 64 64 1.0
+            WorldBegin
+                Pattern "PxrChecker" "check" "colorA" [1 0 0] "colorB" [0 0 1] "sScale" [4] "tScale" [4]
+                Pattern "PxrMix" "blend" "reference color color1" ["check:resultRGB"] "color2" [0 1 0] "mix" [0.25]
+                Bxdf "PxrSurface" "mat" "reference color diffuseColor" ["blend:resultRGB"] "specularIor" [1]
+                Sphere 1 -1 1 360
+            WorldEnd
+        "#;
+        let scene = SceneBuilder::new().build(&parse_rib(input).unwrap()).unwrap();
+        assert_eq!(scene.patterns.len(), 2);
+        let material = scene.materials.last().unwrap();
+        assert_eq!(material.pattern_bindings.len(), 1);
+        let (field, node) = material.pattern_bindings[0];
+        assert_eq!(field, crate::texture::pattern::BoundField::DiffuseColor);
+        assert_eq!(node, 1);
+        // Evaluate the bound graph: checker cell (0,0) red, mixed 25%
+        // toward green.
+        let ctx = crate::texture::pattern::ShadeCtx {
+            st: [0.1, 0.1],
+            p: [0.0; 3],
+            n: [0.0, 0.0, 1.0],
+            footprint: 0.0,
+        };
+        let pbr = material.resolved_pbr(&scene.patterns, &ctx);
+        assert!((pbr.diffuse_color.x - 0.75).abs() < 1e-9, "{:?}", pbr.diffuse_color);
+        assert!((pbr.diffuse_color.y - 0.25).abs() < 1e-9);
+    }
 
     #[test]
     fn test_single_pass_build_with_attribute_blocks() {

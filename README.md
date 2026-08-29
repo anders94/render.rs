@@ -242,11 +242,11 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 2. **Missing primitives** - Curves (hair) and Points are on the roadmap (see ROADMAP.md); implemented: all seven RiSpec quadrics, Polygon/GeneralPolygon (ear-clipped holes), PointsPolygons meshes with SAH BVH + TLAS instancing, Catmull-Clark SubdivisionMesh with creases, bilinear/bicubic PatchMesh with basis matrices, NURBS NuPatch, and fBm displacement at dice time (`Displace "noise"`). COMPLIANCE.md tracks the full RIB request matrix.
 
-3. **No textures** - Texture mapping not implemented.
+3. **Textures & patterns** - Implemented (roadmap Phase 6): a tiled-mip `.tex` format with a `render txmake` converter, a sharded-LRU tile cache with a byte budget, trilinear filtering driven by ray-cone mip selection, UDIM (`<UDIM>` filenames), and a pattern node graph (PxrTexture/PxrChecker/PxrFractal/PxrMix/PxrColorCorrect/PxrRamp/triplanar) connected to Bxdf params with `reference` declarations — on CPU and Metal (runtime MSL codegen). Not yet: EWA anisotropic filtering, pattern-driven displacement, `Pattern` st on GPU quadrics (use triplanar there).
 
-4. **No acceleration structure** - Every ray tests every object; fine for small scenes, slow for large ones.
+4. **Acceleration structure** - Quadrics and loose polygons still use a linear scan; meshes (where the polygon counts live) go through a binned-SAH BVH with TLAS instancing.
 
-5. **No global illumination** - Direct lighting plus mirror reflections only; no ambient occlusion or path tracing. Point lights have no distance falloff.
+5. **Global illumination** - The `--integrator path` path tracer (CPU and Metal) does full GI with NEE+MIS; the default Whitted integrator remains the fast direct-light preview.
 
 ## Future Enhancements
 

@@ -6,6 +6,7 @@
 //! runtime from the embedded kernel.metal via the OS compiler service.
 
 pub mod gpu_scene;
+pub mod pattern_codegen;
 mod renderer;
 pub mod scene_buffers;
 

@@ -118,12 +118,17 @@ pub fn tessellate_bicubic(
     let gu = npu * segs + if def.u_wrap { 0 } else { 1 };
     let gv = npv * segs + if def.v_wrap { 0 } else { 1 };
     let mut positions = Vec::with_capacity(gu * gv);
+    let mut st = Vec::with_capacity(gu * gv);
     for sv in 0..gv {
         let pv = (sv / segs).min(npv - 1);
         let v = sv as f64 / segs as f64 - pv as f64;
         for su in 0..gu {
             let pu = (su / segs).min(npu - 1);
             let u = su as f64 / segs as f64 - pu as f64;
+            st.push([
+                (su as f64 / (npu * segs) as f64) as f32,
+                (sv as f64 / (npv * segs) as f64) as f32,
+            ]);
             let mut grid = [[0.0; 3]; 16];
             for (jj, row) in grid.chunks_exact_mut(4).enumerate() {
                 for (ii, c) in row.iter_mut().enumerate() {
@@ -151,7 +156,7 @@ pub fn tessellate_bicubic(
         }
     }
     let normals = smooth_normals(&positions, &indices);
-    Some(Mesh::new(positions, indices, Some(normals), None))
+    Some(Mesh::new(positions, indices, Some(normals), Some(st)))
 }
 
 /// Bilinear PatchMesh: control points interpolated directly.
@@ -169,12 +174,17 @@ pub fn tessellate_bilinear(def: &PatchMeshDef<'_>, segs: usize) -> Option<Mesh> 
         [def.points[idx], def.points[idx + 1], def.points[idx + 2]]
     };
     let mut positions = Vec::with_capacity(gu * gv);
+    let mut st = Vec::with_capacity(gu * gv);
     for sv in 0..gv {
         let pv = (sv / segs).min(npv - 1);
         let v = sv as f64 / segs as f64 - pv as f64;
         for su in 0..gu {
             let pu = (su / segs).min(npu - 1);
             let u = su as f64 / segs as f64 - pu as f64;
+            st.push([
+                (su as f64 / (npu * segs) as f64) as f32,
+                (sv as f64 / (npv * segs) as f64) as f32,
+            ]);
             let p00 = ctrl(pu, pv);
             let p10 = ctrl(pu + 1, pv);
             let p01 = ctrl(pu, pv + 1);
@@ -201,7 +211,7 @@ pub fn tessellate_bilinear(def: &PatchMeshDef<'_>, segs: usize) -> Option<Mesh> 
         }
     }
     let normals = smooth_normals(&positions, &indices);
-    Some(Mesh::new(positions, indices, Some(normals), None))
+    Some(Mesh::new(positions, indices, Some(normals), Some(st)))
 }
 
 // ---------------------------------------------------------------------------
@@ -297,10 +307,15 @@ pub fn tessellate_nurbs(def: &NuPatchDef<'_>, segs_u: usize, segs_v: usize) -> O
     let gu = segs_u + 1;
     let gv = segs_v + 1;
     let mut positions = Vec::with_capacity(gu * gv);
+    let mut st = Vec::with_capacity(gu * gv);
     for sv in 0..gv {
         let v = def.vmin + (def.vmax - def.vmin) * sv as f64 / segs_v as f64;
         for su in 0..gu {
             let u = def.umin + (def.umax - def.umin) * su as f64 / segs_u as f64;
+            st.push([
+                (su as f64 / segs_u as f64) as f32,
+                (sv as f64 / segs_v as f64) as f32,
+            ]);
             let p = eval_nurbs(def, u, v);
             positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
         }
@@ -316,7 +331,7 @@ pub fn tessellate_nurbs(def: &NuPatchDef<'_>, segs_u: usize, segs_v: usize) -> O
         }
     }
     let normals = smooth_normals(&positions, &indices);
-    Some(Mesh::new(positions, indices, Some(normals), None))
+    Some(Mesh::new(positions, indices, Some(normals), Some(st)))
 }
 
 #[cfg(test)]

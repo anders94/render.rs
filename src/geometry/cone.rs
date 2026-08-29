@@ -126,12 +126,21 @@ impl Cone {
 
         let world_normal = self.inverse_transform.transform_normal(&local_normal).normalize();
 
-        Some(Intersection::new(
-            t_world,
-            world_hit_point,
-            world_normal,
-            self.material_id,
-        ))
+        let mut phi = local_hit_point.y.atan2(local_hit_point.x).to_degrees();
+        if phi < 0.0 {
+            phi += 360.0;
+        }
+        let u = (phi / self.thetamax).clamp(0.0, 1.0);
+        let v = (local_hit_point.z / self.height.max(1e-12)).clamp(0.0, 1.0);
+        let dpdu = r.max(1e-6 * self.radius.max(1e-12)) * self.thetamax.to_radians();
+        let slant = (self.height * self.height + self.radius * self.radius).sqrt();
+        let density =
+            1.0 / (dpdu * slant).max(1e-24).sqrt() / self.transform.approx_scale();
+
+        Some(
+            Intersection::new(t_world, world_hit_point, world_normal, self.material_id)
+                .with_st([u, v], density),
+        )
     }
 }
 

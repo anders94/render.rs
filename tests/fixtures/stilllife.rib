@@ -1,0 +1,126 @@
+##RenderMan RIB-Structure 1.1
+# Phase 6 demo gate: UDIM-textured still life. File textures through the
+# tiled-mip cache, pattern graphs (texture/checker/fractal/mix/
+# colorCorrect/ramp/triplanar) bound to Bxdf params via references, and
+# ray-cone mip selection killing grazing-angle shimmer on the deck.
+version 3.04
+Display "stilllife.exr" "file" "rgb"
+Format 1280 640 1.0
+Projection "perspective" "fov" [34]
+Rotate -11 1 0 0
+Translate 0 -2.6 0
+
+WorldBegin
+    Light "PxrDomeLight" "sky" "intensity" [1] "lightColorMap" ["sky.hdr"]
+
+    # --- Wooden deck: 2x2 UDIM parquet, grazing angles to the far edge --
+    AttributeBegin
+        Pattern "PxrTexture" "wood" "filename" ["wood_<UDIM>.tex"]
+        Bxdf "PxrSurface" "deck"
+            "reference color diffuseColor" ["wood:resultRGB"]
+            "diffuseRoughness" [0.3]
+            "specularIor" [1.4]
+            "specularRoughness" [0.35]
+        PointsPolygons [4] [0 1 2 3]
+            "P" [-9 0 2  9 0 2  9 0 20  -9 0 20]
+            "st" [0 0  1.999 0  1.999 1.999  0 1.999]
+    AttributeEnd
+
+    # Distant ground beyond the deck (sea of grey to the horizon).
+    Bxdf "PxrSurface" "ground" "diffuseColor" [0.32 0.33 0.36] "specularIor" [1]
+    Polygon "P" [-300 -0.35 -20  300 -0.35 -20  300 -0.35 500  -300 -0.35 500]
+
+    # --- Left: shipping crate with the label texture -------------------
+    AttributeBegin
+        Pattern "PxrTexture" "poster" "filename" ["label.tex"]
+        Pattern "PxrColorCorrect" "posterGraded"
+            "reference color inputRGB" ["poster:resultRGB"]
+            "gain" [1.05 1.0 0.92] "gamma" [1.1] "saturation" [1.25]
+        Bxdf "PxrSurface" "crate"
+            "reference color diffuseColor" ["posterGraded:resultRGB"]
+            "specularIor" [1.45]
+            "specularRoughness" [0.3]
+        Translate -3.1 0.85 10
+        Rotate 24 0 1 0
+        PointsPolygons [4 4 4 4 4 4]
+            [0 1 2 3  4 5 6 7  8 9 10 11  12 13 14 15  16 17 18 19  20 21 22 23]
+            "P" [-0.85 -0.85 -0.85   0.85 -0.85 -0.85   0.85 0.85 -0.85  -0.85 0.85 -0.85
+                  0.85 -0.85  0.85  -0.85 -0.85  0.85  -0.85 0.85  0.85   0.85 0.85  0.85
+                 -0.85 -0.85  0.85  -0.85 -0.85 -0.85  -0.85 0.85 -0.85  -0.85 0.85  0.85
+                  0.85 -0.85 -0.85   0.85 -0.85  0.85   0.85 0.85  0.85   0.85 0.85 -0.85
+                 -0.85  0.85 -0.85   0.85  0.85 -0.85   0.85 0.85  0.85  -0.85 0.85  0.85
+                 -0.85 -0.85  0.85   0.85 -0.85  0.85   0.85 -0.85 -0.85  -0.85 -0.85 -0.85]
+            "st" [0 0  1 0  1 1  0 1
+                  0 0  1 0  1 1  0 1
+                  0 0  1 0  1 1  0 1
+                  0 0  1 0  1 1  0 1
+                  0 0  1 0  1 1  0 1
+                  0 0  1 0  1 1  0 1]
+    AttributeEnd
+
+    # --- Right: turned-wood sphere (triplanar; no st needed) -----------
+    AttributeBegin
+        Pattern "triplanar" "woodwrap" "filename" ["wood_1001.tex"] "frequency" [1.6]
+        Pattern "PxrFractal" "rough" "frequency" [3.0] "layers" [4]
+        Bxdf "PxrSurface" "woodball"
+            "reference color diffuseColor" ["woodwrap:resultRGB"]
+            "specularIor" [1.5]
+            "reference float specularRoughness" ["rough:resultRGB"]
+        Translate 3.1 1.0 11
+        Sphere 1.0 -1.0 1.0 360
+    AttributeEnd
+
+    # --- Center: checkered picnic cloth (b-spline patch) ---------------
+    AttributeBegin
+        Pattern "PxrChecker" "check" "colorA" [0.75 0.12 0.10] "colorB" [0.92 0.88 0.82]
+            "sScale" [10] "tScale" [10]
+        Pattern "PxrMix" "checkSoft"
+            "reference color color1" ["check:resultRGB"]
+            "color2" [0.6 0.55 0.5] "mix" [0.12]
+        Bxdf "PxrSurface" "cloth"
+            "reference color diffuseColor" ["checkSoft:resultRGB"]
+            "diffuseRoughness" [0.6]
+            "specularIor" [1]
+            "fuzzGain" [0.8] "fuzzColor" [0.95 0.9 0.85]
+        ShadingRate 0.5
+        Basis "b-spline" 1 "b-spline" 1
+        Translate 0.1 0.001 12.5
+        Rotate -14 0 1 0
+        PatchMesh "bicubic" 7 "nonperiodic" 7 "nonperiodic"
+            "P" [-1.8 0 -1.8  -1.2 0 -1.8  -0.6 0 -1.8  0 0 -1.8  0.6 0 -1.8  1.2 0 -1.8  1.8 0 -1.8
+                 -1.8 0 -1.2  -1.2 0.35 -1.2  -0.6 1.5 -1.2  0 1.6 -1.2  0.6 1.5 -1.2  1.2 0.35 -1.2  1.8 0 -1.2
+                 -1.8 0 -0.6  -1.2 1.5 -0.6  -0.6 1.7 -0.6  0 1.7 -0.6  0.6 1.7 -0.6  1.2 1.5 -0.6  1.8 0 -0.6
+                 -1.8 0 0  -1.2 1.6 0  -0.6 1.7 0  0 1.75 0  0.6 1.7 0  1.2 1.6 0  1.8 0 0
+                 -1.8 0 0.6  -1.2 1.5 0.6  -0.6 1.7 0.6  0 1.7 0.6  0.6 1.7 0.6  1.2 1.5 0.6  1.8 0 0.6
+                 -1.8 0 1.2  -1.2 0.35 1.2  -0.6 1.5 1.2  0 1.6 1.2  0.6 1.5 1.2  1.2 0.35 1.2  1.8 0 1.2
+                 -1.8 0 1.8  -1.2 0 1.8  -0.6 0 1.8  0 0 1.8  0.6 0 1.8  1.2 0 1.8  1.8 0 1.8]
+    AttributeEnd
+
+    # --- Back: teal NURBS band with a vertical ramp --------------------
+    AttributeBegin
+        Pattern "PxrRamp" "fade" "axis" ["t"]
+            "positions" [0 0.5 1]
+            "colors" [0.06 0.22 0.28  0.1 0.4 0.45  0.75 0.82 0.8]
+        Bxdf "PxrSurface" "band"
+            "reference color diffuseColor" ["fade:resultRGB"]
+            "specularIor" [1.5]
+            "specularRoughness" [0.18]
+        ShadingRate 0.5
+        Translate -0.6 0 19
+        NuPatch 7 3 [0 0 0 1 2 3 4 5 5 5] 0 5
+                3 3 [0 0 0 1 1 1] 0 1
+            "P" [-6 0 0  -4 2.4 0.6  -2 0 -0.6  0 2.4 0.6  2 0 -0.6  4 2.4 0.6  6 0 0
+                 -6 0.4 1  -4 2.8 1.6  -2 0.4 0.4  0 2.8 1.6  2 0.4 0.4  4 2.8 1.6  6 0.4 1
+                 -6 0.8 2  -4 3.2 2.6  -2 0.8 1.4  0 3.2 2.6  2 0.8 1.4  4 3.2 2.6  6 0.8 2]
+    AttributeEnd
+
+    # --- Front: glass sphere over the parquet --------------------------
+    AttributeBegin
+        Bxdf "PxrSurface" "glass"
+            "diffuseGain" [0]
+            "glassRefractionGain" [1] "glassIor" [1.5] "glassRoughness" [0.02]
+            "refractionColor" [0.96 0.99 0.97]
+        Translate 1.1 0.62 7.2
+        Sphere 0.62 -0.62 0.62 360
+    AttributeEnd
+WorldEnd

@@ -97,12 +97,20 @@ impl Intersectable for Cylinder {
         let local_normal = Vec3::new(local_hit_point.x, local_hit_point.y, 0.0).normalize();
         let world_normal = self.inverse_transform.transform_normal(&local_normal).normalize();
 
-        Some(Intersection::new(
-            t_world,
-            world_hit_point,
-            world_normal,
-            self.material_id,
-        ))
+        let mut phi = local_hit_point.y.atan2(local_hit_point.x).to_degrees();
+        if phi < 0.0 {
+            phi += 360.0;
+        }
+        let u = (phi / self.thetamax).clamp(0.0, 1.0);
+        let zrange = (self.zmax - self.zmin).max(1e-12);
+        let v = ((local_hit_point.z - self.zmin) / zrange).clamp(0.0, 1.0);
+        let dpdu = self.radius.max(1e-12) * self.thetamax.to_radians();
+        let density = 1.0 / (dpdu * zrange).max(1e-24).sqrt() / self.transform.approx_scale();
+
+        Some(
+            Intersection::new(t_world, world_hit_point, world_normal, self.material_id)
+                .with_st([u, v], density),
+        )
     }
 
     fn describe(&self) -> PrimitiveDesc {

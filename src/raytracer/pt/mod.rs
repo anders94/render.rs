@@ -12,7 +12,8 @@ pub mod sampler;
 use crate::math::{Point3, Vec3};
 use crate::output::Image;
 use crate::raytracer::{Intersection, Ray};
-use crate::scene::{Light, LightType, Material, Scene};
+use crate::scene::{Light, LightType, Material, PbrParams, Scene};
+use crate::texture::pattern::ShadeCtx;
 use bxdf::Frame;
 use rayon::prelude::*;
 use sampler::Pcg32;
@@ -29,6 +30,10 @@ const MAX_PRESENCE_SKIPS: usize = 16;
 pub fn render(scene: &Scene, spp: u32) -> Image {
     let width = scene.camera.width as usize;
     let height = scene.camera.height as usize;
+    // Angular size of one pixel: the initial ray-cone spread for texture
+    // footprints (task: mip selection without shimmer).
+    let pixel_spread =
+        (scene.camera.fov.to_radians() / 2.0).tan() * 2.0 / scene.camera.height as f64;
 
     (0..height)
         .into_par_iter()
@@ -43,7 +48,7 @@ pub fn render(scene: &Scene, spp: u32) -> Image {
                         let ray = scene
                             .camera
                             .generate_ray(x as f64 + jx, y as f64 + jy);
-                        let mut l = trace(scene, ray, &mut rng);
+                        let mut l = trace(scene, ray, pixel_spread, &mut rng);
                         let lum = luminance(&l);
                         if lum > FIREFLY_CLAMP {
                             l = l * (FIREFLY_CLAMP / lum);
@@ -63,10 +68,6 @@ fn luminance(c: &Vec3) -> f64 {
 
 fn max_component(c: &Vec3) -> f64 {
     c.x.max(c.y).max(c.z)
-}
-
-fn emission_of(material: &Material) -> Vec3 {
-    material.emission + material.pbr.glow
 }
 
 /// Dome light lookup: (index, light) when the scene has one.
@@ -92,7 +93,27 @@ fn dome_pdf(light: &Light, dir: &Vec3) -> f64 {
     }
 }
 
-fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
+/// Pattern-resolved lobe parameters at a hit (ray-cone footprint feeds
+/// the texture mip selection).
+fn shade_params(
+    scene: &Scene,
+    material: &Material,
+    hit: &Intersection,
+    cone_width: f64,
+) -> PbrParams {
+    if material.pattern_bindings.is_empty() {
+        return material.pbr.clone();
+    }
+    let ctx = ShadeCtx {
+        st: hit.st,
+        p: [hit.point.x, hit.point.y, hit.point.z],
+        n: [hit.normal.x, hit.normal.y, hit.normal.z],
+        footprint: cone_width * hit.st_density,
+    };
+    material.resolved_pbr(&scene.patterns, &ctx)
+}
+
+fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec3 {
     let mut l = Vec3::zero();
     let mut beta = Vec3::one();
     // pdf of the previous BSDF sample (solid angle), for MIS on emitter hits.
@@ -101,6 +122,10 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
     let mut from_camera = true;
     let mut presence_skips = 0usize;
     let num_lights = scene.lights.len() as f64;
+    // Ray cone for texture filtering: width grows with distance, spread
+    // widens after rough bounces.
+    let mut cone_width = 0.0f64;
+    let mut cone_spread = pixel_spread;
 
     let mut depth = 0usize;
     while depth < MAX_BOUNCES {
@@ -122,9 +147,11 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
         };
         let material = &scene.materials[hit.material_id];
         let wo = -ray.direction.normalize();
+        cone_width += hit.t * cone_spread;
+        let pbr = shade_params(scene, material, &hit, cone_width);
 
         // Presence cutout: stochastically pass through.
-        let presence = material.pbr.presence.clamp(0.0, 1.0);
+        let presence = pbr.presence.clamp(0.0, 1.0);
         if presence < 1.0 && rng.next_f64() >= presence && presence_skips < MAX_PRESENCE_SKIPS {
             presence_skips += 1;
             ray = Ray::new(hit.point + ray.direction.normalize() * RAY_OFFSET, ray.direction);
@@ -136,13 +163,13 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
         let entering = hit.front_face;
         let n = if hit.normal.dot(&wo) >= 0.0 { hit.normal } else { -hit.normal };
         let eta_rel = if entering {
-            material.pbr.glass_ior
+            pbr.glass_ior
         } else {
-            1.0 / material.pbr.glass_ior
+            1.0 / pbr.glass_ior
         };
 
         // Emitter hit.
-        let emission = emission_of(material);
+        let emission = material.emission + pbr.glow;
         if max_component(&emission) > 0.0 {
             let weight = if from_camera {
                 1.0
@@ -161,7 +188,7 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
         let wo_l = frame.to_local(&wo);
 
         // Next-event estimation: sample one light uniformly.
-        if !scene.lights.is_empty() && material.pbr.lobe_weights().is_some() {
+        if !scene.lights.is_empty() && pbr.lobe_weights().is_some() {
             let light_idx = rng.next_below(scene.lights.len());
             let contribution = sample_light(
                 scene,
@@ -169,7 +196,7 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
                 &hit.point,
                 &frame,
                 &wo_l,
-                material,
+                &pbr,
                 eta_rel,
                 rng,
             );
@@ -177,7 +204,7 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
         }
 
         // Continue the path with a BSDF sample.
-        let Some(s) = bxdf::sample(&material.pbr, &wo_l, eta_rel, rng) else {
+        let Some(s) = bxdf::sample(&pbr, &wo_l, eta_rel, rng) else {
             break;
         };
         let wi_world = frame.to_world(&s.wi);
@@ -185,6 +212,9 @@ fn trace(scene: &Scene, mut ray: Ray, rng: &mut Pcg32) -> Vec3 {
         prev_pdf = s.pdf;
         prev_origin = hit.point;
         from_camera = false;
+        // Widen the cone after rough bounces (tight lobes = high pdf add
+        // almost nothing; diffuse adds ~0.3 rad).
+        cone_spread += (1.0 / (1.0 + s.pdf)).min(0.4);
 
         let offset = if s.transmitted { -RAY_OFFSET } else { RAY_OFFSET };
         ray = Ray::new(hit.point + n * offset, wi_world);
@@ -244,7 +274,7 @@ fn sample_light(
     p: &Point3,
     frame: &Frame,
     wo_l: &Vec3,
-    material: &Material,
+    pbr: &PbrParams,
     eta_rel: f64,
     rng: &mut Pcg32,
 ) -> Vec3 {
@@ -254,7 +284,7 @@ fn sample_light(
         if wi_l.z <= 0.0 {
             return (Vec3::zero(), 0.0);
         }
-        bxdf::eval_pdf(&material.pbr, wo_l, &wi_l, eta_rel)
+        bxdf::eval_pdf(pbr, wo_l, &wi_l, eta_rel)
     };
 
     match &light.light_type {
@@ -311,7 +341,7 @@ fn sample_light(
             let (u, v) = rng.next_2d();
             let sample_point = *corner + *edge1 * u + *edge2 * v;
             area_light_contribution(
-                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, material, eta_rel,
+                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, pbr, eta_rel,
             )
         }
         LightType::DiskArea { center, e1, e2, normal, area } => {
@@ -321,7 +351,7 @@ fn sample_light(
             let phi = 2.0 * PI * v;
             let sample_point = *center + *e1 * (r * phi.cos()) + *e2 * (r * phi.sin());
             area_light_contribution(
-                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, material, eta_rel,
+                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, pbr, eta_rel,
             )
         }
         LightType::SphereArea { center, radius } => {
@@ -401,7 +431,7 @@ fn area_light_contribution(
     area: f64,
     light: &Light,
     wo_l: &Vec3,
-    material: &Material,
+    pbr: &PbrParams,
     eta_rel: f64,
 ) -> Vec3 {
     let to_light = *sample_point - *p;
@@ -415,7 +445,7 @@ fn area_light_contribution(
     if cos_light < 1e-9 || area <= 0.0 {
         return Vec3::zero();
     }
-    let (f, bsdf_pdf) = bxdf::eval_pdf(&material.pbr, wo_l, &wi_l, eta_rel);
+    let (f, bsdf_pdf) = bxdf::eval_pdf(pbr, wo_l, &wi_l, eta_rel);
     if max_component(&f) <= 0.0 {
         return Vec3::zero();
     }
@@ -451,7 +481,8 @@ fn transmittance(scene: &Scene, mut origin: Point3, dir: Vec3, mut remaining: f6
         if hit.t >= remaining {
             return vis;
         }
-        let presence = scene.materials[hit.material_id].pbr.presence.clamp(0.0, 1.0);
+        let material = &scene.materials[hit.material_id];
+        let presence = shade_params(scene, material, &hit, 0.0).presence.clamp(0.0, 1.0);
         if presence >= 1.0 {
             return 0.0;
         }

@@ -31,6 +31,15 @@ fn world_hit(
     Intersection::new(t_world, world_p, world_n, material_id)
 }
 
+/// Parametric u in [0,1]: wrapped phi (degrees) over thetamax.
+fn phi_u(x: f64, y: f64, thetamax: f64) -> f64 {
+    let mut phi = y.atan2(x).to_degrees();
+    if phi < 0.0 {
+        phi += 360.0;
+    }
+    (phi / thetamax.max(1e-9)).clamp(0.0, 1.0)
+}
+
 /// phi in [0, 360) from object-space x/y; accept when phi <= thetamax.
 fn theta_ok(x: f64, y: f64, thetamax: f64) -> bool {
     if thetamax >= 360.0 {
@@ -264,14 +273,31 @@ impl Intersectable for Torus {
             let r_xy = (p.x * p.x + p.y * p.y).sqrt().max(1e-12);
             let scale = 1.0 - big_r / r_xy;
             let local_n = Vec3::new(p.x * scale, p.y * scale, p.z).normalize();
-            return Some(world_hit(
-                &self.transform,
-                &self.inverse_transform,
-                ray,
-                p,
-                local_n,
-                self.material_id,
-            ));
+            let u = phi_u(p.x, p.y, self.thetamax);
+            let mut vphi = p.z.atan2(r_xy - big_r).to_degrees();
+            while vphi < self.phimin {
+                vphi += 360.0;
+            }
+            while vphi >= self.phimin + 360.0 {
+                vphi -= 360.0;
+            }
+            let vrange = (self.phimax - self.phimin).max(1e-9);
+            let v = ((vphi - self.phimin) / vrange).clamp(0.0, 1.0);
+            let dpdu = r_xy * self.thetamax.to_radians();
+            let dpdv = r.max(1e-12) * vrange.to_radians();
+            let density =
+                1.0 / (dpdu * dpdv).max(1e-24).sqrt() / self.transform.approx_scale();
+            return Some(
+                world_hit(
+                    &self.transform,
+                    &self.inverse_transform,
+                    ray,
+                    p,
+                    local_n,
+                    self.material_id,
+                )
+                .with_st([u, v], density),
+            );
         }
         None
     }
@@ -335,14 +361,23 @@ impl Intersectable for Disk {
             return None;
         }
         let local_n = Vec3::new(0.0, 0.0, 1.0);
-        Some(world_hit(
-            &self.transform,
-            &self.inverse_transform,
-            ray,
-            p,
-            local_n,
-            self.material_id,
-        ))
+        let r_hit = (p.x * p.x + p.y * p.y).sqrt();
+        let u = phi_u(p.x, p.y, self.thetamax);
+        let v = ((self.radius - r_hit) / self.radius.max(1e-12)).clamp(0.0, 1.0);
+        let dpdu = r_hit.max(1e-6 * self.radius.max(1e-12)) * self.thetamax.to_radians();
+        let density =
+            1.0 / (dpdu * self.radius).max(1e-24).sqrt() / self.transform.approx_scale();
+        Some(
+            world_hit(
+                &self.transform,
+                &self.inverse_transform,
+                ray,
+                p,
+                local_n,
+                self.material_id,
+            )
+            .with_st([u, v], density),
+        )
     }
 
     fn describe(&self) -> PrimitiveDesc {
@@ -424,14 +459,26 @@ impl Intersectable for Paraboloid {
                 continue;
             }
             let local_n = Vec3::new(2.0 * p.x, 2.0 * p.y, -k).normalize();
-            return Some(world_hit(
-                &self.transform,
-                &self.inverse_transform,
-                ray,
-                p,
-                local_n,
-                self.material_id,
-            ));
+            let u = phi_u(p.x, p.y, self.thetamax);
+            let zrange = (self.zmax - self.zmin).max(1e-12);
+            let v = ((p.z - self.zmin) / zrange).clamp(0.0, 1.0);
+            let ring = (p.x * p.x + p.y * p.y)
+                .sqrt()
+                .max(1e-6 * self.rmax.max(1e-12));
+            let dpdu = ring * self.thetamax.to_radians();
+            let density =
+                1.0 / (dpdu * zrange).max(1e-24).sqrt() / self.transform.approx_scale();
+            return Some(
+                world_hit(
+                    &self.transform,
+                    &self.inverse_transform,
+                    ray,
+                    p,
+                    local_n,
+                    self.material_id,
+                )
+                .with_st([u, v], density),
+            );
         }
         None
     }
@@ -554,14 +601,32 @@ impl Intersectable for Hyperboloid {
                 continue;
             }
             let local_n = Vec3::new(2.0 * p.x, 2.0 * p.y, -(2.0 * pa * p.z + pb)).normalize();
-            return Some(world_hit(
-                &self.transform,
-                &self.inverse_transform,
-                ray,
-                p,
-                local_n,
-                self.material_id,
-            ));
+            let u = phi_u(p.x, p.y, self.thetamax);
+            let dz = self.p2[2] - self.p1[2];
+            let v = ((p.z - self.p1[2]) / dz).clamp(0.0, 1.0);
+            let ring = (p.x * p.x + p.y * p.y).sqrt().max(1e-12);
+            let dpdu = ring * self.thetamax.to_radians();
+            let sweep = {
+                let d = [
+                    self.p2[0] - self.p1[0],
+                    self.p2[1] - self.p1[1],
+                    self.p2[2] - self.p1[2],
+                ];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-12)
+            };
+            let density =
+                1.0 / (dpdu * sweep).max(1e-24).sqrt() / self.transform.approx_scale();
+            return Some(
+                world_hit(
+                    &self.transform,
+                    &self.inverse_transform,
+                    ray,
+                    p,
+                    local_n,
+                    self.material_id,
+                )
+                .with_st([u, v], density),
+            );
         }
         None
     }

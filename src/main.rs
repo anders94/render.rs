@@ -63,7 +63,34 @@ enum Integrator {
     Path,
 }
 
+/// txmake-equivalent: convert any image to the renderer's tiled-mip .tex.
+#[derive(Parser, Debug)]
+#[command(name = "render txmake")]
+struct TxmakeArgs {
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+}
+
 fn main() -> Result<()> {
+    // Subcommand dispatch that keeps `render scene.rib` working unchanged.
+    if std::env::args().nth(1).as_deref() == Some("txmake") {
+        let tx = TxmakeArgs::parse_from(std::env::args().skip(1));
+        let header = render_rs::texture::tex::txmake(&tx.input, &tx.output)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!(
+            "{} -> {} ({}x{}, {} mip levels, {}px tiles)",
+            tx.input.display(),
+            tx.output.display(),
+            header.width,
+            header.height,
+            header.mips.len(),
+            header.tile_size
+        );
+        return Ok(());
+    }
+
     let args = Args::parse();
 
     if let Some(threads) = args.threads {
@@ -144,6 +171,10 @@ fn main() -> Result<()> {
         }
         },
     };
+
+    if !scene.patterns.is_empty() {
+        println!("{}", render_rs::texture::global_cache().stats_line());
+    }
 
     println!("Writing output to {}...", args.output.display());
     match args.format.as_str() {

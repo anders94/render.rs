@@ -84,9 +84,27 @@ impl Intersectable for Sphere {
         let local_normal = (local_hit_point - Point3::origin()).normalize();
         let world_normal = self.inverse_transform.transform_normal(&local_normal).normalize();
 
+        // RiSpec parameterization: u along theta, v along z.
+        let mut phi = local_hit_point.y.atan2(local_hit_point.x).to_degrees();
+        if phi < 0.0 {
+            phi += 360.0;
+        }
+        let u = (phi / self.thetamax).clamp(0.0, 1.0);
+        let zrange = (self.zmax - self.zmin).max(1e-12);
+        let v = ((local_hit_point.z - self.zmin) / zrange).clamp(0.0, 1.0);
+        let ring = (local_hit_point.x * local_hit_point.x
+            + local_hit_point.y * local_hit_point.y)
+            .sqrt()
+            .max(1e-6 * self.radius.max(1e-12));
+        let dpdu = ring * self.thetamax.to_radians();
+        let dpdv = zrange * self.radius / ring;
+        let scale = self.transform.approx_scale();
+        let density = 1.0 / (dpdu * dpdv).max(1e-24).sqrt() / scale;
+
         Some(
             Intersection::new(t_world, world_hit_point, world_normal, self.material_id)
-                .with_front_face(ray.direction.dot(&world_normal) < 0.0),
+                .with_front_face(ray.direction.dot(&world_normal) < 0.0)
+                .with_st([u, v], density),
         )
     }
 
@@ -120,6 +138,24 @@ mod tests {
 
         let intersection = intersection.unwrap();
         assert!(intersection.t > 0.0);
+    }
+
+    #[test]
+    fn sphere_parametric_st() {
+        let sphere = Sphere::new(1.0, -1.0, 1.0, 360.0, 0, Matrix4::identity());
+        // Hit at (-1, 0, 0): phi = 180 -> u = 0.5; z = 0 -> v = 0.5.
+        let ray = Ray::new(Point3::new(-5.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0));
+        let hit = sphere.intersect(&ray).expect("hit");
+        assert!((hit.st[0] - 0.5).abs() < 1e-9, "u = {}", hit.st[0]);
+        assert!((hit.st[1] - 0.5).abs() < 1e-9, "v = {}", hit.st[1]);
+        // Equator of a unit sphere: |dpdu| = 2pi, |dpdv| = 2.
+        let expect = 1.0 / (2.0 * std::f64::consts::PI * 2.0f64).sqrt();
+        assert!(
+            (hit.st_density - expect).abs() < 1e-9,
+            "density = {} vs {}",
+            hit.st_density,
+            expect
+        );
     }
 
     #[test]

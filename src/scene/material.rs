@@ -1,5 +1,6 @@
 use crate::math::Vec3;
 use crate::scene::pbr::PbrParams;
+use crate::texture::pattern::{eval, BoundField, PatternNode, ShadeCtx};
 
 #[derive(Debug, Clone)]
 pub enum MaterialType {
@@ -23,6 +24,9 @@ pub struct Material {
     /// Physically-based lobe parameters used by the path tracer (the
     /// Whitted integrator uses the Phong fields above instead).
     pub pbr: PbrParams,
+    /// Pattern-graph outputs driving pbr fields (from `reference` params);
+    /// node indices point into Scene::patterns.
+    pub pattern_bindings: Vec<(BoundField, u32)>,
 }
 
 impl Material {
@@ -36,6 +40,7 @@ impl Material {
             emission: Vec3::zero(),
             area_light: None,
             pbr: PbrParams::from_matte(color),
+            pattern_bindings: Vec::new(),
         }
     }
 
@@ -49,6 +54,7 @@ impl Material {
             emission: Vec3::zero(),
             area_light: None,
             pbr: PbrParams::from_plastic(color, roughness),
+            pattern_bindings: Vec::new(),
         }
     }
 
@@ -62,7 +68,18 @@ impl Material {
             emission: Vec3::zero(),
             area_light: None,
             pbr: PbrParams::from_metal(color, roughness),
+            pattern_bindings: Vec::new(),
         }
+    }
+
+    /// Lobe parameters at a shading point: the base pbr with any bound
+    /// pattern outputs substituted in.
+    pub fn resolved_pbr(&self, patterns: &[PatternNode], ctx: &ShadeCtx) -> PbrParams {
+        let mut pbr = self.pbr.clone();
+        for (field, node) in &self.pattern_bindings {
+            field.apply(&mut pbr, eval(patterns, *node, ctx));
+        }
+        pbr
     }
 
     /// Fraction of incoming light mirrored by this surface. Rougher surfaces

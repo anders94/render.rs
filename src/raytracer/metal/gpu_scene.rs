@@ -38,6 +38,9 @@ pub struct GpuMeshInfo {
     pub vertex_offset: u32,
     /// 1 when per-vertex normals are present.
     pub has_normals: u32,
+    /// 1 when per-vertex st coordinates are present.
+    pub has_st: u32,
+    pub pad: u32,
 }
 
 #[repr(C)]
@@ -47,7 +50,9 @@ pub struct GpuInstance {
     pub fwd: [f32; 16],
     pub mesh_id: u32,
     pub material_id: u32,
-    pub pad: [u32; 2],
+    /// Isotropic transform scale (st-density transfer to world space).
+    pub scale: f32,
+    pub pad: u32,
 }
 
 #[repr(C)]
@@ -123,7 +128,7 @@ pub struct GpuPtUniforms {
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
-const _: () = assert!(std::mem::size_of::<GpuMeshInfo>() == 16);
+const _: () = assert!(std::mem::size_of::<GpuMeshInfo>() == 24);
 const _: () = assert!(std::mem::size_of::<GpuInstance>() == 144);
 const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 140);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
@@ -143,7 +148,13 @@ pub struct GpuPtScene {
     pub vertices: Vec<f32>,
     /// Parallel to vertices (zeros when a mesh has none).
     pub normals: Vec<f32>,
+    /// Per-vertex st pairs, all meshes concatenated (zeros when absent).
+    pub st: Vec<f32>,
     pub mesh_infos: Vec<GpuMeshInfo>,
+    /// Packed texture table + generated pattern MSL (pattern_codegen).
+    pub tex_data: Vec<f32>,
+    pub tex_mips: Vec<super::pattern_codegen::GpuTexMip>,
+    pub pattern_msl: String,
     pub env_pixels: Vec<f32>,
     pub env_marginal: Vec<f32>,
     pub env_conditional: Vec<f32>,
@@ -295,6 +306,7 @@ impl GpuPtScene {
         let mut tri_indices = Vec::new();
         let mut vertices = Vec::new();
         let mut normals = Vec::new();
+        let mut st = Vec::new();
         let mut mesh_infos = Vec::with_capacity(scene.meshes.len());
         for mesh in &scene.meshes {
             let node_offset = blas_nodes.len() as u32;
@@ -318,11 +330,21 @@ impl GpuPtScene {
                 }
                 None => normals.extend(std::iter::repeat(0.0f32).take(mesh.positions.len() * 3)),
             }
+            match &mesh.st {
+                Some(sts) => {
+                    for s2 in sts {
+                        st.extend_from_slice(s2);
+                    }
+                }
+                None => st.extend(std::iter::repeat(0.0f32).take(mesh.positions.len() * 2)),
+            }
             mesh_infos.push(GpuMeshInfo {
                 node_offset,
                 index_offset,
                 vertex_offset,
                 has_normals: mesh.normals.is_some() as u32,
+                has_st: mesh.st.is_some() as u32,
+                pad: 0,
             });
         }
 
@@ -341,7 +363,8 @@ impl GpuPtScene {
                     fwd: matrix_to_f32(&inst.transform)?,
                     mesh_id: inst.mesh_id,
                     material_id: inst.material_id as u32,
-                    pad: [0; 2],
+                    scale: inst.scale as f32,
+                    pad: 0,
                 })
             })
             .collect::<Result<_>>()?;
@@ -380,6 +403,7 @@ impl GpuPtScene {
             env_total: env_dims.2,
         };
 
+        let patterns = super::pattern_codegen::build(scene);
         let mut out = Self {
             objects,
             object_materials,
@@ -391,7 +415,11 @@ impl GpuPtScene {
             tri_indices,
             vertices,
             normals,
+            st,
             mesh_infos,
+            tex_data: patterns.tex_data,
+            tex_mips: patterns.tex_mips,
+            pattern_msl: patterns.msl,
             env_pixels,
             env_marginal,
             env_conditional,
@@ -431,6 +459,15 @@ impl GpuPtScene {
         }
         if self.normals.is_empty() {
             self.normals.extend_from_slice(&[0.0, 0.0, 0.0]);
+        }
+        if self.st.is_empty() {
+            self.st.extend_from_slice(&[0.0, 0.0]);
+        }
+        if self.tex_data.is_empty() {
+            self.tex_data.extend_from_slice(&[0.0; 3]);
+        }
+        if self.tex_mips.is_empty() {
+            self.tex_mips.push(unsafe { std::mem::zeroed() });
         }
         if self.mesh_infos.is_empty() {
             self.mesh_infos.push(unsafe { std::mem::zeroed() });
@@ -475,6 +512,15 @@ impl GpuPtScene {
     }
     pub fn normals_bytes(&self) -> &[u8] {
         as_bytes(&self.normals)
+    }
+    pub fn st_bytes(&self) -> &[u8] {
+        as_bytes(&self.st)
+    }
+    pub fn tex_data_bytes(&self) -> &[u8] {
+        as_bytes(&self.tex_data)
+    }
+    pub fn tex_mips_bytes(&self) -> &[u8] {
+        as_bytes(&self.tex_mips)
     }
     pub fn mesh_infos_bytes(&self) -> &[u8] {
         as_bytes(&self.mesh_infos)

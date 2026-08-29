@@ -117,6 +117,76 @@ fn mesh_instances_statistical_parity() {
 }
 
 #[test]
+fn textured_patterns_statistical_parity() {
+    // Phase 6: file texture + checker + mix + colorCorrect through the
+    // generated-MSL pattern path, vs the CPU tile cache.
+    use render_rs::texture::tex::{write_tex, LinearImage};
+    let tex_path = std::env::temp_dir().join("render_rs_parity_grad.tex");
+    let (w, h) = (64usize, 64usize);
+    let mut pixels = vec![0.0f32; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            pixels[i] = x as f32 / (w - 1) as f32;
+            pixels[i + 1] = 0.3;
+            pixels[i + 2] = y as f32 / (h - 1) as f32;
+        }
+    }
+    write_tex(&tex_path, &LinearImage { width: w, height: h, pixels }).unwrap();
+
+    let scene_rib = format!(
+        r#"
+        Format 96 96 1.0
+        Projection "perspective" "fov" [45]
+        Option "background" "color" [0.3 0.4 0.6]
+        WorldBegin
+            LightSource "distantlight" "sun" "from" [3 8 -4] "to" [0 0 6] "intensity" [1.3]
+            AttributeBegin
+                Pattern "PxrTexture" "grad" "filename" ["{tex}"]
+                Pattern "PxrColorCorrect" "graded" "reference color inputRGB" ["grad:resultRGB"]
+                    "gain" [1.2 1.0 0.8] "gamma" [1.4] "saturation" [1.3]
+                Bxdf "PxrSurface" "floor" "reference color diffuseColor" ["graded:resultRGB"]
+                    "specularIor" [1]
+                PointsPolygons [4] [0 1 2 3]
+                    "P" [-6 -1 2  6 -1 2  6 -1 14  -6 -1 14]
+                    "st" [0 0  4 0  4 4  0 4]
+            AttributeEnd
+            AttributeBegin
+                Pattern "PxrChecker" "check" "colorA" [0.9 0.2 0.15] "colorB" [0.15 0.2 0.9]
+                    "sScale" [6] "tScale" [6]
+                Pattern "PxrMix" "softened" "reference color color1" ["check:resultRGB"]
+                    "color2" [0.5 0.5 0.5] "mix" [0.3]
+                Bxdf "PxrSurface" "boxmat" "reference color diffuseColor" ["softened:resultRGB"]
+                    "specularIor" [1]
+                Translate 0 0 7
+                Rotate 25 0 1 0
+                PointsPolygons [4 4 4 4 4 4]
+                    [0 1 2 3  5 4 7 6  4 0 3 7  1 5 6 2  3 2 6 7  4 5 1 0]
+                    "P" [-1 -1 -1  1 -1 -1  1 1 -1  -1 1 -1
+                         -1 -1 1  1 -1 1  1 1 1  -1 1 1]
+                    "st" [0 0  1 0  1 1  0 1  0 1  1 1  1 0  0 0]
+            AttributeEnd
+        WorldEnd
+    "#,
+        tex = tex_path.display()
+    );
+    let requests = render_rs::parser::parse_rib(&scene_rib).unwrap();
+    let scene = render_rs::parser::SceneBuilder::new().build(&requests).unwrap();
+    assert_eq!(scene.patterns.len(), 4);
+
+    let cpu = pt::render(&scene, 128);
+    let gpu = metal::render_pt(&scene, 128).unwrap();
+    let mc = image_mean(&cpu);
+    let mg = image_mean(&gpu);
+    let rel = ((mc.x - mg.x).abs() + (mc.y - mg.y).abs() + (mc.z - mg.z).abs())
+        / (mc.x + mc.y + mc.z).max(0.05);
+    assert!(rel < 0.04, "textured scene mean mismatch: {mc:?} vs {mg:?} (rel {rel:.4})");
+    let e = rmse(&cpu, &gpu);
+    assert!(e < 0.12, "textured scene RMSE {e:.4}");
+    std::fs::remove_file(&tex_path).ok();
+}
+
+#[test]
 fn metal_pt_deterministic() {
     let scene = load_fixture_scene("cornell.rib", 64, 64);
     let a = metal::render_pt(&scene, 16).unwrap();

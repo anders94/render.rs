@@ -40,27 +40,8 @@ struct PtUniforms {
     float env_total;
 };
 
-struct PtMaterial {
-    float diffuse_gain;
-    float diffuse_color[3];
-    float diffuse_sigma;
-    float spec_f0[3];
-    float spec_f90[3];
-    float spec_alpha;
-    float coat_gain;
-    float coat_alpha;
-    float fuzz_gain;
-    float fuzz_color[3];
-    float glass_gain;
-    float glass_ior;
-    float glass_alpha;
-    float refr_color[3];
-    float emission[3];
-    float presence;
-    float under_scale;
-    float weights[5];       // d, s, c, f, g (normalized; all zero = dead)
-    uint  area_light;
-};
+// PtMaterial is defined in pattern_prelude.metal (compiled just before
+// this file) because the generated pattern code mutates it.
 
 struct PtLight {
     uint  kind;          // 0 point, 1 distant, 2 rect, 3 sphere, 4 disk, 5 dome
@@ -85,6 +66,8 @@ struct MeshInfoG {
     uint index_offset;
     uint vertex_offset;
     uint has_normals;
+    uint has_st;
+    uint pad;
 };
 
 struct InstanceG {
@@ -92,7 +75,8 @@ struct InstanceG {
     float fwd[16];
     uint  mesh_id;
     uint  material_id;
-    uint  pad[2];
+    float scale;         // isotropic transform scale (st-density transfer)
+    uint  pad;
 };
 
 // All scene pointers bundled so helpers have sane signatures.
@@ -108,6 +92,9 @@ struct PtScene {
     device const float*     vertices;
     device const float*     normals;
     device const MeshInfoG* mesh_infos;
+    device const float*     st;
+    device const float*     tex_data;
+    device const TexMipG*   tex_mips;
     device const float*     env_pixels;
     device const float*     env_marginal;
     device const float*     env_conditional;
@@ -183,6 +170,8 @@ struct PtHit {
     float3 n;
     uint  material;
     bool  front;
+    float2 st;           // surface parameterization (meshes; quadrics 0)
+    float st_density;    // st units per world unit (0 = no st)
 };
 
 // Möller–Trumbore; returns t (parametric along dir) with barycentrics.
@@ -217,7 +206,8 @@ inline float3 fetch_v3(device const float* buf, uint index3) {
 // world direction (the instance transform is applied without normalizing).
 inline bool instance_hit(thread const PtScene& s, uint inst_id,
                          float3 wo_pos, float3 wd, float t_max,
-                         thread float& t_out, thread float3& n_out) {
+                         thread float& t_out, thread float3& n_out,
+                         thread float2& st_out, thread float& st_density_out) {
     device const InstanceG& inst = s.instances[inst_id];
     device const MeshInfoG& mesh = s.mesh_infos[inst.mesh_id];
     Affine inv = load_affine(inst.inv);
@@ -294,6 +284,31 @@ inline bool instance_hit(thread const PtScene& s, uint inst_id,
     }
     t_out = best_t;
     n_out = normalize_cpu(xf_normal(inv, nl));
+
+    // st: interpolated coordinates + density (st area over geometric
+    // area, scaled by the instance's isotropic scale) — mirrors
+    // Mesh::st_at + Instance::intersect on the CPU.
+    st_out = float2(0.0f);
+    st_density_out = 0.0f;
+    if (mesh.has_st != 0u) {
+        float2 s0 = float2(s.st[(mesh.vertex_offset + i0) * 2u],
+                           s.st[(mesh.vertex_offset + i0) * 2u + 1u]);
+        float2 s1 = float2(s.st[(mesh.vertex_offset + i1) * 2u],
+                           s.st[(mesh.vertex_offset + i1) * 2u + 1u]);
+        float2 s2 = float2(s.st[(mesh.vertex_offset + i2) * 2u],
+                           s.st[(mesh.vertex_offset + i2) * 2u + 1u]);
+        float w = 1.0f - best_u - best_v;
+        st_out = s0 * w + s1 * best_u + s2 * best_v;
+        float st_area = 0.5f * fabs((s1.x - s0.x) * (s2.y - s0.y)
+                                  - (s2.x - s0.x) * (s1.y - s0.y));
+        float3 v0 = fetch_v3(s.vertices, mesh.vertex_offset + i0);
+        float3 v1 = fetch_v3(s.vertices, mesh.vertex_offset + i1);
+        float3 v2 = fetch_v3(s.vertices, mesh.vertex_offset + i2);
+        float geo_area = 0.5f * length(cross(v1 - v0, v2 - v0));
+        if (geo_area > 1e-18f) {
+            st_density_out = sqrt(st_area / geo_area) / max(inst.scale, 1e-12f);
+        }
+    }
     return true;
 }
 
@@ -342,6 +357,8 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
     best.n = float3(0.0f);
     best.material = 0u;
     best.front = true;
+    best.st = float2(0.0f);
+    best.st_density = 0.0f;
 
     for (uint i = 0u; i < s.u->object_count; i++) {
         Hit h = isect_object(s.objects[i], o, d);
@@ -369,7 +386,9 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
                     uint inst_id = node.left_or_first + i;
                     float t;
                     float3 n;
-                    if (instance_hit(s, inst_id, o, d, best.t, t, n)) {
+                    float2 st;
+                    float st_density;
+                    if (instance_hit(s, inst_id, o, d, best.t, t, n, st, st_density)) {
                         best.hit = true;
                         best.t = t;
                         best.p = o + d * t;
@@ -377,6 +396,8 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d) {
                         best.front = dot(n, d) < 0.0f;
                         best.n = n;
                         best.material = s.instances[inst_id].material_id;
+                        best.st = st;
+                        best.st_density = st_density;
                     }
                 }
             } else {
@@ -791,7 +812,9 @@ inline float pt_visibility(thread const PtScene& s, float3 p, float3 n,
     for (int i = 0; i < 16; i++) {
         PtHit h = pt_trace_scene(s, origin, dir);
         if (!h.hit || h.t >= remaining) return vis;
-        float presence = clamp(s.materials[h.material].presence, 0.0f, 1.0f);
+        PtMaterial pm = s.materials[h.material];
+        apply_patterns(h.material, pm, h.st, h.p, h.n, 0.0f, s.tex_data, s.tex_mips);
+        float presence = clamp(pm.presence, 0.0f, 1.0f);
         if (presence >= 1.0f) return 0.0f;
         vis *= 1.0f - presence;
         if (vis < 1e-4f) return 0.0f;
@@ -930,6 +953,9 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
     bool from_camera = true;
     uint presence_skips = 0u;
     float num_lights = (float)u.light_count;
+    // Ray cone for texture mip selection (mirror of pt::trace).
+    float cone_width = 0.0f;
+    float cone_spread = 2.0f * u.half_height / (float)u.height;
 
     uint depth = 0u;
     while (depth < u.max_bounces) {
@@ -951,6 +977,9 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
         }
         PtMaterial m = s.materials[h.material];
         float3 wo = -normalize_cpu(dir);
+        cone_width += h.t * cone_spread;
+        apply_patterns(h.material, m, h.st, h.p, h.n,
+                       cone_width * h.st_density, s.tex_data, s.tex_mips);
 
         float presence = clamp(m.presence, 0.0f, 1.0f);
         if (presence < 1.0f && pcg_f32(rng) >= presence && presence_skips < 16u) {
@@ -994,6 +1023,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
         prev_pdf = pdf;
         prev_origin = h.p;
         from_camera = false;
+        cone_spread += min(1.0f / (1.0f + pdf), 0.4f);
 
         float off = transmitted ? -PT_RAY_OFFSET : PT_RAY_OFFSET;
         origin = h.p + n * off;
@@ -1025,8 +1055,11 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const float*      env_pixels       [[buffer(11)]],
                       device const float*      env_marginal     [[buffer(12)]],
                       device const float*      env_conditional  [[buffer(13)]],
-                      constant PtUniforms&     u                [[buffer(14)]],
-                      device float*            accum            [[buffer(15)]],
+                      device const float*      st               [[buffer(14)]],
+                      device const float*      tex_data         [[buffer(15)]],
+                      device const TexMipG*    tex_mips         [[buffer(16)]],
+                      constant PtUniforms&     u                [[buffer(17)]],
+                      device float*            accum            [[buffer(18)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint py_row = gid.y + u.y_offset;
     if (gid.x >= u.width || py_row >= u.height) return;
@@ -1043,6 +1076,9 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
     s.vertices = vertices;
     s.normals = normals;
     s.mesh_infos = mesh_infos;
+    s.st = st;
+    s.tex_data = tex_data;
+    s.tex_mips = tex_mips;
     s.env_pixels = env_pixels;
     s.env_marginal = env_marginal;
     s.env_conditional = env_conditional;

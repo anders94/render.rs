@@ -52,7 +52,7 @@ skipped forever.
 | Surface | ✅ | legacy matte/plastic/metal mapping |
 | Bxdf "PxrSurface" | ✅ | full lobe stack: Oren-Nayar diffuse, GGX/VNDF specular (F0/F90 or IOR), clearcoat, fuzz, rough glass with refraction, glow, presence |
 | Light "PxrRect/Sphere/Disk/Distant/DomeLight" | ✅ | shapes from the current transform; dome takes "lightColorMap" HDRI with 2D-CDF importance sampling |
-| Pattern | ⏭ P6 | |
+| Pattern | ✅ | PxrTexture (UDIM `<UDIM>`), PxrChecker, PxrFractal, PxrMix, PxrColorCorrect, PxrRamp, triplanar (extension); `reference` param connections into Bxdf; CPU eval + Metal MSL codegen |
 | Displace | ✅ | extension: `Displace "noise" "amplitude"/"frequency"/"octaves"/"gain"/"lacunarity"/"offset"` — fBm displacement at dice time; pattern-driven displacement arrives with P6 |
 | LightSource / AreaLightSource | ✅ / ✅ | point+distant; quad polygons under AreaLightSource become sampleable rect lights (path integrator) |
 | Illuminate (light linking) | ⏭ P6 | |
@@ -89,7 +89,7 @@ skipped forever.
 |---|---|---|
 | ReadArchive | ✅ | file (relative to RIB dir) or inline archive; depth-capped |
 | ArchiveBegin/ArchiveEnd | ✅ | inline archives |
-| MakeTexture/MakeLatLongEnvironment/etc. | ⏭ P6 | txmake-equivalent tool instead |
+| MakeTexture/MakeLatLongEnvironment/etc. | 🟡 | `render txmake in.png out.tex` CLI converts any image to the tiled-mip .tex format (in-RIB MakeTexture requests still warn) |
 | Binary RIB encoding | ⏭ P9 | |
 
 ## RSL-era shading (all skipped forever)

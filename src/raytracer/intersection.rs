@@ -12,6 +12,12 @@ pub struct Intersection {
     /// record this from the *unflipped* orientation — refraction depends
     /// on it.
     pub front_face: bool,
+    /// Surface parameterization at the hit (mesh st or quadric parametric
+    /// uv); [0,0] when the primitive carries none.
+    pub st: [f64; 2],
+    /// Approximate st-units per world-unit at the hit (isotropic scalar,
+    /// for ray-cone mip selection). 0 = unknown / no st.
+    pub st_density: f64,
 }
 
 impl Intersection {
@@ -22,11 +28,19 @@ impl Intersection {
             normal: normal.normalize(),
             material_id,
             front_face: true,
+            st: [0.0, 0.0],
+            st_density: 0.0,
         }
     }
 
     pub fn with_front_face(mut self, front_face: bool) -> Self {
         self.front_face = front_face;
+        self
+    }
+
+    pub fn with_st(mut self, st: [f64; 2], st_density: f64) -> Self {
+        self.st = st;
+        self.st_density = st_density;
         self
     }
 }

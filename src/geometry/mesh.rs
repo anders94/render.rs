@@ -92,6 +92,30 @@ impl Mesh {
         (t > 1e-9 && t < t_max).then_some((t, u, v))
     }
 
+    /// Interpolated st at a hit, plus the triangle's st-density (st units
+    /// per local-space unit, the sqrt of st-area over surface area).
+    fn st_at(&self, tri: u32, u: f64, v: f64) -> Option<([f64; 2], f64)> {
+        let st = self.st.as_ref()?;
+        let i0 = self.indices[tri as usize * 3] as usize;
+        let i1 = self.indices[tri as usize * 3 + 1] as usize;
+        let i2 = self.indices[tri as usize * 3 + 2] as usize;
+        let (s0, s1, s2) = (st[i0], st[i1], st[i2]);
+        let w = 1.0 - u - v;
+        let s = s0[0] as f64 * w + s1[0] as f64 * u + s2[0] as f64 * v;
+        let t = s0[1] as f64 * w + s1[1] as f64 * u + s2[1] as f64 * v;
+        // st area vs geometric area of the triangle.
+        let st_area = 0.5
+            * ((s1[0] - s0[0]) as f64 * (s2[1] - s0[1]) as f64
+                - (s2[0] - s0[0]) as f64 * (s1[1] - s0[1]) as f64)
+                .abs();
+        let v0 = self.vertex(i0 as u32);
+        let e1 = self.vertex(i1 as u32) - v0;
+        let e2 = self.vertex(i2 as u32) - v0;
+        let geo_area = 0.5 * e1.cross(&e2).length();
+        let density = if geo_area > 1e-18 { (st_area / geo_area).sqrt() } else { 0.0 };
+        Some(([s, t], density))
+    }
+
     /// Interpolated (or geometric) local-space normal for a hit.
     fn local_normal(&self, tri: u32, u: f64, v: f64) -> Vec3 {
         let i0 = self.indices[tri as usize * 3] as usize;
@@ -119,6 +143,9 @@ pub struct Instance {
     pub transform: Matrix4,
     pub inverse: Matrix4,
     pub world_bounds: Aabb,
+    /// Isotropic length scale of the transform (for st-density transfer
+    /// from local to world space).
+    pub scale: f64,
 }
 
 impl Instance {
@@ -136,7 +163,8 @@ impl Instance {
             let w = transform.transform_point(&corner);
             world_bounds.grow_point(&Vec3::new(w.x, w.y, w.z));
         }
-        Self { mesh_id, material_id, transform, inverse, world_bounds }
+        let scale = transform.approx_scale();
+        Self { mesh_id, material_id, transform, inverse, world_bounds, scale }
     }
 
     /// Closest hit in *parametric* t (along the world ray direction).
@@ -159,7 +187,11 @@ impl Instance {
         // hit_uv holds the uv of the LAST accepted (i.e. winning) triangle.
         let local_n = mesh.local_normal(tri, hit_uv.0, hit_uv.1);
         let world_n = self.inverse.transform_normal(&local_n).normalize();
-        Some(MeshHit { t_param: t, tri, world_normal: world_n })
+        let (st, st_density) = mesh
+            .st_at(tri, hit_uv.0, hit_uv.1)
+            .map(|(st, d)| (st, d / self.scale))
+            .unwrap_or(([0.0, 0.0], 0.0));
+        Some(MeshHit { t_param: t, tri, world_normal: world_n, st, st_density })
     }
 
     /// Any hit strictly before parametric `t_limit`.
@@ -180,6 +212,9 @@ pub struct MeshHit {
     pub t_param: f64,
     pub tri: u32,
     pub world_normal: Vec3,
+    pub st: [f64; 2],
+    /// st units per world unit (0 when the mesh has no st).
+    pub st_density: f64,
 }
 
 /// Convert a parametric mesh hit into the renderer's Intersection
@@ -193,6 +228,7 @@ pub fn to_intersection(hit: &MeshHit, ray: &Ray, material_id: usize) -> Intersec
     }
     Intersection::new(point.distance(&ray.origin), point, normal, material_id)
         .with_front_face(front_face)
+        .with_st(hit.st, hit.st_density)
 }
 
 #[cfg(test)]
@@ -250,6 +286,27 @@ mod tests {
         let ray = Ray::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
         let hit = inst.intersect(&meshes, &ray, f64::INFINITY).expect("hit");
         assert!((hit.t_param - 3.0).abs() < 1e-9, "t = {}", hit.t_param);
+    }
+
+    #[test]
+    fn st_interpolates_and_density_scales() {
+        // Unit quad in xy with st == xy: density 1 in local space.
+        let positions = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let st = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let mesh = Mesh::new(positions, vec![0, 1, 2, 0, 2, 3], None, Some(st));
+        let meshes = vec![mesh];
+        // Scale 2x: st density halves in world space.
+        let inst = Instance::new(0, 0, Matrix4::scale(2.0, 2.0, 2.0), &meshes[0]);
+        let ray = Ray::new(Point3::new(0.5, 1.0, -3.0), Vec3::new(0.0, 0.0, 1.0));
+        let hit = inst.intersect(&meshes, &ray, f64::INFINITY).expect("hit");
+        assert!((hit.st[0] - 0.25).abs() < 1e-6, "s = {}", hit.st[0]);
+        assert!((hit.st[1] - 0.5).abs() < 1e-6, "t = {}", hit.st[1]);
+        assert!((hit.st_density - 0.5).abs() < 1e-6, "density = {}", hit.st_density);
     }
 
     #[test]
