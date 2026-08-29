@@ -27,6 +27,12 @@ struct PtMaterial {
     float under_scale;
     float weights[5];       // d, s, c, f, g (normalized; all zero = dead)
     uint  area_light;
+    uint  is_hair;          // Marschner hair fields below
+    float hair_sigma_a[3];
+    float hair_v[4];        // longitudinal variances (R, TT, TRT, residual)
+    float hair_s;           // azimuthal logistic scale
+    float hair_eta;
+    uint  hair_pad;
 };
 
 struct TexMipG {

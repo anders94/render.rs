@@ -18,6 +18,9 @@ pub struct Intersection {
     /// Approximate st-units per world-unit at the hit (isotropic scalar,
     /// for ray-cone mip selection). 0 = unknown / no st.
     pub st_density: f64,
+    /// Curve tangent at the hit (zero for surface geometry) — the hair
+    /// BSDF shades against this.
+    pub tangent: Vec3,
 }
 
 impl Intersection {
@@ -30,6 +33,7 @@ impl Intersection {
             front_face: true,
             st: [0.0, 0.0],
             st_density: 0.0,
+            tangent: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
         }
     }
 
@@ -41,6 +45,11 @@ impl Intersection {
     pub fn with_st(mut self, st: [f64; 2], st_density: f64) -> Self {
         self.st = st;
         self.st_density = st_density;
+        self
+    }
+
+    pub fn with_tangent(mut self, tangent: Vec3) -> Self {
+        self.tangent = tangent;
         self
     }
 }

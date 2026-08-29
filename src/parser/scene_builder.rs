@@ -12,6 +12,7 @@ use crate::geometry::patches::{
     PatchMeshDef, BEZIER,
 };
 use crate::geometry::subdiv::SubdivCage;
+use crate::geometry::curves::{dice_curve, CurveSet};
 use crate::geometry::{
     Cone, Cylinder, Disk, Hyperboloid, Instance, Intersectable, Mesh, Paraboloid, Sphere, Torus,
     Triangle,
@@ -51,6 +52,8 @@ struct GraphicsState {
     /// transform at shutter open / close when the block closed.
     motion_t0: Option<Matrix4>,
     motion_t1: Option<Matrix4>,
+    /// Hair material from Bxdf "PxrMarschnerHair".
+    hair: Option<crate::raytracer::pt::hair::HairParams>,
     basis_u: (Basis4, usize),
     basis_v: (Basis4, usize),
 }
@@ -71,6 +74,7 @@ impl Default for GraphicsState {
             displace: None,
             motion_t0: None,
             motion_t1: None,
+            hair: None,
             basis_u: (BEZIER, 3),
             basis_v: (BEZIER, 3),
         }
@@ -82,6 +86,7 @@ impl Default for GraphicsState {
 struct SceneData {
     objects: Vec<Arc<dyn Intersectable>>,
     meshes: Vec<Mesh>,
+    curve_sets: Vec<CurveSet>,
     instances: Vec<Instance>,
     lights: Vec<Light>,
     materials: Vec<Material>,
@@ -200,6 +205,7 @@ impl SceneBuilder {
         let mut scene = Scene::new(camera);
         scene.objects = data.objects;
         scene.meshes = data.meshes;
+        scene.curve_sets = data.curve_sets;
         scene.instances = data.instances;
         scene.lights = data.lights;
         scene.materials = data.materials;
@@ -517,6 +523,17 @@ impl SceneBuilder {
             }
             "Bxdf" => {
                 let bxdf_type = req.string(0).unwrap_or("");
+                if bxdf_type == "PxrMarschnerHair" {
+                    let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
+                    let params = req.params_from(params_start);
+                    let hp =
+                        crate::raytracer::pt::hair::HairParams::from_bxdf_params(&params);
+                    self.state.hair = Some(hp);
+                    self.state.bxdf = None;
+                    self.state.bxdf_bindings = Vec::new();
+                    return Ok(());
+                }
+                self.state.hair = None;
                 if bxdf_type != "PxrSurface" {
                     self.warn_once(&format!(
                         "Bxdf \"{bxdf_type}\" not implemented; treating as PxrSurface"
@@ -564,6 +581,14 @@ impl SceneBuilder {
                     .and_then(|v| (v.len() >= 3).then(|| Vec3::new(v[0], v[1], v[2])))
                     .unwrap_or(Vec3::one());
                 self.state.area_light = Some((intensity, color));
+            }
+
+            // ---- curves & points ------------------------------------------
+            "Curves" => {
+                self.curves_request(req, data);
+            }
+            "Points" => {
+                self.points_request(req, data);
             }
 
             // ---- meshes ---------------------------------------------------
@@ -859,6 +884,128 @@ impl SceneBuilder {
         });
         let mesh = Mesh::with_motion(positions, indices, normals, st, positions1);
         self.add_tessellated_mesh(mesh, data);
+    }
+
+    /// `Curves "cubic"|"linear" [nvertices] "nonperiodic" "P" [...]` with
+    /// "width" (root/tip taper) or "constantwidth". Cubic curves use the
+    /// v Basis (RiSpec); periodic wrap is treated as nonperiodic.
+    fn curves_request(&mut self, req: &RibRequest, data: &mut SceneData) {
+        if self.reject_in_object_def("Curves") {
+            return;
+        }
+        let curve_type = req.string(0).unwrap_or("cubic");
+        let Some(nvertices) = req.values.get(1).and_then(RibValue::as_numbers) else {
+            self.warn_once("Curves without [nvertices]; skipping");
+            return;
+        };
+        let wrap = req.string(2).unwrap_or("nonperiodic");
+        if wrap == "periodic" {
+            self.warn_once("Curves \"periodic\" not supported; treating as nonperiodic");
+        }
+        let params = req.params_from(3);
+        let Some(p) = params.get_numbers("P") else {
+            self.warn_once("Curves without \"P\"; skipping");
+            return;
+        };
+        let (width_root, width_tip) = match params.get_numbers("width") {
+            Some(w) if !w.is_empty() => (w[0], *w.last().unwrap()),
+            _ => {
+                let cw = params.get_number("constantwidth").unwrap_or(0.01);
+                (cw, cw)
+            }
+        };
+        let cubic = if curve_type == "linear" {
+            None
+        } else {
+            let (basis, step) = &self.state.basis_v;
+            Some((*basis, *step))
+        };
+        let segs = ((8.0 / self.state.shading_rate.max(0.1)) as usize).clamp(2, 24);
+
+        let mut p0 = Vec::new();
+        let mut p1 = Vec::new();
+        let mut v0 = Vec::new();
+        let mut v1 = Vec::new();
+        let mut cursor = 0usize;
+        for &nv in nvertices {
+            let nv = nv as usize;
+            if (cursor + nv) * 3 > p.len() {
+                break;
+            }
+            let ctrl: Vec<[f64; 3]> = (0..nv)
+                .map(|i| {
+                    let b = (cursor + i) * 3;
+                    [p[b], p[b + 1], p[b + 2]]
+                })
+                .collect();
+            dice_curve(
+                &ctrl,
+                cubic.as_ref().map(|(b, s)| (b, *s)),
+                width_root,
+                width_tip,
+                segs,
+                &mut p0,
+                &mut p1,
+                &mut v0,
+                &mut v1,
+            );
+            cursor += nv;
+        }
+        if p0.is_empty() {
+            return;
+        }
+        self.add_curve_set(CurveSet::new(p0, p1, v0, v1), data);
+    }
+
+    /// `Points "P" [...] "width" [...]` — particles as spheres.
+    fn points_request(&mut self, req: &RibRequest, data: &mut SceneData) {
+        if self.reject_in_object_def("Points") {
+            return;
+        }
+        let params = req.params_from(0);
+        let Some(p) = params.get_numbers("P") else {
+            self.warn_once("Points without \"P\"; skipping");
+            return;
+        };
+        let widths = params.get_numbers("width");
+        let cw = params.get_number("constantwidth").unwrap_or(0.05);
+        let count = p.len() / 3;
+        let mut p0 = Vec::with_capacity(count);
+        let mut p1 = Vec::with_capacity(count);
+        let mut v0 = vec![0.0f32; count];
+        let mut v1 = vec![1.0f32; count];
+        for i in 0..count {
+            let w = widths
+                .and_then(|w| w.get(i).copied())
+                .unwrap_or(cw);
+            let e = [
+                p[i * 3] as f32,
+                p[i * 3 + 1] as f32,
+                p[i * 3 + 2] as f32,
+                (w * 0.5) as f32,
+            ];
+            p0.push(e);
+            p1.push(e);
+        }
+        v0.iter_mut().for_each(|v| *v = 0.5);
+        v1.iter_mut().for_each(|v| *v = 0.5);
+        self.add_curve_set(CurveSet::new(p0, p1, v0, v1), data);
+    }
+
+    /// Shared sink for curve sets: material + placement (with motion).
+    fn add_curve_set(&mut self, set: CurveSet, data: &mut SceneData) {
+        let material_id = self.push_material(&mut data.materials);
+        let set_id = data.curve_sets.len() as u32;
+        let placement = self.transform_stack.current();
+        let instance = Instance::new_curves(
+            set_id,
+            material_id,
+            placement,
+            self.motion_endpoint(&placement),
+            &set,
+        );
+        data.curve_sets.push(set);
+        data.instances.push(instance);
     }
 
     /// Dice density per patch span, from ShadingRate (smaller rate = finer).
@@ -1519,6 +1666,13 @@ impl SceneBuilder {
 
     /// Material from the current attribute state.
     fn make_material(&self) -> Material {
+        if let Some(hp) = &self.state.hair {
+            // Whitted fallback: a plain brown matte so hair still shows up
+            // outside the path tracer.
+            let mut m = Material::matte(Vec3::new(0.35, 0.22, 0.12));
+            m.hair = Some(hp.clone());
+            return m;
+        }
         if let Some(pbr) = &self.state.bxdf {
             // Whitted fallback terms approximated from the lobe params.
             let mut m = Material::matte(pbr.diffuse_color);

@@ -1,0 +1,65 @@
+##RenderMan RIB-Structure 1.1
+# Phase 8 demo gate: a groomed critter under the HDRI dome. The coat is
+# hundreds of thousands of cubic b-spline strands (see
+# scripts/gen_groom.py) shaded with the Marschner hair BSDF; capsule
+# curve segments ride the same BVH/TLAS as everything else.
+version 3.04
+Display "furball.exr" "file" "rgb"
+Format 1280 640 1.0
+Projection "perspective" "fov" [26]
+Rotate -9 1 0 0
+Translate 0 -2.3 0
+
+WorldBegin
+    Light "PxrDomeLight" "sky" "intensity" [1] "lightColorMap" ["sky.hdr"]
+
+    # Wooden deck (Phase 6 UDIM parquet).
+    AttributeBegin
+        Pattern "PxrTexture" "wood" "filename" ["wood_<UDIM>.tex"]
+        Bxdf "PxrSurface" "deck"
+            "reference color diffuseColor" ["wood:resultRGB"]
+            "specularIor" [1.4] "specularRoughness" [0.3]
+        PointsPolygons [4] [0 1 2 3]
+            "P" [-12 0 2  12 0 2  12 0 26  -12 0 26]
+            "st" [0 0  1.999 0  1.999 1.999  0 1.999]
+    AttributeEnd
+
+    # --- The critter ---------------------------------------------------
+    AttributeBegin
+        Translate 0 1.32 9.5
+        Rotate -22 0 1 0
+
+        # Skin (peeks through at the roots).
+        Bxdf "PxrSurface" "skin" "diffuseColor" [0.30 0.17 0.08] "specularIor" [1]
+        Sphere 1.0 -1.0 1.0 360
+
+        # The coat.
+        Bxdf "PxrMarschnerHair" "coat"
+            "color" [0.32 0.14 0.05]
+            "roughness" [0.35]
+            "azimuthalRoughness" [0.32]
+        ReadArchive "groom_archive.rib"
+
+        # Eyes: glossy dark spheres set into the fur, facing the camera.
+        Bxdf "PxrSurface" "eye"
+            "diffuseGain" [0.12] "diffuseColor" [0.04 0.03 0.02]
+            "specularIor" [1.6] "specularRoughness" [0.06]
+        TransformBegin
+            Rotate 14 0 1 0  Rotate -8 1 0 0
+            Translate 0 0 -1.08  Sphere 0.15 -0.15 0.15 360
+        TransformEnd
+        TransformBegin
+            Rotate -14 0 1 0  Rotate -8 1 0 0
+            Translate 0 0 -1.08  Sphere 0.15 -0.15 0.15 360
+        TransformEnd
+
+        # Nose.
+        Bxdf "PxrSurface" "nose"
+            "diffuseGain" [0.4] "diffuseColor" [0.1 0.05 0.05]
+            "specularIor" [1.5] "specularRoughness" [0.15]
+        TransformBegin
+            Rotate -24 1 0 0
+            Translate 0 0 -1.1  Sphere 0.12 -0.12 0.12 360
+        TransformEnd
+    AttributeEnd
+WorldEnd

@@ -7,6 +7,7 @@
 //! rect/sphere/disk area lights, and HDRI dome with importance sampling.
 
 pub mod bxdf;
+pub mod hair;
 pub mod sampler;
 
 use crate::math::{Point3, Vec3};
@@ -259,20 +260,75 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
             l = l + beta * emission * weight;
         }
 
+        // Hair fibers scatter over the full sphere with their own BSDF;
+        // they bypass the surface-lobe machinery entirely.
+        if let Some(hp) = &material.hair {
+            if hit.tangent.length_squared() > 0.5 {
+                let ff = hair::FiberFrame::new(&hit.tangent, &hit.normal, &wo);
+                let wo_f = ff.to_local(&wo);
+                let hh = ff.h;
+                if !scene.lights.is_empty() {
+                    let eval = |wi_world: &Vec3| -> (Vec3, f64) {
+                        let wi_f = ff.to_local(wi_world);
+                        let fv = hair::f(hp, &wo_f, &wi_f, hh);
+                        let pv = hair::pdf(hp, &wo_f, &wi_f, hh);
+                        (fv, pv)
+                    };
+                    let light_idx = rng.next_below(scene.lights.len());
+                    let c = sample_light(
+                        scene,
+                        &scene.lights[light_idx],
+                        &hit.point,
+                        n,
+                        &eval,
+                        ray.time,
+                        rng,
+                    );
+                    l = l + beta * c * num_lights;
+                }
+                let Some((wi_f, fv, pv)) = hair::sample(hp, &wo_f, hh, rng) else {
+                    break;
+                };
+                let wi_world = ff.to_world(&wi_f);
+                beta = beta * fv / pv; // f is per-solid-angle: no cosine
+                prev_pdf = pv;
+                prev_origin = hit.point;
+                from_camera = false;
+                cone_spread += 0.4;
+                let side = if wi_world.dot(&hit.normal) >= 0.0 { hit.normal } else { -hit.normal };
+                ray = Ray::new(hit.point + side * RAY_OFFSET, wi_world).with_time(ray.time);
+                depth += 1;
+                if depth >= RR_START {
+                    let q = max_component(&beta).min(0.95);
+                    if q <= 0.0 || rng.next_f64() > q {
+                        break;
+                    }
+                    beta = beta / q;
+                }
+                continue;
+            }
+        }
+
         let frame = Frame::new(n);
         let wo_l = frame.to_local(&wo);
 
         // Next-event estimation: sample one light uniformly.
         if !scene.lights.is_empty() && pbr.lobe_weights().is_some() {
+            let eval = |wi_world: &Vec3| -> (Vec3, f64) {
+                let wi_l = frame.to_local(wi_world);
+                if wi_l.z <= 0.0 {
+                    return (Vec3::zero(), 0.0);
+                }
+                let (f, pdf) = bxdf::eval_pdf(&pbr, &wo_l, &wi_l, eta_rel);
+                (f * wi_l.z, pdf)
+            };
             let light_idx = rng.next_below(scene.lights.len());
             let contribution = sample_light(
                 scene,
                 &scene.lights[light_idx],
                 &hit.point,
-                &frame,
-                &wo_l,
-                &pbr,
-                eta_rel,
+                n,
+                &eval,
                 ray.time,
                 rng,
             );
@@ -341,28 +397,20 @@ fn light_pdf_solid_angle(light: &Light, origin: &Point3, hit: &Intersection) -> 
     }
 }
 
-/// Direct lighting for one light. `wo_l` is the outgoing direction in the
-/// shading frame.
+/// Direct lighting for one light. `eval` returns the BSDF value with any
+/// cosine factor already applied (surfaces: f·cos⁺; hair: f alone) plus
+/// the BSDF's solid-angle pdf for MIS. `n` is only the shadow-bias
+/// direction.
 #[allow(clippy::too_many_arguments)]
 fn sample_light(
     scene: &Scene,
     light: &Light,
     p: &Point3,
-    frame: &Frame,
-    wo_l: &Vec3,
-    pbr: &PbrParams,
-    eta_rel: f64,
+    n: Vec3,
+    eval: &dyn Fn(&Vec3) -> (Vec3, f64),
     time: f64,
     rng: &mut Pcg32,
 ) -> Vec3 {
-    let n = frame.to_world(&Vec3::new(0.0, 0.0, 1.0));
-    let eval = |wi_world: &Vec3| -> (Vec3, f64) {
-        let wi_l = frame.to_local(wi_world);
-        if wi_l.z <= 0.0 {
-            return (Vec3::zero(), 0.0);
-        }
-        bxdf::eval_pdf(pbr, wo_l, &wi_l, eta_rel)
-    };
 
     match &light.light_type {
         LightType::Point { position } => {
@@ -377,7 +425,7 @@ fn sample_light(
             if vis <= 0.0 {
                 return Vec3::zero();
             }
-            f * light.radiance() * (wi.dot(&n).max(0.0) * vis / dist2)
+            f * light.radiance() * (vis / dist2)
         }
         LightType::Distant { direction, angular_radius } => {
             let base = -*direction;
@@ -405,21 +453,16 @@ fn sample_light(
             if vis <= 0.0 {
                 return Vec3::zero();
             }
-            let cos = wi.dot(&n).max(0.0);
-            if pdf_sa > 0.0 {
-                // Soft sun: radiance constant over the cone; dividing the
-                // cone pdf by itself leaves f * L * cos.
-                f * light.radiance() * (cos * vis)
-            } else {
-                f * light.radiance() * (cos * vis)
-            }
+            // Soft sun: radiance constant over the cone; the cone pdf
+            // divides itself out.
+            let _ = pdf_sa;
+            f * light.radiance() * vis
         }
         LightType::Rect { corner, edge1, edge2, normal, area } => {
             let (u, v) = rng.next_2d();
             let sample_point = *corner + *edge1 * u + *edge2 * v;
             area_light_contribution(
-                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, pbr, eta_rel,
-                time,
+                scene, p, &n, &sample_point, normal, *area, light, eval, time,
             )
         }
         LightType::DiskArea { center, e1, e2, normal, area } => {
@@ -429,8 +472,7 @@ fn sample_light(
             let phi = 2.0 * PI * v;
             let sample_point = *center + *e1 * (r * phi.cos()) + *e2 * (r * phi.sin());
             area_light_contribution(
-                scene, p, frame, &n, &sample_point, normal, *area, light, wo_l, pbr, eta_rel,
-                time,
+                scene, p, &n, &sample_point, normal, *area, light, eval, time,
             )
         }
         LightType::SphereArea { center, radius } => {
@@ -461,7 +503,7 @@ fn sample_light(
             }
             let pdf_sa = 1.0 / (2.0 * PI * (1.0 - cos_max)).max(1e-12);
             let weight = power_heuristic(pdf_sa, bsdf_pdf);
-            f * light.radiance() * (wi.dot(&n).max(0.0) * vis / pdf_sa) * weight
+            f * light.radiance() * (vis / pdf_sa) * weight
         }
         LightType::Dome => {
             let (wi, radiance, pdf_sa) = match &light.env {
@@ -494,7 +536,7 @@ fn sample_light(
                 return Vec3::zero();
             }
             let weight = power_heuristic(pdf_sa, bsdf_pdf);
-            f * radiance * (wi.dot(&n).max(0.0) * vis / pdf_sa) * weight
+            f * radiance * (vis / pdf_sa) * weight
         }
     }
 }
@@ -503,29 +545,22 @@ fn sample_light(
 fn area_light_contribution(
     scene: &Scene,
     p: &Point3,
-    frame: &Frame,
     n: &Vec3,
     sample_point: &Point3,
     light_normal: &Vec3,
     area: f64,
     light: &Light,
-    wo_l: &Vec3,
-    pbr: &PbrParams,
-    eta_rel: f64,
+    eval: &dyn Fn(&Vec3) -> (Vec3, f64),
     time: f64,
 ) -> Vec3 {
     let to_light = *sample_point - *p;
     let dist2 = to_light.length_squared().max(1e-12);
     let wi = to_light.normalize();
-    let wi_l = frame.to_local(&wi);
-    if wi_l.z <= 0.0 {
-        return Vec3::zero();
-    }
     let cos_light = wi.dot(light_normal).abs(); // double-sided emitter
     if cos_light < 1e-9 || area <= 0.0 {
         return Vec3::zero();
     }
-    let (f, bsdf_pdf) = bxdf::eval_pdf(pbr, wo_l, &wi_l, eta_rel);
+    let (f, bsdf_pdf) = eval(&wi);
     if max_component(&f) <= 0.0 {
         return Vec3::zero();
     }
@@ -535,7 +570,7 @@ fn area_light_contribution(
     }
     let pdf_sa = dist2 / (cos_light * area);
     let weight = power_heuristic(pdf_sa, bsdf_pdf);
-    f * light.radiance() * (wi_l.z.max(0.0) * vis / pdf_sa) * weight
+    f * light.radiance() * (vis / pdf_sa) * weight
 }
 
 /// Fractional visibility toward a point (presence cutouts attenuate).

@@ -243,6 +243,77 @@ fn motion_dof_statistical_parity() {
 }
 
 #[test]
+fn hair_curves_statistical_parity() {
+    // Phase 8: capsule curves + Marschner hair BSDF, CPU vs Metal.
+    let mut curves = String::new();
+    let mut nv = Vec::new();
+    let mut seed = 12345u64;
+    let mut rand = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f64 / (1u64 << 31) as f64 - 1.0
+    };
+    for i in 0..400 {
+        let phi = i as f64 * 0.61803 * std::f64::consts::TAU;
+        let z: f64 = -0.2 + 1.15 * ((i as f64 * 0.377).fract());
+        let z = z.clamp(-0.2, 0.98);
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        let (nx, ny, nz) = (r * phi.cos(), z, r * phi.sin());
+        nv.push(4);
+        for k in 0..4 {
+            let t = k as f64 / 3.0;
+            let g = 1.0 + 0.45 * t;
+            curves.push_str(&format!(
+                "{:.4} {:.4} {:.4} ",
+                nx * g + 0.08 * t * t * rand(),
+                ny * g - 0.25 * t * t,
+                nz * g + 0.08 * t * t * rand()
+            ));
+        }
+    }
+    let scene_rib = format!(
+        r#"
+        Format 96 96 1.0
+        Projection "perspective" "fov" [35]
+        Option "background" "color" [0.4 0.45 0.55]
+        WorldBegin
+            LightSource "distantlight" "sun" "from" [4 8 -6] "to" [0 0 6] "intensity" [1.4]
+            AttributeBegin
+                Color 0.6 0.6 0.6
+                Polygon "P" [-30 -1.3 -5  30 -1.3 -5  30 -1.3 40  -30 -1.3 40]
+            AttributeEnd
+            AttributeBegin
+                Bxdf "PxrMarschnerHair" "fur" "color" [0.5 0.3 0.12]
+                    "roughness" [0.3] "azimuthalRoughness" [0.35]
+                Translate 0 0.4 7
+                Curves "linear" [{nv}] "nonperiodic"
+                    "P" [{curves}]
+                    "width" [0.03 0.008]
+            AttributeEnd
+        WorldEnd
+    "#,
+        nv = nv
+            .iter()
+            .map(|n: &i32| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        curves = curves
+    );
+    let requests = render_rs::parser::parse_rib(&scene_rib).unwrap();
+    let scene = render_rs::parser::SceneBuilder::new().build(&requests).unwrap();
+    assert!(scene.curve_segment_count() > 1000);
+
+    let cpu = pt::render(&scene, 160);
+    let gpu = metal::render_pt(&scene, 160).unwrap();
+    let mc = image_mean(&cpu);
+    let mg = image_mean(&gpu);
+    let rel = ((mc.x - mg.x).abs() + (mc.y - mg.y).abs() + (mc.z - mg.z).abs())
+        / (mc.x + mc.y + mc.z).max(0.05);
+    assert!(rel < 0.04, "hair scene mean mismatch: {mc:?} vs {mg:?} (rel {rel:.4})");
+    let e = rmse(&cpu, &gpu);
+    assert!(e < 0.12, "hair scene RMSE {e:.4}");
+}
+
+#[test]
 fn metal_pt_deterministic() {
     let scene = load_fixture_scene("cornell.rib", 64, 64);
     let a = metal::render_pt(&scene, 16).unwrap();

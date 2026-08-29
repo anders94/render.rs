@@ -78,8 +78,8 @@ skipped forever.
 | NuPatch / TrimCurve | ✅ / ⏭ | NURBS (rational Pw or P) via Cox-de Boor; trims warn + render untrimmed |
 | SubdivisionMesh | ✅ | uniform Catmull-Clark; crease/corner (semi-sharp decay), hole, interpolateboundary tags |
 | HierarchicalSubdivisionMesh | 🟡 | treated as SubdivisionMesh (string args ignored) |
-| Curves | ⏭ P8 | |
-| Points | ⏭ P8 | |
+| Curves | ✅ | linear + cubic (v Basis) diced to rounded-cone segments; "width"/"constantwidth" with root-to-tip taper; periodic warns; Bxdf "PxrMarschnerHair" shades them |
+| Points | ✅ | sphere particles ("width" per point or "constantwidth") |
 | Blobby | 🚫 | revisit only if a real scene needs it |
 | Volume | ⏭ P10 | |
 | Procedural (DelayedReadArchive/RunProgram/DynamicLoad) | ⏭ P9 | |

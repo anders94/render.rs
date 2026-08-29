@@ -126,7 +126,7 @@ fn main() -> Result<()> {
         scene.objects.len(),
         scene.meshes.len(),
         scene.instances.len(),
-        scene.triangle_count(),
+        scene.triangle_count() + scene.curve_segment_count(),
         scene.lights.len(),
         scene.materials.len()
     );

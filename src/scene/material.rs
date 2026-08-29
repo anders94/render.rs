@@ -1,4 +1,5 @@
 use crate::math::Vec3;
+use crate::raytracer::pt::hair::HairParams;
 use crate::scene::pbr::PbrParams;
 use crate::texture::pattern::{eval, BoundField, PatternNode, ShadeCtx};
 
@@ -27,6 +28,10 @@ pub struct Material {
     /// Pattern-graph outputs driving pbr fields (from `reference` params);
     /// node indices point into Scene::patterns.
     pub pattern_bindings: Vec<(BoundField, u32)>,
+    /// Marschner hair scattering (Bxdf "PxrMarschnerHair"); when set, the
+    /// path tracer shades curve hits with the hair BSDF instead of the
+    /// surface lobes.
+    pub hair: Option<HairParams>,
 }
 
 impl Material {
@@ -41,6 +46,7 @@ impl Material {
             area_light: None,
             pbr: PbrParams::from_matte(color),
             pattern_bindings: Vec::new(),
+            hair: None,
         }
     }
 
@@ -55,6 +61,7 @@ impl Material {
             area_light: None,
             pbr: PbrParams::from_plastic(color, roughness),
             pattern_bindings: Vec::new(),
+            hair: None,
         }
     }
 
@@ -69,6 +76,7 @@ impl Material {
             area_light: None,
             pbr: PbrParams::from_metal(color, roughness),
             pattern_bindings: Vec::new(),
+            hair: None,
         }
     }
 

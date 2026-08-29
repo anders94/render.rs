@@ -6,8 +6,16 @@
 //! runs in f64 on the CPU reference path.
 
 use crate::accel::{Aabb, Bvh};
+use crate::geometry::curves::CurveSet;
 use crate::math::{Matrix4, Point3, Vec3};
 use crate::raytracer::{Intersection, Ray};
+
+/// What an Instance points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeomKind {
+    Mesh,
+    Curves,
+}
 
 pub struct Mesh {
     /// xyz triples.
@@ -181,8 +189,10 @@ impl Mesh {
     }
 }
 
-/// A placed copy of a mesh: transform + material.
+/// A placed copy of a mesh or curve set: transform + material.
 pub struct Instance {
+    pub kind: GeomKind,
+    /// Index into Scene::meshes or Scene::curve_sets, per `kind`.
     pub mesh_id: u32,
     pub material_id: usize,
     pub transform: Matrix4,
@@ -209,10 +219,31 @@ impl Instance {
         transform1: Option<Matrix4>,
         mesh: &Mesh,
     ) -> Self {
+        Self::build(GeomKind::Mesh, mesh_id, material_id, transform, transform1, &mesh.local_bounds)
+    }
+
+    pub fn new_curves(
+        set_id: u32,
+        material_id: usize,
+        transform: Matrix4,
+        transform1: Option<Matrix4>,
+        set: &CurveSet,
+    ) -> Self {
+        Self::build(GeomKind::Curves, set_id, material_id, transform, transform1, &set.local_bounds)
+    }
+
+    fn build(
+        kind: GeomKind,
+        mesh_id: u32,
+        material_id: usize,
+        transform: Matrix4,
+        transform1: Option<Matrix4>,
+        local_bounds: &Aabb,
+    ) -> Self {
         let inverse = transform.inverse().unwrap_or(Matrix4::identity());
         // World bounds from the 8 transformed corners of the local box, at
         // both shutter endpoints when moving.
-        let lb = &mesh.local_bounds;
+        let lb = local_bounds;
         let mut world_bounds = Aabb::empty();
         for xf in std::iter::once(&transform).chain(transform1.iter()) {
             for i in 0..8 {
@@ -226,7 +257,7 @@ impl Instance {
             }
         }
         let scale = transform.approx_scale();
-        Self { mesh_id, material_id, transform, inverse, transform1, world_bounds, scale }
+        Self { kind, mesh_id, material_id, transform, inverse, transform1, world_bounds, scale }
     }
 
     /// (forward, inverse) at shutter time.
@@ -243,8 +274,13 @@ impl Instance {
     }
 
     /// Closest hit in *parametric* t (along the world ray direction).
-    pub fn intersect(&self, meshes: &[Mesh], world_ray: &Ray, t_max: f64) -> Option<MeshHit> {
-        let mesh = &meshes[self.mesh_id as usize];
+    pub fn intersect(
+        &self,
+        meshes: &[Mesh],
+        curves: &[CurveSet],
+        world_ray: &Ray,
+        t_max: f64,
+    ) -> Option<MeshHit> {
         let (_, inverse) = self.transforms_at(world_ray.time);
         // Affine transform WITHOUT normalizing the direction keeps the
         // parametric t identical in local and world space (Ray::new would
@@ -254,6 +290,28 @@ impl Instance {
             direction: inverse.transform_vec(&world_ray.direction),
             time: world_ray.time,
         };
+        if self.kind == GeomKind::Curves {
+            let set = &curves[self.mesh_id as usize];
+            let mut best: Option<(Vec3, Vec3, f64)> = None;
+            let (_, t) = set.blas.traverse(&local_ray, t_max, |seg, cur_max| {
+                set.intersect_segment(&local_ray, seg, cur_max).map(|(t, n, tang, v)| {
+                    best = Some((n, tang, v));
+                    t
+                })
+            })?;
+            let (n, tang, v) = best?;
+            let world_n = inverse.transform_normal(&n).normalize();
+            let world_t = self.transform.transform_vec(&tang).normalize();
+            return Some(MeshHit {
+                t_param: t,
+                tri: 0,
+                world_normal: world_n,
+                st: [0.5, v],
+                st_density: 0.0,
+                tangent: world_t,
+            });
+        }
+        let mesh = &meshes[self.mesh_id as usize];
         let mut hit_uv = (0.0, 0.0);
         let (tri, t) = mesh.blas.traverse(&local_ray, t_max, |tri, cur_max| {
             mesh.intersect_triangle(&local_ray, tri, cur_max).map(|(t, u, v)| {
@@ -268,18 +326,37 @@ impl Instance {
             .st_at(tri, hit_uv.0, hit_uv.1)
             .map(|(st, d)| (st, d / self.scale))
             .unwrap_or(([0.0, 0.0], 0.0));
-        Some(MeshHit { t_param: t, tri, world_normal: world_n, st, st_density })
+        Some(MeshHit {
+            t_param: t,
+            tri,
+            world_normal: world_n,
+            st,
+            st_density,
+            tangent: Vec3::zero(),
+        })
     }
 
     /// Any hit strictly before parametric `t_limit`.
-    pub fn occludes(&self, meshes: &[Mesh], world_ray: &Ray, t_limit: f64) -> bool {
-        let mesh = &meshes[self.mesh_id as usize];
+    pub fn occludes(
+        &self,
+        meshes: &[Mesh],
+        curves: &[CurveSet],
+        world_ray: &Ray,
+        t_limit: f64,
+    ) -> bool {
         let (_, inverse) = self.transforms_at(world_ray.time);
         let local_ray = Ray {
             origin: inverse.transform_point(&world_ray.origin),
             direction: inverse.transform_vec(&world_ray.direction),
             time: world_ray.time,
         };
+        if self.kind == GeomKind::Curves {
+            let set = &curves[self.mesh_id as usize];
+            return set.blas.any_hit(&local_ray, t_limit, |seg, lim| {
+                set.intersect_segment(&local_ray, seg, lim).is_some()
+            });
+        }
+        let mesh = &meshes[self.mesh_id as usize];
         mesh.blas.any_hit(&local_ray, t_limit, |tri, lim| {
             mesh.intersect_triangle(&local_ray, tri, lim).is_some()
         })
@@ -294,6 +371,8 @@ pub struct MeshHit {
     pub st: [f64; 2],
     /// st units per world unit (0 when the mesh has no st).
     pub st_density: f64,
+    /// Curve tangent at the hit (zero for surface geometry).
+    pub tangent: Vec3,
 }
 
 /// Convert a parametric mesh hit into the renderer's Intersection
@@ -308,6 +387,7 @@ pub fn to_intersection(hit: &MeshHit, ray: &Ray, material_id: usize) -> Intersec
     Intersection::new(point.distance(&ray.origin), point, normal, material_id)
         .with_front_face(front_face)
         .with_st(hit.st, hit.st_density)
+        .with_tangent(hit.tangent)
 }
 
 #[cfg(test)]
@@ -348,7 +428,7 @@ mod tests {
         let meshes = vec![mesh];
         let inst = Instance::new(0, 0, Matrix4::translate(0.0, 0.0, 5.0), &meshes[0]);
         let ray = Ray::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
-        let hit = inst.intersect(&meshes, &ray, f64::INFINITY).expect("hit");
+        let hit = inst.intersect(&meshes, &[], &ray, f64::INFINITY).expect("hit");
         assert!((hit.t_param - 4.0).abs() < 1e-9, "t = {}", hit.t_param);
         let isect = to_intersection(&hit, &ray, 0);
         assert!((isect.t - 4.0).abs() < 1e-9);
@@ -363,7 +443,7 @@ mod tests {
         let xf = Matrix4::translate(0.0, 0.0, 5.0) * Matrix4::scale(2.0, 2.0, 2.0);
         let inst = Instance::new(0, 0, xf, &meshes[0]);
         let ray = Ray::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
-        let hit = inst.intersect(&meshes, &ray, f64::INFINITY).expect("hit");
+        let hit = inst.intersect(&meshes, &[], &ray, f64::INFINITY).expect("hit");
         assert!((hit.t_param - 3.0).abs() < 1e-9, "t = {}", hit.t_param);
     }
 
@@ -382,7 +462,7 @@ mod tests {
         // Scale 2x: st density halves in world space.
         let inst = Instance::new(0, 0, Matrix4::scale(2.0, 2.0, 2.0), &meshes[0]);
         let ray = Ray::new(Point3::new(0.5, 1.0, -3.0), Vec3::new(0.0, 0.0, 1.0));
-        let hit = inst.intersect(&meshes, &ray, f64::INFINITY).expect("hit");
+        let hit = inst.intersect(&meshes, &[], &ray, f64::INFINITY).expect("hit");
         assert!((hit.st[0] - 0.25).abs() < 1e-6, "s = {}", hit.st[0]);
         assert!((hit.st[1] - 0.5).abs() < 1e-6, "t = {}", hit.st[1]);
         assert!((hit.st_density - 0.5).abs() < 1e-6, "density = {}", hit.st_density);
@@ -394,7 +474,7 @@ mod tests {
         let meshes = vec![mesh];
         let inst = Instance::new(0, 0, Matrix4::translate(0.0, 0.0, 5.0), &meshes[0]);
         let ray = Ray::new(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
-        assert!(inst.occludes(&meshes, &ray, 10.0));
-        assert!(!inst.occludes(&meshes, &ray, 3.5));
+        assert!(inst.occludes(&meshes, &[], &ray, 10.0));
+        assert!(!inst.occludes(&meshes, &[], &ray, 3.5));
     }
 }

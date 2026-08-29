@@ -86,6 +86,22 @@ struct InstanceG {
     uint  material_id;
     float scale;         // isotropic transform scale (st-density transfer)
     uint  has_motion;
+    uint  kind;          // 0 mesh, 1 curve set
+    uint  pad[3];
+};
+
+struct CurveSegG {
+    float p0[4];         // xyz + radius
+    float p1[4];
+    float v0;
+    float v1;
+    float pad[2];
+};
+
+struct CurveInfoG {
+    uint node_offset;
+    uint seg_offset;
+    uint pad[2];
 };
 
 // All scene pointers bundled so helpers have sane signatures.
@@ -103,6 +119,8 @@ struct PtScene {
     device const MeshInfoG* mesh_infos;
     device const float*     st;
     device const float*     vertices1;
+    device const CurveSegG* curve_segs;
+    device const CurveInfoG* curve_infos;
     device const float*     tex_data;
     device const TexMipG*   tex_mips;
     device const float*     env_pixels;
@@ -182,6 +200,7 @@ struct PtHit {
     bool  front;
     float2 st;           // surface parameterization (meshes; quadrics 0)
     float st_density;    // st units per world unit (0 = no st)
+    float3 tangent;      // fiber tangent (curves; zero for surfaces)
 };
 
 // Möller–Trumbore; returns t (parametric along dir) with barycentrics.
@@ -258,6 +277,199 @@ inline float3 fetch_vertex_at(thread const PtScene& s, device const MeshInfoG& m
         return mix(v0, v1, time);
     }
     return v0;
+}
+
+// Ray vs rounded cone (sphere-swept segment, lerped radius), mirroring
+// curves.rs. Direction unnormalized: t is parametric.
+inline bool capsule_hit(float3 o, float3 d, float3 pa, float ra, float3 pb, float rb,
+                        float t_max, thread float& t_out, thread float3& n_out) {
+    float3 ba = pb - pa;
+    float3 oa = o - pa;
+    float rr = ra - rb;
+    float m0 = dot(ba, ba);
+    float m1 = dot(ba, oa);
+    float m2 = dot(ba, d);
+    float m3 = dot(d, oa);
+    float m5 = dot(oa, oa);
+    float dd = dot(d, d);
+
+    bool found = false;
+    if (m0 < 1e-18f) {
+        // Degenerate: sphere of radius max(ra, rb).
+        float r = max(ra, rb);
+        float b = m3;
+        float c = m5 - r * r;
+        float disc = b * b - dd * c;
+        if (disc < 0.0f) return false;
+        float sq = sqrt(disc);
+        float t = (-b - sq) / dd;
+        if (t <= 1e-6f) t = (-b + sq) / dd;
+        if (t <= 1e-6f || t >= t_max) return false;
+        t_out = t;
+        n_out = normalize_cpu(o + d * t - pa);
+        return true;
+    }
+
+    float d2 = m0 - rr * rr;
+    float k2 = d2 * dd - m2 * m2;
+    float k1 = d2 * m3 - m1 * m2 + m2 * rr * ra;
+    float k0 = d2 * m5 - m1 * m1 + m1 * rr * ra * 2.0f - m0 * ra * ra;
+    if (fabs(k2) > 1e-18f) {
+        float h = k1 * k1 - k0 * k2;
+        if (h >= 0.0f) {
+            float t = (-k1 - sqrt(h)) / k2;
+            float y = m1 + t * m2;
+            if (t > 1e-6f && t < t_max && y > 0.0f && y < d2) {
+                t_out = t;
+                n_out = normalize_cpu((oa + d * t) * d2 - ba * y);
+                return true;
+            }
+        }
+    }
+    // Caps: start owns y < 0, end owns y > d2.
+    float t_lim = t_max;
+    {
+        float b = m3;
+        float c = m5 - ra * ra;
+        float disc = b * b - dd * c;
+        if (disc >= 0.0f) {
+            float sq = sqrt(disc);
+            float t = (-b - sq) / dd;
+            if (t <= 1e-6f) t = (-b + sq) / dd;
+            if (t > 1e-6f && t < t_lim && (m1 + t * m2) <= 0.0f) {
+                t_out = t;
+                n_out = normalize_cpu(o + d * t - pa);
+                t_lim = t;
+                found = true;
+            }
+        }
+    }
+    {
+        float3 ob = o - pb;
+        float b = dot(d, ob);
+        float c = dot(ob, ob) - rb * rb;
+        float disc = b * b - dd * c;
+        if (disc >= 0.0f) {
+            float sq = sqrt(disc);
+            float t = (-b - sq) / dd;
+            if (t <= 1e-6f) t = (-b + sq) / dd;
+            if (t > 1e-6f && t < t_lim && (m1 + t * m2) >= d2) {
+                t_out = t;
+                n_out = normalize_cpu(o + d * t - pb);
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+// Closest hit within one curve set's BLAS (mirrors instance_hit).
+inline bool curve_instance_hit(thread const PtScene& s, uint inst_id,
+                               float3 wo_pos, float3 wd, float time, float t_max,
+                               thread float& t_out, thread float3& n_out,
+                               thread float3& tangent_out, thread float& v_out) {
+    device const InstanceG& inst = s.instances[inst_id];
+    device const CurveInfoG& info = s.curve_infos[inst.mesh_id];
+    Affine inv = instance_inverse_at(inst, time);
+    float3 o = xf_point(inv, wo_pos);
+    float3 d = xf_vec(inv, wd);
+    float3 inv_d = safe_inv(d);
+
+    float best_t = t_max;
+    uint best_seg = 0xFFFFFFFFu;
+    float3 best_n = float3(0.0f);
+
+    uint stack[48];
+    int sp = 0;
+    stack[sp++] = 0u;
+    while (sp > 0) {
+        device const BvhNodeG& node = s.blas[info.node_offset + stack[--sp]];
+        float tn;
+        if (!aabb_hit(node, o, inv_d, best_t, tn)) continue;
+        if (node.count > 0u) {
+            for (uint i = 0u; i < node.count; i++) {
+                uint seg = info.seg_offset + node.left_or_first + i;
+                device const CurveSegG& cs = s.curve_segs[seg];
+                float t;
+                float3 n;
+                if (capsule_hit(o, d,
+                                float3(cs.p0[0], cs.p0[1], cs.p0[2]), cs.p0[3],
+                                float3(cs.p1[0], cs.p1[1], cs.p1[2]), cs.p1[3],
+                                best_t, t, n)) {
+                    best_t = t;
+                    best_seg = seg;
+                    best_n = n;
+                }
+            }
+        } else {
+            uint l = node.left_or_first;
+            uint r = l + 1u;
+            float tl, tr;
+            bool hl = aabb_hit(s.blas[info.node_offset + l], o, inv_d, best_t, tl);
+            bool hr = aabb_hit(s.blas[info.node_offset + r], o, inv_d, best_t, tr);
+            if (hl && hr) {
+                uint near_c = (tl <= tr) ? l : r;
+                uint far_c = (tl <= tr) ? r : l;
+                stack[sp++] = far_c;
+                stack[sp++] = near_c;
+            } else if (hl) {
+                stack[sp++] = l;
+            } else if (hr) {
+                stack[sp++] = r;
+            }
+        }
+    }
+    if (best_seg == 0xFFFFFFFFu) return false;
+    device const CurveSegG& cs = s.curve_segs[best_seg];
+    float3 pa = float3(cs.p0[0], cs.p0[1], cs.p0[2]);
+    float3 pb = float3(cs.p1[0], cs.p1[1], cs.p1[2]);
+    float3 axis = pb - pa;
+    float len2 = dot(axis, axis);
+    float3 hitp = o + d * best_t;
+    float along = len2 > 1e-18f ? clamp(dot(hitp - pa, axis) / len2, 0.0f, 1.0f) : 0.5f;
+    v_out = cs.v0 + (cs.v1 - cs.v0) * along;
+    float3 tang = len2 > 1e-18f ? normalize_cpu(axis) : float3(0.0f, 0.0f, 1.0f);
+    t_out = best_t;
+    n_out = normalize_cpu(xf_normal(inv, best_n));
+    // Tangent transforms with the forward matrix.
+    Affine fwd_a = load_affine(inst.fwd);
+    tangent_out = normalize_cpu(xf_vec(fwd_a, tang));
+    return true;
+}
+
+// Any curve hit before t_limit (shadow rays).
+inline bool curve_instance_occludes(thread const PtScene& s, uint inst_id,
+                                    float3 wo_pos, float3 wd, float time, float t_limit) {
+    device const InstanceG& inst = s.instances[inst_id];
+    device const CurveInfoG& info = s.curve_infos[inst.mesh_id];
+    Affine inv = instance_inverse_at(inst, time);
+    float3 o = xf_point(inv, wo_pos);
+    float3 d = xf_vec(inv, wd);
+    float3 inv_d = safe_inv(d);
+    uint stack[48];
+    int sp = 0;
+    stack[sp++] = 0u;
+    while (sp > 0) {
+        device const BvhNodeG& node = s.blas[info.node_offset + stack[--sp]];
+        float tn;
+        if (!aabb_hit(node, o, inv_d, t_limit, tn)) continue;
+        if (node.count > 0u) {
+            for (uint i = 0u; i < node.count; i++) {
+                uint seg = info.seg_offset + node.left_or_first + i;
+                device const CurveSegG& cs = s.curve_segs[seg];
+                float t;
+                float3 n;
+                if (capsule_hit(o, d,
+                                float3(cs.p0[0], cs.p0[1], cs.p0[2]), cs.p0[3],
+                                float3(cs.p1[0], cs.p1[1], cs.p1[2]), cs.p1[3],
+                                t_limit, t, n)) return true;
+            }
+        } else {
+            stack[sp++] = node.left_or_first;
+            stack[sp++] = node.left_or_first + 1u;
+        }
+    }
+    return false;
 }
 
 // Closest hit within one instance's BLAS. t stays parametric along the
@@ -419,6 +631,7 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d, float t
     best.front = true;
     best.st = float2(0.0f);
     best.st_density = 0.0f;
+    best.tangent = float3(0.0f);
 
     for (uint i = 0u; i < s.u->object_count; i++) {
         Hit h = isect_object(s.objects[i], o, d);
@@ -444,6 +657,24 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d, float t
             if (node.count > 0u) {
                 for (uint i = 0u; i < node.count; i++) {
                     uint inst_id = node.left_or_first + i;
+                    if (s.instances[inst_id].kind == 1u) {
+                        float t;
+                        float3 n;
+                        float3 tang;
+                        float v;
+                        if (curve_instance_hit(s, inst_id, o, d, time, best.t, t, n, tang, v)) {
+                            best.hit = true;
+                            best.t = t;
+                            best.p = o + d * t;
+                            best.front = dot(n, d) < 0.0f;
+                            best.n = n;
+                            best.material = s.instances[inst_id].material_id;
+                            best.st = float2(0.5f, v);
+                            best.st_density = 0.0f;
+                            best.tangent = tang;
+                        }
+                        continue;
+                    }
                     float t;
                     float3 n;
                     float2 st;
@@ -458,6 +689,7 @@ inline PtHit pt_trace_scene(thread const PtScene& s, float3 o, float3 d, float t
                         best.material = s.instances[inst_id].material_id;
                         best.st = st;
                         best.st_density = st_density;
+                        best.tangent = float3(0.0f);
                     }
                 }
             } else {
@@ -502,9 +734,11 @@ inline bool pt_occluded(thread const PtScene& s, float3 p, float3 n,
             if (!aabb_hit(node, o, inv_d, limit, tn)) continue;
             if (node.count > 0u) {
                 for (uint i = 0u; i < node.count; i++) {
-                    if (instance_occludes(s, node.left_or_first + i, o, dir, time, limit)) {
-                        return true;
-                    }
+                    uint inst_id = node.left_or_first + i;
+                    bool blocked = s.instances[inst_id].kind == 1u
+                        ? curve_instance_occludes(s, inst_id, o, dir, time, limit)
+                        : instance_occludes(s, inst_id, o, dir, time, limit);
+                    if (blocked) return true;
                 }
             } else {
                 stack[sp++] = node.left_or_first;
@@ -884,10 +1118,257 @@ inline float pt_visibility(thread const PtScene& s, float3 p, float3 n,
     return vis;
 }
 
+
+// ---- Marschner/d'Eon hair scattering (mirror of pt/hair.rs) -------------
+// Fiber frame: x = tangent, yz = normal plane. f is per-solid-angle with
+// no cosine factors on either side.
+
+constant int HAIR_PMAX = 3;
+
+inline float hair_i0(float x) {
+    float val = 0.0f;
+    float x2i = 1.0f;
+    float ifact = 1.0f;
+    float i4 = 1.0f;
+    for (int i = 0; i < 10; i++) {
+        if (i > 1) ifact *= (float)i;
+        val += x2i / (i4 * ifact * ifact);
+        x2i *= x * x;
+        i4 *= 4.0f;
+    }
+    return val;
+}
+
+inline float hair_log_i0(float x) {
+    if (x > 12.0f) return x + 0.5f * (-log(2.0f * PT_PI * x) + 1.0f / (8.0f * x));
+    return log(hair_i0(x));
+}
+
+inline float hair_mp(float cti, float cto, float sti, float sto, float v) {
+    float a = cti * cto / v;
+    float b = sti * sto / v;
+    if (v <= 0.1f) {
+        return exp(hair_log_i0(a) - b - 1.0f / v + 0.6931f + log(1.0f / (2.0f * v)));
+    }
+    return (exp(-b) * hair_i0(a)) / (sinh(1.0f / v) * 2.0f * v);
+}
+
+inline float hair_fr_dielectric(float ci, float eta) {
+    ci = clamp(ci, -1.0f, 1.0f);
+    float ei = 1.0f;
+    float et = eta;
+    if (ci <= 0.0f) { ei = eta; et = 1.0f; ci = -ci; }
+    float si = sqrt(max(1.0f - ci * ci, 0.0f));
+    float st = ei / et * si;
+    if (st >= 1.0f) return 1.0f;
+    float ct = sqrt(max(1.0f - st * st, 0.0f));
+    float rp = (et * ci - ei * ct) / (et * ci + ei * ct);
+    float rs = (ei * ci - et * ct) / (ei * ci + et * ct);
+    return (rp * rp + rs * rs) * 0.5f;
+}
+
+struct HairGeomG {
+    float sin_to, cos_to, phi_o, gamma_o, gamma_t;
+    float3 tbody;   // body transmittance
+};
+
+inline HairGeomG hair_geom(thread const PtMaterial& m, float3 wo, float hh) {
+    HairGeomG g;
+    g.sin_to = clamp(wo.x, -1.0f, 1.0f);
+    g.cos_to = sqrt(max(1.0f - g.sin_to * g.sin_to, 0.0f));
+    g.phi_o = atan2(wo.z, wo.y);
+    g.gamma_o = asin(clamp(hh, -1.0f, 1.0f));
+    float sin_tt = g.sin_to / m.hair_eta;
+    float cos_tt = sqrt(max(1.0f - sin_tt * sin_tt, 0.0f));
+    float etap = sqrt(max(m.hair_eta * m.hair_eta - g.sin_to * g.sin_to, 0.0f))
+        / max(g.cos_to, 1e-6f);
+    float sgt = clamp(hh / etap, -1.0f, 1.0f);
+    float cgt = sqrt(max(1.0f - sgt * sgt, 0.0f));
+    g.gamma_t = asin(sgt);
+    float l = 2.0f * cgt / max(cos_tt, 1e-6f);
+    g.tbody = float3(exp(-m.hair_sigma_a[0] * l),
+                     exp(-m.hair_sigma_a[1] * l),
+                     exp(-m.hair_sigma_a[2] * l));
+    return g;
+}
+
+inline void hair_ap(float cos_to, float eta, float hh, float3 t,
+                    thread float3 ap_out[4]) {
+    float cgo = sqrt(max(1.0f - hh * hh, 0.0f));
+    float fr = hair_fr_dielectric(cos_to * cgo, eta);
+    ap_out[0] = float3(fr);
+    ap_out[1] = t * ((1.0f - fr) * (1.0f - fr));
+    ap_out[2] = ap_out[1] * t * fr;
+    ap_out[3] = ap_out[2] * fr * t
+        / max(float3(1.0f) - t * fr, float3(1e-6f));
+}
+
+inline float hair_logistic(float x, float sc) {
+    x = fabs(x);
+    float e = exp(-x / sc);
+    return e / (sc * (1.0f + e) * (1.0f + e));
+}
+
+inline float hair_logistic_cdf(float x, float sc) {
+    return 1.0f / (1.0f + exp(-x / sc));
+}
+
+inline float hair_trimmed_logistic(float x, float sc) {
+    return hair_logistic(x, sc)
+        / (hair_logistic_cdf(PT_PI, sc) - hair_logistic_cdf(-PT_PI, sc));
+}
+
+inline float hair_sample_trimmed_logistic(float u, float sc) {
+    float k = hair_logistic_cdf(PT_PI, sc) - hair_logistic_cdf(-PT_PI, sc);
+    float inner = clamp(u * k + hair_logistic_cdf(-PT_PI, sc), 1e-9f, 1.0f - 1e-9f);
+    float x = -sc * log(1.0f / inner - 1.0f);
+    return clamp(x, -PT_PI, PT_PI);
+}
+
+inline float hair_phi_fn(int pp, float gamma_o, float gamma_t) {
+    return 2.0f * (float)pp * gamma_t - 2.0f * gamma_o + (float)pp * PT_PI;
+}
+
+inline float hair_np(float phi, int pp, float sc, float gamma_o, float gamma_t) {
+    float dphi = phi - hair_phi_fn(pp, gamma_o, gamma_t);
+    while (dphi > PT_PI) dphi -= 2.0f * PT_PI;
+    while (dphi < -PT_PI) dphi += 2.0f * PT_PI;
+    return hair_trimmed_logistic(dphi, sc);
+}
+
+inline float3 hair_f(thread const PtMaterial& m, float3 wo, float3 wi, float hh) {
+    HairGeomG g = hair_geom(m, wo, hh);
+    float sti = clamp(wi.x, -1.0f, 1.0f);
+    float cti = sqrt(max(1.0f - sti * sti, 0.0f));
+    float phi = atan2(wi.z, wi.y) - g.phi_o;
+    float3 ap[4];
+    hair_ap(g.cos_to, m.hair_eta, hh, g.tbody, ap);
+    float3 outv = float3(0.0f);
+    for (int pp = 0; pp <= HAIR_PMAX; pp++) {
+        float mpv = hair_mp(cti, g.cos_to, sti, g.sin_to, m.hair_v[pp]);
+        float npv = pp < HAIR_PMAX ? hair_np(phi, pp, m.hair_s, g.gamma_o, g.gamma_t)
+                                   : 1.0f / (2.0f * PT_PI);
+        outv += ap[pp] * (mpv * npv);
+    }
+    return outv;
+}
+
+inline void hair_ap_pdf(thread const PtMaterial& m, thread const HairGeomG& g,
+                        float hh, thread float w_out[4]) {
+    float3 ap[4];
+    hair_ap(g.cos_to, m.hair_eta, hh, g.tbody, ap);
+    float total = 0.0f;
+    for (int pp = 0; pp <= HAIR_PMAX; pp++) {
+        w_out[pp] = 0.2126f * ap[pp].x + 0.7152f * ap[pp].y + 0.0722f * ap[pp].z;
+        total += w_out[pp];
+    }
+    if (total > 1e-12f) {
+        for (int pp = 0; pp <= HAIR_PMAX; pp++) w_out[pp] /= total;
+    } else {
+        w_out[0] = 1.0f;
+    }
+}
+
+inline float hair_pdf(thread const PtMaterial& m, float3 wo, float3 wi, float hh) {
+    HairGeomG g = hair_geom(m, wo, hh);
+    float sti = clamp(wi.x, -1.0f, 1.0f);
+    float cti = sqrt(max(1.0f - sti * sti, 0.0f));
+    float phi = atan2(wi.z, wi.y) - g.phi_o;
+    float w[4];
+    hair_ap_pdf(m, g, hh, w);
+    float outp = 0.0f;
+    for (int pp = 0; pp <= HAIR_PMAX; pp++) {
+        float mpv = hair_mp(cti, g.cos_to, sti, g.sin_to, m.hair_v[pp]);
+        float npv = pp < HAIR_PMAX ? hair_np(phi, pp, m.hair_s, g.gamma_o, g.gamma_t)
+                                   : 1.0f / (2.0f * PT_PI);
+        outp += w[pp] * mpv * npv;
+    }
+    return max(outp, 0.0f);
+}
+
+inline bool hair_sample(thread const PtMaterial& m, float3 wo, float hh,
+                        thread Pcg32& rng, thread float3& wi_out,
+                        thread float3& f_out, thread float& pdf_out) {
+    HairGeomG g = hair_geom(m, wo, hh);
+    float w[4];
+    hair_ap_pdf(m, g, hh, w);
+    float u = pcg_f32(rng);
+    int pp = HAIR_PMAX;
+    for (int i = 0; i <= HAIR_PMAX; i++) {
+        if (u < w[i]) { pp = i; break; }
+        u -= w[i];
+    }
+    float v = m.hair_v[pp];
+    float u1 = max(pcg_f32(rng), 1e-9f);
+    float u2 = pcg_f32(rng);
+    float cos_theta = 1.0f + v * log(u1 + (1.0f - u1) * exp(-2.0f / v));
+    float sin_theta = sqrt(max(1.0f - cos_theta * cos_theta, 0.0f));
+    float cpl = cos(2.0f * PT_PI * u2);
+    float sti = -cos_theta * g.sin_to + sin_theta * cpl * g.cos_to;
+    float cti = sqrt(max(1.0f - sti * sti, 0.0f));
+    float u3 = pcg_f32(rng);
+    float dphi = pp < HAIR_PMAX
+        ? hair_phi_fn(pp, g.gamma_o, g.gamma_t) + hair_sample_trimmed_logistic(u3, m.hair_s)
+        : 2.0f * PT_PI * u3;
+    float phi_i = g.phi_o + dphi;
+    float3 wi = float3(sti, cti * cos(phi_i), cti * sin(phi_i));
+    float pv = hair_pdf(m, wo, wi, hh);
+    if (pv <= 1e-12f) return false;
+    wi_out = wi;
+    f_out = hair_f(m, wo, wi, hh);
+    pdf_out = pv;
+    return true;
+}
+
+// Fiber frame from tangent/normal/viewer (mirror of hair::FiberFrame).
+inline FrameL fiber_frame(float3 tangent, float3 n, float3 wo, thread float& h_out) {
+    float3 x = normalize_cpu(tangent);
+    float3 z = wo - x * dot(wo, x);
+    if (dot(z, z) < 1e-12f) z = n - x * dot(n, x);
+    z = normalize_cpu(z);
+    float3 y = normalize_cpu(cross(z, x));
+    float3 n_perp = normalize_cpu(n - x * dot(n, x));
+    h_out = clamp(dot(n_perp, y), -1.0f, 1.0f);
+    FrameL f;
+    f.t = x;
+    f.b = y;
+    f.n = z;
+    return f;
+}
+
+// ---- unified BSDF evaluation for light sampling -------------------------
+// Returns the BSDF value with any cosine already applied (surfaces:
+// f * cos+; hair: f alone) and the solid-angle pdf for MIS.
+
+struct EvalCtx {
+    bool hair;
+    FrameL frame;      // surface frame (n = z) or fiber frame (t = x)
+    float3 wo_l;
+    PtMaterial m;
+    float eta;
+    float h;
+};
+
+inline float3 eval_bsdf_weighted(thread const EvalCtx& c, float3 wi_world,
+                                 thread float& pdf_out) {
+    float3 wi_l = to_local(c.frame, wi_world);
+    if (c.hair) {
+        pdf_out = hair_pdf(c.m, c.wo_l, wi_l, c.h);
+        return hair_f(c.m, c.wo_l, wi_l, c.h);
+    }
+    if (wi_l.z <= 0.0f) {
+        pdf_out = 0.0f;
+        return float3(0.0f);
+    }
+    float3 f;
+    bsdf_eval_pdf(c.m, c.wo_l, wi_l, c.eta, f, pdf_out);
+    return f * max(wi_l.z, 0.0f);
+}
+
 inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
-                               FrameL frame, float3 wo_l, PtMaterial m,
-                               float eta, float time, thread Pcg32& rng) {
-    float3 n = frame.n;
+                               float3 nbias, thread const EvalCtx& ec,
+                               float time, thread Pcg32& rng) {
+    float3 n = nbias;
     float3 rad = m3(l.radiance);
 
     if (l.kind == 0u) {                       // point
@@ -895,14 +1376,11 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float dist2 = max(dot(to_l, to_l), 1e-12f);
         float dist = sqrt(dist2);
         float3 wi = to_l / dist;
-        float3 wi_l = to_local(frame, wi);
-        if (wi_l.z <= 0.0f) return float3(0.0f);
-        float3 f;
         float pdf;
-        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, pdf);
+        float3 f = eval_bsdf_weighted(ec, wi, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float vis = pt_visibility(s, p, n, wi, dist, time);
-        return f * rad * (max(wi_l.z, 0.0f) * vis / dist2);
+        return f * rad * (vis / dist2);
     }
     if (l.kind == 1u) {                       // distant (soft when area>0)
         float3 base = -m3(l.a);
@@ -917,14 +1395,11 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
             FrameL lf = frame_of(base);
             wi = to_world(lf, float3(st * cos(phi), st * sin(phi), ct));
         }
-        float3 wi_l = to_local(frame, wi);
-        if (wi_l.z <= 0.0f) return float3(0.0f);
-        float3 f;
         float pdf;
-        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, pdf);
+        float3 f = eval_bsdf_weighted(ec, wi, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float vis = pt_visibility(s, p, n, wi, PT_BIG, time);
-        return f * rad * (max(wi_l.z, 0.0f) * vis);
+        return f * rad * vis;
     }
     if (l.kind == 2u || l.kind == 4u) {       // rect / disk
         float uu = pcg_f32(rng);
@@ -941,19 +1416,16 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float dist2 = max(dot(to_l, to_l), 1e-12f);
         float dist = sqrt(dist2);
         float3 wi = to_l / dist;
-        float3 wi_l = to_local(frame, wi);
-        if (wi_l.z <= 0.0f) return float3(0.0f);
         float cl = fabs(dot(wi, m3(l.normal)));
         if (cl < 1e-9f || l.area <= 0.0f) return float3(0.0f);
-        float3 f;
         float bp;
-        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
+        float3 f = eval_bsdf_weighted(ec, wi, bp);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float vis = pt_visibility(s, p, n, wi, dist, time);
         if (vis <= 0.0f) return float3(0.0f);
         float pdf_sa = dist2 / (cl * l.area);
         float w = power_heuristic(pdf_sa, bp);
-        return f * rad * (max(wi_l.z, 0.0f) * vis / pdf_sa) * w;
+        return f * rad * (vis / pdf_sa) * w;
     }
     if (l.kind == 3u) {                       // sphere area: visible cone
         float3 c = m3(l.a);
@@ -970,11 +1442,8 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float phi = 2.0f * PT_PI * vv;
         FrameL lf = frame_of(normalize_cpu(to_c));
         float3 wi = to_world(lf, float3(st * cos(phi), st * sin(phi), ct));
-        float3 wi_l = to_local(frame, wi);
-        if (wi_l.z <= 0.0f) return float3(0.0f);
-        float3 f;
         float bp;
-        bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
+        float3 f = eval_bsdf_weighted(ec, wi, bp);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float dist = sqrt(dist2) * ct
             - sqrt(max(radius * radius - dist2 * st * st, 0.0f));
@@ -982,23 +1451,20 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         if (vis <= 0.0f) return float3(0.0f);
         float pdf_sa = 1.0f / max(2.0f * PT_PI * (1.0f - cm), 1e-12f);
         float w = power_heuristic(pdf_sa, bp);
-        return f * rad * (max(wi_l.z, 0.0f) * vis / pdf_sa) * w;
+        return f * rad * (vis / pdf_sa) * w;
     }
     // dome
     float3 wi, er;
     float pdf_sa;
     env_sample(s, rng, wi, er, pdf_sa);
     if (pdf_sa <= 0.0f) return float3(0.0f);
-    float3 wi_l = to_local(frame, wi);
-    if (wi_l.z <= 0.0f) return float3(0.0f);
-    float3 f;
     float bp;
-    bsdf_eval_pdf(m, wo_l, wi_l, eta, f, bp);
+    float3 f = eval_bsdf_weighted(ec, wi, bp);
     if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
     float vis = pt_visibility(s, p, n, wi, PT_BIG, time);
     if (vis <= 0.0f) return float3(0.0f);
     float w = power_heuristic(pdf_sa, bp);
-    return f * (er * rad) * (max(wi_l.z, 0.0f) * vis / pdf_sa) * w;
+    return f * (er * rad) * (vis / pdf_sa) * w;
 }
 
 // ---- the path integrator (mirror of pt::trace) --------------------------
@@ -1063,14 +1529,60 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             l += beta * em * w;
         }
 
+        // Hair fibers: full-sphere Marschner scattering (mirror of the
+        // CPU hair branch in pt::trace).
+        if (m.is_hair != 0u && dot(h.tangent, h.tangent) > 0.5f) {
+            float hh;
+            FrameL ff = fiber_frame(h.tangent, h.n, wo, hh);
+            float3 wo_f = to_local(ff, wo);
+            if (u.light_count > 0u) {
+                EvalCtx ec;
+                ec.hair = true;
+                ec.frame = ff;
+                ec.wo_l = wo_f;
+                ec.m = m;
+                ec.eta = m.hair_eta;
+                ec.h = hh;
+                uint li = min((uint)(pcg_f32(rng) * num_lights), u.light_count - 1u);
+                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, time, rng);
+                l += beta * c * num_lights;
+            }
+            float3 wi_f, fv;
+            float pv;
+            if (!hair_sample(m, wo_f, hh, rng, wi_f, fv, pv)) break;
+            float3 wi = to_world(ff, wi_f);
+            beta *= fv / pv;   // per-solid-angle f: no cosine
+            prev_pdf = pv;
+            prev_origin = h.p;
+            from_camera = false;
+            cone_spread += 0.4f;
+            float3 side = dot(wi, h.n) >= 0.0f ? h.n : -h.n;
+            origin = h.p + side * PT_RAY_OFFSET;
+            dir = wi;
+            depth++;
+            if (depth >= u.rr_start) {
+                float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
+                if (q <= 0.0f || pcg_f32(rng) > q) break;
+                beta /= q;
+            }
+            continue;
+        }
+
         FrameL frame = frame_of(n);
         float3 wo_l = to_local(frame, wo);
         float wsum = m.weights[0] + m.weights[1] + m.weights[2] + m.weights[3]
             + m.weights[4];
 
         if (u.light_count > 0u && wsum > 0.0f) {
+            EvalCtx ec;
+            ec.hair = false;
+            ec.frame = frame;
+            ec.wo_l = wo_l;
+            ec.m = m;
+            ec.eta = eta;
+            ec.h = 0.0f;
             uint li = min((uint)(pcg_f32(rng) * num_lights), u.light_count - 1u);
-            float3 c = sample_one_light(s, s.lights[li], h.p, frame, wo_l, m, eta, time, rng);
+            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, time, rng);
             l += beta * c * num_lights;
         }
 
@@ -1137,8 +1649,10 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const float*      tex_data         [[buffer(15)]],
                       device const TexMipG*    tex_mips         [[buffer(16)]],
                       device const float*      vertices1        [[buffer(17)]],
-                      constant PtUniforms&     u                [[buffer(18)]],
-                      device float*            accum            [[buffer(19)]],
+                      device const CurveSegG*  curve_segs       [[buffer(18)]],
+                      device const CurveInfoG* curve_infos      [[buffer(19)]],
+                      constant PtUniforms&     u                [[buffer(20)]],
+                      device float*            accum            [[buffer(21)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint py_row = gid.y + u.y_offset;
     if (gid.x >= u.width || py_row >= u.height) return;
@@ -1157,6 +1671,8 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
     s.mesh_infos = mesh_infos;
     s.st = st;
     s.vertices1 = vertices1;
+    s.curve_segs = curve_segs;
+    s.curve_infos = curve_infos;
     s.tex_data = tex_data;
     s.tex_mips = tex_mips;
     s.env_pixels = env_pixels;

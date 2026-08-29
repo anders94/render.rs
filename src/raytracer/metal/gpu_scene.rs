@@ -46,6 +46,29 @@ pub struct GpuMeshInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct GpuCurveSeg {
+    /// xyz + radius at the segment start.
+    pub p0: [f32; 4],
+    /// xyz + radius at the segment end.
+    pub p1: [f32; 4],
+    /// Curve v at start/end (0 root, 1 tip).
+    pub v0: f32,
+    pub v1: f32,
+    pub pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuCurveInfo {
+    /// Offset of this set's BLAS nodes in the shared blas buffer.
+    pub node_offset: u32,
+    /// Offset of this set's segments in the curve_segs buffer.
+    pub seg_offset: u32,
+    pub pad: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct GpuInstance {
     pub inv: [f32; 16],
     pub fwd: [f32; 16],
@@ -57,6 +80,9 @@ pub struct GpuInstance {
     pub scale: f32,
     /// 1 when fwd1 differs (kernel lerps + inverts per ray).
     pub has_motion: u32,
+    /// 0 = mesh, 1 = curve set (mesh_id then indexes curve_infos).
+    pub kind: u32,
+    pub pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -84,6 +110,15 @@ pub struct GpuPtMaterial {
     /// all-zero when the material reflects nothing.
     pub weights: [f32; 5],
     pub area_light: u32,
+    /// 1 when this is a Marschner hair material (fields below active).
+    pub is_hair: u32,
+    pub hair_sigma_a: [f32; 3],
+    /// Longitudinal variances per lobe (R, TT, TRT, residual).
+    pub hair_v: [f32; 4],
+    /// Azimuthal logistic scale.
+    pub hair_s: f32,
+    pub hair_eta: f32,
+    pub hair_pad: u32,
 }
 
 #[repr(C)]
@@ -146,8 +181,10 @@ pub struct GpuPtUniforms {
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
 const _: () = assert!(std::mem::size_of::<GpuMeshInfo>() == 24);
-const _: () = assert!(std::mem::size_of::<GpuInstance>() == 208);
-const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 140);
+const _: () = assert!(std::mem::size_of::<GpuInstance>() == 224);
+const _: () = assert!(std::mem::size_of::<GpuCurveSeg>() == 48);
+const _: () = assert!(std::mem::size_of::<GpuCurveInfo>() == 16);
+const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 184);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
 const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 160);
 
@@ -169,6 +206,9 @@ pub struct GpuPtScene {
     pub st: Vec<f32>,
     /// Shutter-close vertex positions (== vertices where static).
     pub vertices1: Vec<f32>,
+    /// Curve segments, all sets concatenated (BLAS leaf order).
+    pub curve_segs: Vec<GpuCurveSeg>,
+    pub curve_infos: Vec<GpuCurveInfo>,
     pub mesh_infos: Vec<GpuMeshInfo>,
     /// Packed texture table + generated pattern MSL (pattern_codegen).
     pub tex_data: Vec<f32>,
@@ -244,6 +284,20 @@ impl GpuPtScene {
                     under_scale: under as f32,
                     weights: weights.map(|w| w as f32),
                     area_light: m.area_light.map(|i| i as u32).unwrap_or(u32::MAX),
+                    is_hair: m.hair.is_some() as u32,
+                    hair_sigma_a: m
+                        .hair
+                        .as_ref()
+                        .map(|h| v3(&h.sigma_a))
+                        .unwrap_or([0.0; 3]),
+                    hair_v: m
+                        .hair
+                        .as_ref()
+                        .map(|h| h.lobe_variances().map(|v| v as f32))
+                        .unwrap_or([0.0; 4]),
+                    hair_s: m.hair.as_ref().map(|h| h.azimuthal_s() as f32).unwrap_or(0.0),
+                    hair_eta: m.hair.as_ref().map(|h| h.eta as f32).unwrap_or(1.55),
+                    hair_pad: 0,
                 }
             })
             .collect();
@@ -380,6 +434,27 @@ impl GpuPtScene {
             });
         }
 
+        // Curve sets: segments permuted into BLAS leaf order, nodes
+        // appended to the shared blas buffer.
+        let mut curve_segs: Vec<GpuCurveSeg> = Vec::new();
+        let mut curve_infos = Vec::with_capacity(scene.curve_sets.len());
+        for set in &scene.curve_sets {
+            let node_offset = blas_nodes.len() as u32;
+            let seg_offset = curve_segs.len() as u32;
+            blas_nodes.extend(export_bvh(&set.blas));
+            for &seg in set.blas.prim_order() {
+                let i = seg as usize;
+                curve_segs.push(GpuCurveSeg {
+                    p0: set.p0[i],
+                    p1: set.p1[i],
+                    v0: set.v0[i],
+                    v1: set.v1[i],
+                    pad: [0.0; 2],
+                });
+            }
+            curve_infos.push(GpuCurveInfo { node_offset, seg_offset, pad: [0; 2] });
+        }
+
         // TLAS: instances permuted into leaf order so leaves are contiguous.
         let tlas = {
             let bounds: Vec<_> = scene.instances.iter().map(|i| i.world_bounds).collect();
@@ -398,6 +473,8 @@ impl GpuPtScene {
                     material_id: inst.material_id as u32,
                     scale: inst.scale as f32,
                     has_motion: inst.transform1.is_some() as u32,
+                    kind: matches!(inst.kind, crate::geometry::GeomKind::Curves) as u32,
+                    pad: [0; 3],
                 })
             })
             .collect::<Result<_>>()?;
@@ -466,6 +543,8 @@ impl GpuPtScene {
             normals,
             st,
             vertices1,
+            curve_segs,
+            curve_infos,
             mesh_infos,
             tex_data: patterns.tex_data,
             tex_mips: patterns.tex_mips,
@@ -515,6 +594,12 @@ impl GpuPtScene {
         }
         if self.vertices1.is_empty() {
             self.vertices1.extend_from_slice(&[0.0, 0.0, 0.0]);
+        }
+        if self.curve_segs.is_empty() {
+            self.curve_segs.push(unsafe { std::mem::zeroed() });
+        }
+        if self.curve_infos.is_empty() {
+            self.curve_infos.push(unsafe { std::mem::zeroed() });
         }
         if self.tex_data.is_empty() {
             self.tex_data.extend_from_slice(&[0.0; 3]);
@@ -571,6 +656,12 @@ impl GpuPtScene {
     }
     pub fn vertices1_bytes(&self) -> &[u8] {
         as_bytes(&self.vertices1)
+    }
+    pub fn curve_segs_bytes(&self) -> &[u8] {
+        as_bytes(&self.curve_segs)
+    }
+    pub fn curve_infos_bytes(&self) -> &[u8] {
+        as_bytes(&self.curve_infos)
     }
     pub fn tex_data_bytes(&self) -> &[u8] {
         as_bytes(&self.tex_data)

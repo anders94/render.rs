@@ -13,7 +13,7 @@ pub use pbr::PbrParams;
 pub use transform::TransformStack;
 
 use crate::accel::Bvh;
-use crate::geometry::{to_intersection, Instance, Intersectable, Mesh};
+use crate::geometry::{to_intersection, CurveSet, Instance, Intersectable, Mesh};
 use crate::math::{Point3, Vec3};
 use crate::raytracer::{Intersection, Ray};
 use std::sync::Arc;
@@ -25,6 +25,8 @@ pub struct Scene {
     /// Mesh library (BLAS per mesh) and their placed instances, traversed
     /// through the TLAS.
     pub meshes: Vec<Mesh>,
+    /// Curve/point sets, addressed by instances with GeomKind::Curves.
+    pub curve_sets: Vec<CurveSet>,
     pub instances: Vec<Instance>,
     pub lights: Vec<Light>,
     pub materials: Vec<Material>,
@@ -45,6 +47,7 @@ impl Scene {
             camera,
             objects: Vec::new(),
             meshes: Vec::new(),
+            curve_sets: Vec::new(),
             instances: Vec::new(),
             lights: Vec::new(),
             materials: Vec::new(),
@@ -66,7 +69,16 @@ impl Scene {
     pub fn triangle_count(&self) -> usize {
         self.instances
             .iter()
+            .filter(|i| i.kind == crate::geometry::GeomKind::Mesh)
             .map(|i| self.meshes[i.mesh_id as usize].triangle_count())
+            .sum()
+    }
+
+    pub fn curve_segment_count(&self) -> usize {
+        self.instances
+            .iter()
+            .filter(|i| i.kind == crate::geometry::GeomKind::Curves)
+            .map(|i| self.curve_sets[i.mesh_id as usize].segment_count())
             .sum()
     }
 
@@ -94,7 +106,7 @@ impl Scene {
             let winner = self.tlas.traverse(ray, t_budget, |inst_id, t_max| {
                 let instance = &self.instances[inst_id as usize];
                 instance
-                    .intersect(&self.meshes, ray, t_max)
+                    .intersect(&self.meshes, &self.curve_sets, ray, t_max)
                     .map(|hit| {
                         let t = hit.t_param;
                         best_hit = Some((instance.material_id, hit));
@@ -134,7 +146,8 @@ impl Scene {
             // light_dir is normalized, so parametric and euclidean t match.
             let limit = max_t - 1e-4;
             if self.tlas.any_hit(&shadow_ray, limit, |inst_id, lim| {
-                self.instances[inst_id as usize].occludes(&self.meshes, &shadow_ray, lim)
+                self.instances[inst_id as usize]
+                    .occludes(&self.meshes, &self.curve_sets, &shadow_ray, lim)
             }) {
                 return true;
             }
