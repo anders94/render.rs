@@ -4,6 +4,10 @@ mod cone;
 mod cylinder;
 mod extra;
 mod mesh;
+pub mod displace;
+pub mod earclip;
+pub mod patches;
+pub mod subdiv;
 
 pub use traits::{Intersectable, PrimitiveDesc, PrimitiveKind};
 pub use sphere::Sphere;

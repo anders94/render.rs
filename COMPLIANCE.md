@@ -52,14 +52,15 @@ skipped forever.
 | Surface | ✅ | legacy matte/plastic/metal mapping |
 | Bxdf "PxrSurface" | ✅ | full lobe stack: Oren-Nayar diffuse, GGX/VNDF specular (F0/F90 or IOR), clearcoat, fuzz, rough glass with refraction, glow, presence |
 | Light "PxrRect/Sphere/Disk/Distant/DomeLight" | ✅ | shapes from the current transform; dome takes "lightColorMap" HDRI with 2D-CDF importance sampling |
-| Pattern / Displace | ⏭ P6/P5 | |
+| Pattern | ⏭ P6 | |
+| Displace | ✅ | extension: `Displace "noise" "amplitude"/"frequency"/"octaves"/"gain"/"lacunarity"/"offset"` — fBm displacement at dice time; pattern-driven displacement arrives with P6 |
 | LightSource / AreaLightSource | ✅ / ✅ | point+distant; quad polygons under AreaLightSource become sampleable rect lights (path integrator) |
 | Illuminate (light linking) | ⏭ P6 | |
 | Atmosphere / Interior / Exterior | ⏭ P10 | |
 | Displacement (RSL-era) | 🚫 | RSL-only; `Displace` is the modern path |
 | Orientation / ReverseOrientation / Sides | 🟡 | honored for meshes at P2 |
-| Basis | 🟡 | used at P5 patches / P8 curves |
-| ShadingRate / ShadingInterpolation | 🟡 | dicing rate analog at P5 |
+| Basis | ✅ | named (bezier/b-spline/catmull-rom/hermite/power) or custom 4x4 matrices + steps |
+| ShadingRate / ShadingInterpolation | ✅ / 🟡 | drives dice density: subdiv depth 1-5 and patch segments 2-64 |
 | Attribute (generic) | ✅ | passthrough dictionary |
 | Detail / DetailRange / GeometricApproximation | 🚫 | always highest detail |
 | TextureCoordinates | 🟡 | |
@@ -71,10 +72,11 @@ skipped forever.
 | Torus / Disk / Paraboloid / Hyperboloid | ✅ | P0 |
 | Polygon | ✅ | P0, convex fan triangulation |
 | PointsPolygons / PointsGeneralPolygons | ✅ | fan triangulation, vertex N carried; general-polygon holes warn (outer loops used) |
-| GeneralPolygon | ⏭ P5 | |
-| PatchMesh / Patch | ⏭ P5 | |
-| NuPatch / TrimCurve | ⏭ P5 | trims later |
-| SubdivisionMesh / HierarchicalSubdivisionMesh | ⏭ P5 | |
+| GeneralPolygon | ✅ | ear-clipping with hole bridging |
+| PatchMesh / Patch | ✅ | bilinear + bicubic with basis matrices; crack-free shared-grid dicing |
+| NuPatch / TrimCurve | ✅ / ⏭ | NURBS (rational Pw or P) via Cox-de Boor; trims warn + render untrimmed |
+| SubdivisionMesh | ✅ | uniform Catmull-Clark; crease/corner (semi-sharp decay), hole, interpolateboundary tags |
+| HierarchicalSubdivisionMesh | 🟡 | treated as SubdivisionMesh (string args ignored) |
 | Curves | ⏭ P8 | |
 | Points | ⏭ P8 | |
 | Blobby | 🚫 | revisit only if a real scene needs it |

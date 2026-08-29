@@ -240,7 +240,7 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 1. **Camera positioning** - Camera is currently fixed at origin looking down +Z axis. Use object translations instead.
 
-2. **Missing primitives** - Subdivision surfaces, NURBS, curves, and points are on the roadmap (see ROADMAP.md); all seven RiSpec quadrics, Polygons, and PointsPolygons triangle meshes (with SAH BVH + TLAS instancing via ObjectInstance — billions of effective triangles) are implemented. COMPLIANCE.md tracks the full RIB request matrix. Mesh geometry is CPU-only until roadmap Phase 3.
+2. **Missing primitives** - Curves (hair) and Points are on the roadmap (see ROADMAP.md); implemented: all seven RiSpec quadrics, Polygon/GeneralPolygon (ear-clipped holes), PointsPolygons meshes with SAH BVH + TLAS instancing, Catmull-Clark SubdivisionMesh with creases, bilinear/bicubic PatchMesh with basis matrices, NURBS NuPatch, and fBm displacement at dice time (`Displace "noise"`). COMPLIANCE.md tracks the full RIB request matrix.
 
 3. **No textures** - Texture mapping not implemented.
 

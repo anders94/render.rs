@@ -6,6 +6,12 @@
 //! once and is skipped.
 
 use super::ast::{RibFile, RibRequest, RibValue};
+use crate::geometry::displace::DisplaceParams;
+use crate::geometry::patches::{
+    basis_by_name, tessellate_bicubic, tessellate_bilinear, tessellate_nurbs, Basis4, NuPatchDef,
+    PatchMeshDef, BEZIER,
+};
+use crate::geometry::subdiv::SubdivCage;
 use crate::geometry::{
     Cone, Cylinder, Disk, Hyperboloid, Instance, Intersectable, Mesh, Paraboloid, Sphere, Torus,
     Triangle,
@@ -35,6 +41,10 @@ struct GraphicsState {
     area_light: Option<(f64, Vec3)>,
     /// Modern material from a `Bxdf` request; overrides `Surface` mapping.
     bxdf: Option<PbrParams>,
+    /// Displacement applied to tessellated geometry (Displace request).
+    displace: Option<DisplaceParams>,
+    basis_u: (Basis4, usize),
+    basis_v: (Basis4, usize),
 }
 
 impl Default for GraphicsState {
@@ -49,6 +59,9 @@ impl Default for GraphicsState {
             shading_rate: 1.0,
             area_light: None,
             bxdf: None,
+            displace: None,
+            basis_u: (BEZIER, 3),
+            basis_v: (BEZIER, 3),
         }
     }
 }
@@ -304,9 +317,36 @@ impl SceneBuilder {
             // Recorded (no render effect yet); see COMPLIANCE.md.
             "Display" | "Clipping" | "ClippingPlane" | "CropWindow" | "ScreenWindow"
             | "FrameAspectRatio" | "Shutter" | "PixelFilter" | "PixelVariance" | "Exposure"
-            | "Quantize" | "Hider" | "Integrator" | "Basis" | "TextureCoordinates"
+            | "Quantize" | "Hider" | "Integrator" | "TextureCoordinates"
             | "ShadingInterpolation" | "DepthOfField" | "RelativeDetail" => {
                 self.record(req);
+            }
+            "Basis" => {
+                // Basis <name-or-matrix> step <name-or-matrix> step
+                let parse = |v: Option<&RibValue>, step: Option<f64>| -> Option<(Basis4, usize)> {
+                    match v {
+                        Some(RibValue::String(name)) => {
+                            let (m, default_step) = basis_by_name(name)?;
+                            Some((m, step.map(|s| s as usize).unwrap_or(default_step)))
+                        }
+                        Some(other) => {
+                            let nums = other.as_numbers()?;
+                            if nums.len() != 16 { return None; }
+                            let mut m = [[0.0; 4]; 4];
+                            for r in 0..4 {
+                                for c in 0..4 { m[r][c] = nums[r * 4 + c]; }
+                            }
+                            Some((m, step.map(|s| s as usize).unwrap_or(1)))
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(b) = parse(req.values.first(), req.number(1)) {
+                    self.state.basis_u = b;
+                }
+                if let Some(b) = parse(req.values.get(2), req.number(3)) {
+                    self.state.basis_v = b;
+                }
             }
 
             // ---- transforms & spaces -------------------------------------
@@ -418,6 +458,43 @@ impl SceneBuilder {
             // ---- meshes ---------------------------------------------------
             "PointsPolygons" => {
                 self.points_polygons(req, None, data);
+            }
+            "SubdivisionMesh" | "HierarchicalSubdivisionMesh" => {
+                if req.name == "HierarchicalSubdivisionMesh" {
+                    self.warn_once(
+                        "HierarchicalSubdivisionMesh treated as SubdivisionMesh (string args ignored)",
+                    );
+                }
+                self.subdivision_mesh(req, data);
+            }
+            "PatchMesh" | "Patch" => {
+                self.patch_mesh(req, data);
+            }
+            "NuPatch" => {
+                self.nu_patch(req, data);
+            }
+            "GeneralPolygon" => {
+                self.general_polygon(req, data);
+            }
+            "Displace" => {
+                let name = req.string(0).unwrap_or("");
+                if name != "noise" {
+                    self.warn_once(&format!(
+                        "Displace \"{name}\": only the built-in \"noise\" displacement exists until Phase 6; using it"
+                    ));
+                }
+                let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
+                let params = req.params_from(params_start);
+                let mut d = DisplaceParams::default();
+                if let Some(v) = params.get_number("amplitude") { d.amplitude = v; }
+                if let Some(v) = params.get_number("frequency") { d.frequency = v; }
+                if let Some(v) = params.get_number("octaves") { d.octaves = v as u32; }
+                if let Some(v) = params.get_number("gain") { d.gain = v; }
+                if let Some(v) = params.get_number("lacunarity") { d.lacunarity = v; }
+                if let Some(v) = params.get_numbers("offset") {
+                    if v.len() >= 3 { d.offset = [v[0], v[1], v[2]]; }
+                }
+                self.state.displace = Some(d);
             }
             "PointsGeneralPolygons" => {
                 // With loop counts: use each polygon's first (outer) loop;
@@ -663,6 +740,37 @@ impl SceneBuilder {
         }
 
         let mesh = Mesh::new(positions, indices, normals, st);
+        self.add_tessellated_mesh(mesh, data);
+    }
+
+    /// Dice density per patch span, from ShadingRate (smaller rate = finer).
+    fn dice_segments(&self) -> usize {
+        (16.0 / self.state.shading_rate.max(0.05)).clamp(2.0, 64.0) as usize
+    }
+
+    /// Uniform subdivision depth from ShadingRate.
+    fn subdiv_levels(&self) -> u32 {
+        let sr = self.state.shading_rate;
+        if sr <= 0.15 {
+            5
+        } else if sr <= 0.35 {
+            4
+        } else if sr <= 1.5 {
+            3
+        } else if sr <= 6.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Shared sink for all tessellated geometry: applies displacement,
+    /// emissive state, object-definition capture, and instancing.
+    fn add_tessellated_mesh(&mut self, mesh: Mesh, data: &mut SceneData) {
+        let mesh = match &self.state.displace {
+            Some(d) => crate::geometry::displace::displace_mesh(mesh, d),
+            None => mesh,
+        };
         let mesh_id = data.meshes.len() as u32;
         data.meshes.push(mesh);
 
@@ -688,6 +796,221 @@ impl SceneBuilder {
                 self.transform_stack.current(),
                 &data.meshes[mesh_id as usize],
             ));
+        }
+    }
+
+    /// SubdivisionMesh "scheme" [nverts] [verts] (["tags"] [nargs] [ints]
+    /// [floats])? params — uniform Catmull-Clark with crease/corner/hole
+    /// tags and interpolateboundary.
+    fn subdivision_mesh(&mut self, req: &RibRequest, data: &mut SceneData) {
+        let Some(scheme) = req.string(0) else { return };
+        if scheme != "catmull-clark" {
+            self.warn_once(&format!(
+                "SubdivisionMesh scheme \"{scheme}\" treated as catmull-clark"
+            ));
+        }
+        let Some(nverts) = req.values.get(1).and_then(RibValue::as_numbers) else { return };
+        let Some(verts) = req.values.get(2).and_then(RibValue::as_numbers) else { return };
+
+        // Optional tag block.
+        let mut crease_edges = Vec::new();
+        let mut corners = Vec::new();
+        let mut holes = Vec::new();
+        let mut interpolate_boundary = false;
+        let params_start = if let Some(RibValue::Strings(tags)) = req.values.get(3) {
+            let nargs = req.values.get(4).and_then(RibValue::as_numbers).unwrap_or(&[]);
+            let intargs = req.values.get(5).and_then(RibValue::as_numbers).unwrap_or(&[]);
+            let floatargs = req.values.get(6).and_then(RibValue::as_numbers).unwrap_or(&[]);
+            let mut int_cursor = 0usize;
+            let mut float_cursor = 0usize;
+            for (ti, tag) in tags.iter().enumerate() {
+                let ni = nargs.get(ti * 2).copied().unwrap_or(0.0) as usize;
+                let nf = nargs.get(ti * 2 + 1).copied().unwrap_or(0.0) as usize;
+                let ints = &intargs[int_cursor.min(intargs.len())
+                    ..(int_cursor + ni).min(intargs.len())];
+                let floats = &floatargs[float_cursor.min(floatargs.len())
+                    ..(float_cursor + nf).min(floatargs.len())];
+                match tag.as_str() {
+                    "crease" => {
+                        let sharp = floats.first().copied().unwrap_or(10.0);
+                        for pair in ints.windows(2) {
+                            crease_edges.push((pair[0] as u32, pair[1] as u32, sharp));
+                        }
+                    }
+                    "corner" => {
+                        for (i, v) in ints.iter().enumerate() {
+                            let sharp = floats
+                                .get(i)
+                                .or(floats.first())
+                                .copied()
+                                .unwrap_or(10.0);
+                            corners.push((*v as u32, sharp));
+                        }
+                    }
+                    "hole" => {
+                        holes.extend(ints.iter().map(|f| *f as u32));
+                    }
+                    "interpolateboundary" => interpolate_boundary = true,
+                    other => self.warn_once(&format!(
+                        "SubdivisionMesh tag \"{other}\" not supported; ignoring"
+                    )),
+                }
+                int_cursor += ni;
+                float_cursor += nf;
+            }
+            7
+        } else {
+            3
+        };
+
+        let Some(p) = req.params_from(params_start).get_numbers("P") else {
+            self.warn_once("SubdivisionMesh without \"P\"; skipping");
+            return;
+        };
+        let positions: Vec<[f64; 3]> = p.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let mut faces = Vec::new();
+        let mut cursor = 0usize;
+        for &nv in nverts {
+            let nv = nv as usize;
+            if cursor + nv > verts.len() {
+                break;
+            }
+            faces.push(verts[cursor..cursor + nv].iter().map(|v| *v as u32).collect());
+            cursor += nv;
+        }
+        let cage = SubdivCage {
+            positions,
+            faces,
+            crease_edges,
+            corners,
+            holes,
+            interpolate_boundary,
+        };
+        let mesh = cage.tessellate(self.subdiv_levels());
+        self.add_tessellated_mesh(mesh, data);
+    }
+
+    /// PatchMesh "type" nu uwrap nv vwrap params / Patch "type" params.
+    fn patch_mesh(&mut self, req: &RibRequest, data: &mut SceneData) {
+        let Some(ptype) = req.string(0) else { return };
+        let (nu, u_wrap, nv, v_wrap, params_start) = if req.name == "Patch" {
+            let n = if ptype == "bilinear" { 2 } else { 4 };
+            (n, false, n, false, 1)
+        } else {
+            let (Some(nu), Some(nv)) = (req.number(1), req.number(3)) else { return };
+            (
+                nu as usize,
+                req.string(2) == Some("periodic"),
+                nv as usize,
+                req.string(4) == Some("periodic"),
+                5,
+            )
+        };
+        let Some(points) = req.params_from(params_start).get_numbers("P") else {
+            self.warn_once(&format!("{} without \"P\"; skipping", req.name));
+            return;
+        };
+        let def = PatchMeshDef { points, nu, nv, u_wrap, v_wrap };
+        let segs = self.dice_segments();
+        let mesh = match ptype {
+            "bilinear" => tessellate_bilinear(&def, segs),
+            "bicubic" => {
+                let (bu, ustep) = self.state.basis_u;
+                let (bv, vstep) = self.state.basis_v;
+                tessellate_bicubic(&def, &bu, ustep, &bv, vstep, segs)
+            }
+            other => {
+                self.warn_once(&format!("{} type \"{other}\" not supported", req.name));
+                None
+            }
+        };
+        match mesh {
+            Some(m) => self.add_tessellated_mesh(m, data),
+            None => self.warn_once(&format!("{}: invalid control grid; skipping", req.name)),
+        }
+    }
+
+    /// NuPatch nu uorder [uknot] umin umax nv vorder [vknot] vmin vmax params.
+    fn nu_patch(&mut self, req: &RibRequest, data: &mut SceneData) {
+        let nums = |i: usize| req.number(i);
+        let arr = |i: usize| req.values.get(i).and_then(RibValue::as_numbers);
+        let (Some(nu), Some(uorder), Some(uknot), Some(umin), Some(umax)) =
+            (nums(0), nums(1), arr(2), nums(3), nums(4))
+        else {
+            return;
+        };
+        let (Some(nv), Some(vorder), Some(vknot), Some(vmin), Some(vmax)) =
+            (nums(5), nums(6), arr(7), nums(8), nums(9))
+        else {
+            return;
+        };
+        let params = req.params_from(10);
+        let (points, rational) = match (params.get_numbers("Pw"), params.get_numbers("P")) {
+            (Some(pw), _) => (pw, true),
+            (None, Some(p)) => (p, false),
+            _ => {
+                self.warn_once("NuPatch without \"P\"/\"Pw\"; skipping");
+                return;
+            }
+        };
+        if params.get("trimcurve").is_some() {
+            self.warn_once("NuPatch trim curves not supported yet; rendering untrimmed");
+        }
+        let def = NuPatchDef {
+            nu: nu as usize,
+            uorder: uorder as usize,
+            uknot,
+            umin,
+            umax,
+            nv: nv as usize,
+            vorder: vorder as usize,
+            vknot,
+            vmin,
+            vmax,
+            points,
+            rational,
+        };
+        let base = self.dice_segments();
+        let segs_u = (base * (def.nu.saturating_sub(def.uorder) + 1)).clamp(4, 128);
+        let segs_v = (base * (def.nv.saturating_sub(def.vorder) + 1)).clamp(4, 128);
+        match tessellate_nurbs(&def, segs_u, segs_v) {
+            Some(m) => self.add_tessellated_mesh(m, data),
+            None => self.warn_once("NuPatch: invalid control data; skipping"),
+        }
+    }
+
+    /// GeneralPolygon [loop nverts] "P" — ear-clipped, holes bridged.
+    fn general_polygon(&mut self, req: &RibRequest, data: &mut SceneData) {
+        let Some(nloops) = req.values.first().and_then(RibValue::as_numbers) else { return };
+        let Some(p) = req.params_from(1).get_numbers("P") else {
+            self.warn_once("GeneralPolygon without \"P\"; skipping");
+            return;
+        };
+        let all: Vec<[f64; 3]> = p.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let mut loops = Vec::new();
+        let mut cursor = 0usize;
+        for &n in nloops {
+            let n = n as usize;
+            if cursor + n > all.len() {
+                break;
+            }
+            loops.push(all[cursor..cursor + n].to_vec());
+            cursor += n;
+        }
+        if loops.is_empty() || loops[0].len() < 3 {
+            return;
+        }
+        match crate::geometry::earclip::triangulate_with_holes(&loops) {
+            Some((positions, indices)) => {
+                let positions: Vec<[f32; 3]> = positions
+                    .iter()
+                    .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
+                    .collect();
+                let normals = crate::geometry::subdiv::smooth_normals(&positions, &indices);
+                let mesh = Mesh::new(positions, indices, Some(normals), None);
+                self.add_tessellated_mesh(mesh, data);
+            }
+            None => self.warn_once("GeneralPolygon: triangulation failed; skipping"),
         }
     }
 
