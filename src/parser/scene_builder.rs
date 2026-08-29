@@ -25,6 +25,9 @@ struct GraphicsState {
     reverse_orientation: bool,
     sides: u32,
     shading_rate: f64,
+    /// Active AreaLightSource: (intensity, color). Subsequent geometry in
+    /// this attribute block becomes emissive.
+    area_light: Option<(f64, Vec3)>,
 }
 
 impl Default for GraphicsState {
@@ -37,6 +40,7 @@ impl Default for GraphicsState {
             reverse_orientation: false,
             sides: 2,
             shading_rate: 1.0,
+            area_light: None,
         }
     }
 }
@@ -259,6 +263,19 @@ impl SceneBuilder {
                     lights.push(light);
                 }
             }
+            "AreaLightSource" => {
+                // `AreaLightSource "type" <handle> params...` — following
+                // geometry in this attribute block emits. Handle presence
+                // detected as in parse_light.
+                let params_start = if req.values.len() % 2 == 0 { 2 } else { 1 };
+                let params = req.params_from(params_start);
+                let intensity = params.get_number("intensity").unwrap_or(1.0);
+                let color = params
+                    .get_numbers("lightcolor")
+                    .and_then(|v| (v.len() >= 3).then(|| Vec3::new(v[0], v[1], v[2])))
+                    .unwrap_or(Vec3::one());
+                self.state.area_light = Some((intensity, color));
+            }
 
             // ---- geometry -------------------------------------------------
             "Sphere" => {
@@ -341,10 +358,30 @@ impl SceneBuilder {
             "Polygon" => {
                 if let Some(p) = req.params_from(0).get_numbers("P") {
                     if p.len() >= 9 {
-                        let id = self.push_material(materials);
                         let transform = self.transform_stack.current();
                         let vertex =
                             |i: usize| -> [f64; 3] { [p[i * 3], p[i * 3 + 1], p[i * 3 + 2]] };
+                        let world = |v: [f64; 3]| {
+                            transform.transform_point(&Point3::new(v[0], v[1], v[2]))
+                        };
+
+                        let mut material = self.make_material();
+                        if let Some((intensity, color)) = self.state.area_light {
+                            material.emission = color * intensity;
+                            // Quads become sampleable rect lights (with MIS);
+                            // other emissive polygons contribute via BSDF
+                            // hits only.
+                            if p.len() == 12 {
+                                let c = world(vertex(0));
+                                let e1 = world(vertex(1)) - c;
+                                let e2 = world(vertex(3)) - c;
+                                material.area_light = Some(lights.len());
+                                lights.push(Light::rect(c, e1, e2, intensity, color));
+                            }
+                        }
+                        materials.push(material);
+                        let id = materials.len() - 1;
+
                         // Convex fan triangulation.
                         for i in 1..(p.len() / 3 - 1) {
                             objects.push(Arc::new(Triangle::new(
@@ -411,14 +448,18 @@ impl SceneBuilder {
         }
     }
 
-    /// Create a material from the current attribute state; returns its id.
-    fn push_material(&self, materials: &mut Vec<Material>) -> usize {
-        let material = match self.state.surface.as_str() {
+    /// Material from the current attribute state.
+    fn make_material(&self) -> Material {
+        match self.state.surface.as_str() {
             "plastic" => Material::plastic(self.state.color, self.state.roughness),
             "metal" => Material::metal(self.state.color, self.state.roughness),
             _ => Material::matte(self.state.color),
-        };
-        materials.push(material);
+        }
+    }
+
+    /// Create a material from the current attribute state; returns its id.
+    fn push_material(&self, materials: &mut Vec<Material>) -> usize {
+        materials.push(self.make_material());
         materials.len() - 1
     }
 }

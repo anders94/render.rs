@@ -14,6 +14,11 @@ pub struct Material {
     pub ka: f64,
     pub kd: f64,
     pub ks: f64,
+    /// Emitted radiance (area-light surfaces; zero for everything else).
+    pub emission: Vec3,
+    /// Index into scene.lights when this surface is an area light, so the
+    /// path tracer can compute MIS weights on emitter hits.
+    pub area_light: Option<usize>,
 }
 
 impl Material {
@@ -24,6 +29,8 @@ impl Material {
             ka: 0.3,  // Increased ambient for brighter rendering without lights
             kd: 0.9,
             ks: 0.0,
+            emission: Vec3::zero(),
+            area_light: None,
         }
     }
 
@@ -34,6 +41,8 @@ impl Material {
             ka: 0.3,  // Increased ambient for brighter rendering without lights
             kd: 0.6,
             ks: 0.4,
+            emission: Vec3::zero(),
+            area_light: None,
         }
     }
 
@@ -44,6 +53,8 @@ impl Material {
             ka: 0.3,  // Increased ambient for brighter rendering without lights
             kd: 0.2,
             ks: 0.8,
+            emission: Vec3::zero(),
+            area_light: None,
         }
     }
 

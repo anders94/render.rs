@@ -116,7 +116,7 @@ impl FlatScene {
         let lights = scene
             .lights
             .iter()
-            .map(|light| {
+            .filter_map(|light| {
                 let kind = match &light.light_type {
                     LightType::Point { position } => FlatLightKind::Point {
                         position: [position.x as f32, position.y as f32, position.z as f32],
@@ -124,8 +124,11 @@ impl FlatScene {
                     LightType::Distant { direction } => FlatLightKind::Distant {
                         direction: [direction.x as f32, direction.y as f32, direction.z as f32],
                     },
+                    // Area lights are path-tracer only; the Whitted GPU
+                    // backends skip them.
+                    LightType::Rect { .. } => return None,
                 };
-                FlatLight {
+                Some(FlatLight {
                     kind,
                     intensity: light.intensity as f32,
                     color: [
@@ -133,7 +136,7 @@ impl FlatScene {
                         light.color.y as f32,
                         light.color.z as f32,
                     ],
-                }
+                })
             })
             .collect();
 

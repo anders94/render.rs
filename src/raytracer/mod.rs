@@ -1,6 +1,7 @@
 mod ray;
 mod intersection;
 pub mod flatten;
+pub mod pt;
 pub mod renderer;
 #[cfg(feature = "mlx")]
 pub mod mlx;

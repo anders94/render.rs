@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use render_rs::output::{write_png, write_ppm, write_ppm_ascii};
+use render_rs::output::{write_exr, write_png, write_ppm, write_ppm_ascii};
 use render_rs::parser::{parse_rib, SceneBuilder};
 use render_rs::raytracer::renderer::render;
 use std::fs;
@@ -36,7 +36,7 @@ struct Args {
     #[arg(short, long, default_value = "output.ppm")]
     output: PathBuf,
 
-    /// Output format: ppm (binary P6), ppm-ascii (P3), png
+    /// Output format: ppm (binary P6), ppm-ascii (P3), png, exr (linear)
     #[arg(short, long, default_value = "ppm")]
     format: String,
 
@@ -47,6 +47,22 @@ struct Args {
     /// Rendering backend
     #[arg(short, long, value_enum, default_value_t = Backend::Cpu)]
     backend: Backend,
+
+    /// Integrator: whitted (fast, direct light + mirror reflections) or
+    /// path (progressive Monte Carlo global illumination, CPU only)
+    #[arg(short, long, value_enum, default_value_t = Integrator::Whitted)]
+    integrator: Integrator,
+
+    /// Samples per pixel for the path integrator (default: PixelSamples
+    /// product from the RIB, or 64 if unset there)
+    #[arg(long)]
+    spp: Option<u32>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, clap::ValueEnum)]
+enum Integrator {
+    Whitted,
+    Path,
 }
 
 fn main() -> Result<()> {
@@ -85,7 +101,19 @@ fn main() -> Result<()> {
         scene.camera.width, scene.camera.height,
         scene.pixel_samples.0, scene.pixel_samples.1
     );
-    let image = match args.backend {
+    let image = match (args.integrator, args.backend) {
+        (Integrator::Path, Backend::Cpu) => {
+            let spp = args.spp.unwrap_or_else(|| {
+                let (sx, sy) = scene.pixel_samples;
+                (sx * sy).max(64)
+            });
+            println!("Path tracing at {spp} spp...");
+            render_rs::raytracer::pt::render(&scene, spp)
+        }
+        (Integrator::Path, _) => {
+            anyhow::bail!("the path integrator is CPU-only until roadmap Phase 3; use --backend cpu")
+        }
+        (Integrator::Whitted, backend) => match backend {
         Backend::Cpu => render(&scene),
         Backend::Mlx => {
             #[cfg(feature = "mlx")]
@@ -105,11 +133,13 @@ fn main() -> Result<()> {
             #[cfg(not(target_os = "macos"))]
             anyhow::bail!("the metal backend requires macOS")
         }
+        },
     };
 
     println!("Writing output to {}...", args.output.display());
     match args.format.as_str() {
         "png" => write_png(&image, args.output.to_str().unwrap())?,
+        "exr" => write_exr(&image, args.output.to_str().unwrap())?,
         "ppm-ascii" => write_ppm_ascii(&image, args.output.to_str().unwrap())?,
         _ => write_ppm(&image, args.output.to_str().unwrap())?,
     }

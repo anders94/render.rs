@@ -1,6 +1,8 @@
+mod exr_writer;
 mod ppm;
 mod png_writer;
 
+pub use exr_writer::write_exr;
 pub use ppm::{write_ppm, write_ppm_ascii};
 pub use png_writer::write_png;
 

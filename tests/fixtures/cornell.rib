@@ -1,0 +1,54 @@
+##RenderMan RIB-Structure 1.1
+# Cornell box — Phase 1 demo gate (render with --integrator path).
+version 3.04
+Display "cornell.exr" "file" "rgb"
+Format 600 600 1.0
+PixelSamples 8 8
+Projection "perspective" "fov" [36]
+
+WorldBegin
+    # Ceiling light (quad => sampleable rect area light)
+    AttributeBegin
+        AreaLightSource "arealight" "ceiling" "intensity" [17] "lightcolor" [1 0.9 0.75]
+        Polygon "P" [-0.25 0.995 3.95  0.25 0.995 3.95  0.25 0.995 4.45  -0.25 0.995 4.45]
+    AttributeEnd
+
+    # Floor / ceiling / back: white
+    AttributeBegin
+        Color 0.73 0.73 0.73
+        Surface "matte"
+        Polygon "P" [-1 -1 3  1 -1 3  1 -1 5  -1 -1 5]
+        Polygon "P" [-1 1 3  -1 1 5  1 1 5  1 1 3]
+        Polygon "P" [-1 -1 5  1 -1 5  1 1 5  -1 1 5]
+    AttributeEnd
+
+    # Left wall: red
+    AttributeBegin
+        Color 0.63 0.065 0.05
+        Surface "matte"
+        Polygon "P" [-1 -1 3  -1 -1 5  -1 1 5  -1 1 3]
+    AttributeEnd
+
+    # Right wall: green
+    AttributeBegin
+        Color 0.14 0.45 0.091
+        Surface "matte"
+        Polygon "P" [1 -1 3  1 1 3  1 1 5  1 -1 5]
+    AttributeEnd
+
+    # White matte sphere (left, rear)
+    AttributeBegin
+        Color 0.73 0.73 0.73
+        Surface "matte"
+        Translate -0.42 -0.65 4.4
+        Sphere 0.35 -0.35 0.35 360
+    AttributeEnd
+
+    # Mirror-ish metal sphere (right, front)
+    AttributeBegin
+        Color 0.95 0.93 0.88
+        Surface "metal" "roughness" [0.08]
+        Translate 0.4 -0.65 3.9
+        Sphere 0.35 -0.35 0.35 360
+    AttributeEnd
+WorldEnd

@@ -228,6 +228,17 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 - **nom** - RIB parser
 - **anyhow** - Error handling
 
+## Integrators
+
+- `--integrator whitted` (default): direct lighting + hard shadows + mirror
+  reflections. Fast, deterministic, what the GPU backends speak.
+- `--integrator path` (CPU): progressive Monte Carlo **global illumination**
+  — soft shadows, color bleeding, area lights (via `AreaLightSource` on quad
+  polygons), physically-based lobes (Lambert / GGX), next-event estimation
+  with multiple importance sampling, Russian roulette. `--spp N` controls
+  samples per pixel. Use `-f exr` for linear HDR output. See
+  `tests/fixtures/cornell.rib`.
+
 ## Features (rendering)
 
 - **Shadows** - Shadow rays are cast to every light; occluded lights contribute nothing.

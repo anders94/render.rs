@@ -51,7 +51,7 @@ skipped forever.
 | Color / Opacity | ✅ / 🟡 | opacity render effect ⏭ P4 |
 | Surface | ✅ | legacy matte/plastic/metal mapping |
 | Bxdf / Pattern / Displace / Light | ⏭ P4/P6 | the modern requests |
-| LightSource / AreaLightSource | ✅ / ⏭ P1 | point+distant today |
+| LightSource / AreaLightSource | ✅ / ✅ | point+distant; quad polygons under AreaLightSource become sampleable rect lights (path integrator) |
 | Illuminate (light linking) | ⏭ P4 | |
 | Atmosphere / Interior / Exterior | ⏭ P10 | |
 | Displacement (RSL-era) | 🚫 | RSL-only; `Displace` is the modern path |
