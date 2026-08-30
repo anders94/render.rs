@@ -155,8 +155,10 @@ inline void wf_unpack(device const WfPath* paths, uint i, thread WfState& st,
 kernel void wf_raygen(WF_SCENE_ARGS,
                       device WfPath*  paths  [[buffer(24)]],
                       device WfHitRec* hits  [[buffer(25)]],
-                      device uint* q_in      [[buffer(26)]],
+                      device atomic_uint* q_in [[buffer(26)]],
                       device atomic_uint* q_out [[buffer(27)]],
+                      device const float* accum [[buffer(28)]],
+                      device const float* stats [[buffer(29)]],
                       uint tid [[thread_position_in_grid]]) {
     // tid is slab-local; u.y_offset carries the slab's first pixel id.
     uint path_id = tid + u.y_offset;
@@ -164,6 +166,21 @@ kernel void wf_raygen(WF_SCENE_ARGS,
     if (path_id >= total) return;
     PtScene s;
     WF_FILL_SCENE(s)
+
+    // Adaptive sampling: converged pixels stop spawning paths. The
+    // accumulation's weight channel is the true per-pixel sample count,
+    // so the final divide stays correct automatically.
+    if (u.adaptive_tol > 0.0f && u.sample_start >= 32u) {
+        float n = accum[path_id * 4u + 3u];
+        if (n >= 16.0f) {
+            float lum_sum = stats[path_id * 2u];
+            float lum2_sum = stats[path_id * 2u + 1u];
+            float mean = lum_sum / n;
+            float var = max(lum2_sum / n - mean * mean, 0.0f);
+            float ci = 1.96f * sqrt(var / n);
+            if (ci < u.adaptive_tol * max(mean, 0.05f)) return;
+        }
+    }
 
     uint px = path_id % u.width;
     uint py = path_id / u.width;
@@ -216,7 +233,10 @@ kernel void wf_raygen(WF_SCENE_ARGS,
     wf_state_init(st, s, ray_o, d, rtime);
     uint local = path_id - u.wf_slab_base;
     wf_pack(st, path_id, rng, paths, local);
-    q_in[local] = local;
+    // Compacted push (adaptive skips leave holes otherwise).
+    uint slot = atomic_fetch_add_explicit(q_in, 1u, memory_order_relaxed);
+    device uint* entries = (device uint*)q_in + 4;
+    entries[slot] = local;
     (void)hits;
     (void)q_out;
 }
@@ -253,6 +273,7 @@ kernel void wf_shade(WF_SCENE_ARGS,
                      device const uint* q_in [[buffer(26)]],
                      device atomic_uint* q_out [[buffer(27)]],
                      device float* accum     [[buffer(28)]],
+                     device float* stats     [[buffer(29)]],
                      uint tid [[thread_position_in_grid]]) {
     uint qi = tid + u.y_offset;
     if (qi >= u.sample_count) return;
@@ -298,4 +319,7 @@ kernel void wf_shade(WF_SCENE_ARGS,
     accum[idx + 1u] += li.y;
     accum[idx + 2u] += li.z;
     accum[idx + 3u] += 1.0f;
+    float li_lum = 0.2126f * li.x + 0.7152f * li.y + 0.0722f * li.z;
+    stats[pixel * 2u] += li_lum;
+    stats[pixel * 2u + 1u] += li_lum * li_lum;
 }

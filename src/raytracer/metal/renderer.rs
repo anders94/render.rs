@@ -470,6 +470,25 @@ impl PtSession {
         image
     }
 
+    /// Raw accumulation: per-pixel radiance sums and sample weights
+    /// (weights differ from the nominal count only on watchdog-retried
+    /// rows). For distributed accumulation output.
+    pub fn sum_and_weight(&self) -> (Image, Vec<Vec<f64>>) {
+        let data = self.accum_slice();
+        let (w, h) = (self.width, self.height);
+        let mut sum = vec![vec![Vec3::zero(); w]; h];
+        let mut weight = vec![vec![0.0f64; w]; h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                sum[y][x] =
+                    Vec3::new(data[i] as f64, data[i + 1] as f64, data[i + 2] as f64);
+                weight[y][x] = data[i + 3] as f64;
+            }
+        }
+        (sum, weight)
+    }
+
     fn aux_vec(&self) -> Vec<f32> {
         let ptr = self.aux_buf.contents().as_ptr() as *const f32;
         unsafe { std::slice::from_raw_parts(ptr, self.width * self.height * 12) }.to_vec()
@@ -488,7 +507,9 @@ pub struct WfSession {
     hits_buf: Buffer,
     q_a: Buffer,
     q_b: Buffer,
+    stats_buf: Buffer,
     slab: usize,
+    adaptive_tol: f32,
 }
 
 const WF_SLAB: usize = 1 << 21; // 2M paths per slab
@@ -532,7 +553,41 @@ impl WfSession {
         // Queues: 16-byte counter block + entries.
         let q_a = alloc(16 + slab * 4)?;
         let q_b = alloc(16 + slab * 4)?;
-        Ok(Self { base, p_raygen, p_extend, p_shade, paths_buf, hits_buf, q_a, q_b, slab })
+        // Per-pixel luminance sum + sum-of-squares (adaptive stopping).
+        let stats_buf = alloc(base.width * base.height * 8)?;
+        unsafe {
+            std::ptr::write_bytes(
+                stats_buf.contents().as_ptr() as *mut u8,
+                0,
+                base.width * base.height * 8,
+            );
+        }
+        Ok(Self {
+            base,
+            p_raygen,
+            p_extend,
+            p_shade,
+            paths_buf,
+            hits_buf,
+            q_a,
+            q_b,
+            stats_buf,
+            slab,
+            adaptive_tol: 0.0,
+        })
+    }
+
+    /// Enable adaptive sampling: pixels stop once their 95% CI relative
+    /// error drops below `tol` (checked after 32 samples).
+    pub fn set_adaptive(&mut self, tol: f64) {
+        self.adaptive_tol = tol as f32;
+    }
+
+    /// Average samples actually taken per pixel (from the weight channel).
+    pub fn average_spp(&self) -> f64 {
+        let data = self.base.accum_slice();
+        let n = self.base.width * self.base.height;
+        (0..n).map(|i| data[i * 4 + 3] as f64).sum::<f64>() / n as f64
     }
 
     pub fn width(&self) -> usize {
@@ -575,9 +630,9 @@ impl WfSession {
             enc.setBuffer_offset_atIndex(Some(&self.hits_buf), 0, 25);
             enc.setBuffer_offset_atIndex(Some(q_in), q_in_offset, 26);
             enc.setBuffer_offset_atIndex(Some(q_out), 0, 27);
-            if with_accum {
-                enc.setBuffer_offset_atIndex(Some(&self.base.accum_buf), 0, 28);
-            }
+            let _ = with_accum;
+            enc.setBuffer_offset_atIndex(Some(&self.base.accum_buf), 0, 28);
+            enc.setBuffer_offset_atIndex(Some(&self.stats_buf), 0, 29);
         }
         let tgs = MTLSize { width: 256, height: 1, depth: 1 };
         let grid = MTLSize { width: threads, height: 1, depth: 1 };
@@ -625,6 +680,8 @@ impl WfSession {
                 let mut uni = self.base.uniforms;
                 uni.sample_start = sample;
                 uni.wf_slab_base = slab_start as u32;
+                uni.adaptive_tol = self.adaptive_tol;
+                self.reset_counter(&self.q_a);
                 // Raygen fills paths + identity queue (entries at offset
                 // 16 unused for wave 0: raygen writes from index 0).
                 let mut cmds = Vec::new();
@@ -638,7 +695,7 @@ impl WfSession {
                 }
                 Self::drain(cmds)?;
 
-                let mut live = slab_n;
+                let mut live = self.read_counter(&self.q_a).min(self.slab);
                 let mut q_in_is_a = true;
                 let mut wave = 0u32;
                 while live > 0 && wave < 128 {
@@ -696,7 +753,8 @@ impl WfSession {
         uniforms: &super::gpu_scene::GpuPtUniforms,
         n: usize,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        self.dispatch_1d(&self.p_raygen, uniforms, &self.q_a, 16, &self.q_b, n, false)
+        // Raygen pushes through q_a's atomic counter (offset 0).
+        self.dispatch_1d(&self.p_raygen, uniforms, &self.q_a, 0, &self.q_b, n, false)
     }
 
     pub fn image(&self) -> Image {

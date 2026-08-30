@@ -96,12 +96,31 @@ struct Args {
     /// wavefront (queued stages with dead-path compaction).
     #[arg(long, default_value = "megakernel")]
     gpu_schedule: String,
+
+    /// Render only samples [a, b) — for distributed rendering. Combine
+    /// with `-f accum` on each node and `render merge` afterward.
+    #[arg(long, value_name = "A:B")]
+    sample_range: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, clap::ValueEnum)]
 enum Integrator {
     Whitted,
     Path,
+}
+
+/// Merge accumulation EXRs from distributed nodes into one image.
+#[derive(Parser, Debug)]
+#[command(name = "render merge")]
+struct MergeArgs {
+    /// Accum EXR inputs (from `-f accum` runs)
+    #[arg(value_name = "INPUT", required = true)]
+    inputs: Vec<String>,
+    #[arg(short, long, default_value = "merged.png")]
+    output: PathBuf,
+    /// Output display transform (png only): linear, srgb, aces
+    #[arg(long, default_value = "srgb")]
+    tonemap: String,
 }
 
 /// catrib-equivalent: decode/re-encode RIB between text and binary.
@@ -147,6 +166,20 @@ fn main() -> Result<()> {
             out_len,
             if cr.binary { "binary" } else { "text" }
         );
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("merge") {
+        let m = MergeArgs::parse_from(std::env::args().skip(1));
+        let tonemap = render_rs::output::Tonemap::from_name(&m.tonemap)
+            .ok_or_else(|| anyhow::anyhow!("unknown tonemap {:?}", m.tonemap))?;
+        let image = render_rs::output::accum::merge(&m.inputs)?;
+        let out = m.output.to_str().unwrap();
+        if out.ends_with(".exr") {
+            render_rs::output::write_exr(&image, out)?;
+        } else {
+            write_png(&render_rs::output::apply_tonemap(tonemap, &image), out)?;
+        }
+        println!("merged {} accum files -> {}", m.inputs.len(), out);
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("txmake") {
@@ -326,6 +359,49 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Distributed node: render a sample range, write raw accumulation.
+    if let Some(range) = &args.sample_range {
+        let (a, b) = range
+            .split_once(':')
+            .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+            .ok_or_else(|| anyhow::anyhow!("--sample-range wants A:B, got {range:?}"))?;
+        if b <= a {
+            anyhow::bail!("--sample-range: empty range {a}:{b}");
+        }
+        if args.integrator != Integrator::Path {
+            anyhow::bail!("--sample-range requires --integrator path");
+        }
+        let (sum, count) = match args.backend {
+            Backend::Cpu => {
+                println!("Path tracing samples [{a}, {b}) on CPU...");
+                let sum = render_rs::raytracer::pt::render_sum(&scene, a, b);
+                let n = (b - a) as f64;
+                let count =
+                    vec![vec![n; scene.camera.width as usize]; scene.camera.height as usize];
+                (sum, count)
+            }
+            Backend::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    println!("Path tracing samples [{a}, {b}) on Metal...");
+                    let session = render_rs::raytracer::metal::PtSession::new(&scene)?;
+                    session.render_samples(a, b - a)?;
+                    session.sum_and_weight()
+                }
+                #[cfg(not(target_os = "macos"))]
+                anyhow::bail!("the metal backend requires macOS")
+            }
+        };
+        println!("Writing accumulation to {}...", args.output.display());
+        render_rs::output::accum::write_accum_exr(
+            args.output.to_str().unwrap(),
+            &sum,
+            &count,
+        )?;
+        println!("Done! Merge nodes with: render merge -o out.png <accum files>");
+        return Ok(());
+    }
+
     let image = match (args.integrator, args.backend) {
         (Integrator::Path, Backend::Cpu) => {
             let spp = args.spp.unwrap_or_else(|| {
@@ -350,9 +426,18 @@ fn main() -> Result<()> {
             #[cfg(target_os = "macos")]
             {
                 if args.gpu_schedule == "wavefront" {
-                    println!("Path tracing on Metal (wavefront) at {spp} spp...");
-                    let session = render_rs::raytracer::metal::WfSession::new(&scene)?;
-                    session.render_samples(0, spp)?;
+                    let mut session = render_rs::raytracer::metal::WfSession::new(&scene)?;
+                    if let Some(tol) = args.adaptive {
+                        println!(
+                            "Adaptive path tracing on Metal (wavefront, tol {tol}, max {spp} spp)..."
+                        );
+                        session.set_adaptive(tol);
+                        session.render_samples(0, spp)?;
+                        println!("Adaptive sampling averaged {:.1} spp", session.average_spp());
+                    } else {
+                        println!("Path tracing on Metal (wavefront) at {spp} spp...");
+                        session.render_samples(0, spp)?;
+                    }
                     session.image()
                 } else {
                     println!("Path tracing on Metal at {spp} spp...");

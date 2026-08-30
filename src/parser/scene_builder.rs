@@ -1595,7 +1595,25 @@ impl SceneBuilder {
                     .get_numbers("from")
                     .and_then(point_from)
                     .unwrap_or(Point3::new(0.0, 0.0, 0.0));
-                Some(Light::point(from, intensity, color))
+                let mut light = Light::point(from, intensity, color);
+                if let Some(file) = params.get_string("iesProfile") {
+                    let path = self.resource_path(file);
+                    match crate::scene::IesProfile::load(&path) {
+                        Ok(profile) => {
+                            light.ies = Some(StdArc::new(profile));
+                            // Orient by the CTM's rotation: world -> light.
+                            light.ies_to_local = self
+                                .transform_stack
+                                .current()
+                                .inverse()
+                                .unwrap_or(Matrix4::identity());
+                        }
+                        Err(e) =>
+
+                            eprintln!("warning: iesProfile {}: {e:#}", path.display()),
+                    }
+                }
+                Some(light)
             }
             "distantlight" => {
                 let from = params

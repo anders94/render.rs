@@ -100,6 +100,38 @@ pub fn render(scene: &Scene, spp: u32) -> Image {
         .collect()
 }
 
+/// Render a SAMPLE RANGE and return the radiance SUM per pixel (for
+/// distributed accumulation; deterministic seeding makes range
+/// partitions exact).
+pub fn render_sum(scene: &Scene, sample_start: u32, sample_end: u32) -> Image {
+    let width = scene.camera.width as usize;
+    let height = scene.camera.height as usize;
+    let pixel_spread =
+        (scene.camera.fov.to_radians() / 2.0).tan() * 2.0 / scene.camera.height as f64;
+    (0..height)
+        .into_par_iter()
+        .map(|y| {
+            (0..width)
+                .map(|x| {
+                    let pixel_index = (y * width + x) as u64;
+                    let mut sum = Vec3::zero();
+                    for s in sample_start..sample_end {
+                        let mut rng = Pcg32::for_pixel_sample(pixel_index, s as u64);
+                        let ray = camera_ray(scene, x, y, &mut rng);
+                        let mut l = trace(scene, ray, pixel_spread, &mut rng);
+                        let lum = luminance(&l);
+                        if lum > FIREFLY_CLAMP {
+                            l = l * (FIREFLY_CLAMP / lum);
+                        }
+                        sum = sum + l;
+                    }
+                    sum
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// One progressive sample pass: sample index `sample` for every pixel
 /// (deterministic per-(pixel, sample) seeding makes accumulation across
 /// calls equal a batch render). The interactive preview drives this.
@@ -510,7 +542,7 @@ fn trace_full(
                                     let c = sigma_s
                                         * tr
                                         * vis
-                                        * scene.lights[li].radiance()
+                                        * scene.lights[li].radiance_toward(&wi)
                                         * (ph * w_eq / (dist2 * pdf_eq * pick_pmf));
                                     emit!(beta * c);
                                 }
@@ -1022,7 +1054,7 @@ fn sample_light(
             if max_component(&vis) <= 0.0 {
                 return Vec3::zero();
             }
-            f * light.radiance() * vis / (dist2 * pick_pmf)
+            f * light.radiance_toward(&wi) * vis / (dist2 * pick_pmf)
         }
         LightType::Distant { direction, angular_radius } => {
             let base = -*direction;

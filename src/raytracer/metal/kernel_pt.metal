@@ -55,6 +55,8 @@ struct PtUniforms {
     uint  has_cam_motion;
     uint  wf_slab_base;
     float cam_motion_inv[16];
+    float adaptive_tol;     // wavefront adaptive sampling (0 = off)
+    float pad_ad[3];
 };
 
 // PtMaterial is defined in pattern_prelude.metal (compiled just before
@@ -126,6 +128,8 @@ struct LightBvhNodeG {
 struct LightAuxG {
     uint leaf;       // light BVH leaf, 0xFFFFFFFF for infinite lights
     float inf_weight;
+    uint ies_offset; // 32x16 factor grid in tex_data (0xFFFFFFFF = none)
+    uint pad;
 };
 
 struct MediumG {
@@ -954,6 +958,36 @@ inline bool pt_occluded(thread const PtScene& s, float3 p, float3 n,
 
 inline float3 m3(thread const float* a) { return float3(a[0], a[1], a[2]); }
 inline float3 m3(device const float* a) { return float3(a[0], a[1], a[2]); }
+
+// IES factor for a point light: bilinear lookup in its normalized 32x16
+// (theta, phi) grid, oriented by the rotation rows stashed in e1/e2/normal.
+// `wi` points toward the light; the profile wants the emission direction.
+inline float ies_factor(thread const PtScene& s, uint light_idx, float3 wi) {
+    uint off = s.light_aux[light_idx].ies_offset;
+    if (off == 0xFFFFFFFFu) return 1.0f;
+    device const PtLight& l = s.lights[light_idx];
+    float3 e = -wi;
+    float3 lo = float3(dot(m3(l.e1), e), dot(m3(l.e2), e), dot(m3(l.normal), e));
+    lo = normalize_cpu(lo);
+    float theta = acos(clamp(-lo.y, -1.0f, 1.0f)) * (180.0f / PT_PI);
+    float phi = atan2(lo.z, lo.x) * (180.0f / PT_PI);
+    if (phi < 0.0f) phi += 360.0f;
+    float fv = clamp(theta / 180.0f, 0.0f, 1.0f) * 31.0f;
+    float fh = (phi / 360.0f) * 16.0f;
+    uint v0 = (uint)fv;
+    uint v1 = min(v0 + 1u, 31u);
+    float tv = fv - (float)v0;
+    uint h0 = (uint)fh % 16u;
+    uint h1 = (h0 + 1u) % 16u;
+    float th = fh - floor(fh);
+    float c00 = s.tex_data[off + h0 * 32u + v0];
+    float c01 = s.tex_data[off + h0 * 32u + v1];
+    float c10 = s.tex_data[off + h1 * 32u + v0];
+    float c11 = s.tex_data[off + h1 * 32u + v1];
+    return (c00 * (1.0f - tv) + c01 * tv) * (1.0f - th)
+        + (c10 * (1.0f - tv) + c11 * tv) * th;
+}
+
 inline float3 c3(constant const float* a) { return float3(a[0], a[1], a[2]); }
 
 inline float3 schlick3(float3 f0, float3 f90, float c) {
@@ -1702,10 +1736,11 @@ inline float3 eval_bsdf_weighted(thread const EvalCtx& c, float3 wi_world,
     return f * max(wi_l.z, 0.0f);
 }
 
-inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
+inline float3 sample_one_light(thread const PtScene& s, uint light_idx, float3 p,
                                float3 nbias, thread const EvalCtx& ec,
                                float pick_pmf, float time, uint medium,
                                thread Pcg32& rng) {
+    device const PtLight& l = s.lights[light_idx];
     float3 n = nbias;
     float3 rad = m3(l.radiance);
 
@@ -1718,7 +1753,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float3 f = eval_bsdf_weighted(ec, wi, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float3 vis = pt_visibility(s, p, n, wi, dist, time, medium, rng);
-        return f * rad * vis / (dist2 * pick_pmf);
+        return f * rad * ies_factor(s, light_idx, wi) * vis / (dist2 * pick_pmf);
     }
     if (l.kind == 1u) {                       // distant (soft when area>0)
         float3 base = -m3(l.a);
@@ -1877,7 +1912,8 @@ inline int pt_shade_step(thread const PtScene& s, thread WfState& st, PtHit h,
                         if (max(max(vis.x, vis.y), vis.z) > 0.0f) {
                             float pdf_d = distance_pdf_approx(med, t_eq, t_seg);
                             float w_eq = pdf_eq / (pdf_eq + pdf_d);
-                            float3 rad = m3(s.lights[seg_li].radiance);
+                            float3 rad = m3(s.lights[seg_li].radiance)
+                                * ies_factor(s, seg_li, wi);
                             float3 _c = st.beta * sig_s * tr * vis * rad
                                 * (ph * w_eq / (dist2 * pdf_eq * seg_pmf));
                             st.l += _c;
@@ -1929,7 +1965,7 @@ inline int pt_shade_step(thread const PtScene& s, thread WfState& st, PtHit h,
                     ec.m = s.materials[0];
                     ec.eta = 1.0f;
                     ec.h = 0.0f;
-                    float3 c = sample_one_light(s, s.lights[seg_li], p, float3(0.0f), ec,
+                    float3 c = sample_one_light(s, seg_li, p, float3(0.0f), ec,
                                                 seg_pmf, st.time, medium, rng);
                     { float3 _c = st.beta * c * w_dist; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
                 }
@@ -2046,7 +2082,7 @@ inline int pt_shade_step(thread const PtScene& s, thread WfState& st, PtHit h,
                 ec.h = hh;
                 float pick;
                 uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
-                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, st.time, medium, rng);
+                float3 c = sample_one_light(s, li, h.p, n, ec, pick, st.time, medium, rng);
                 { float3 _c = st.beta * c; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
             }
             float3 wi_f, fv;
@@ -2152,7 +2188,7 @@ inline int pt_shade_step(thread const PtScene& s, thread WfState& st, PtHit h,
                     ec.h = 2.0f; // sentinel: lambert-exit eval
                     float pick;
                     uint li = ls_sample(s, exit_p, pcg_f32(rng), pick);
-                    float3 c = sample_one_light(s, s.lights[li], exit_p, out_n, ec,
+                    float3 c = sample_one_light(s, li, exit_p, out_n, ec,
                                                 pick, st.time, medium, rng);
                     { float3 _c = st.beta * c; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
                 }
@@ -2199,7 +2235,7 @@ inline int pt_shade_step(thread const PtScene& s, thread WfState& st, PtHit h,
             ec.h = 0.0f;
             float pick;
             uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
-            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, st.time, medium, rng);
+            float3 c = sample_one_light(s, li, h.p, n, ec, pick, st.time, medium, rng);
             { float3 _c = st.beta * c; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
         }
 

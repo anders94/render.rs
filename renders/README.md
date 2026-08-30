@@ -182,6 +182,26 @@ and id layers plus the object-name manifest; regenerate it with:
 
 ---
 
+## Phase 12 — Stretch goals
+
+![USD scene](usd_demo.png)
+
+**`usd_demo.png`** · `usd_demo.usda` · path integrator, Metal, 512 spp,
+ACES
+
+Not a RIB file: a **USD stage**, parsed by the pure-Rust `.usda`
+importer — prim hierarchy, Xform op chains, `UsdPreviewSurface`
+materials (the gold is `metallic = 1`, the bar is `emissiveColor`), a
+`DomeLight`, and the USD camera's focal-length/aperture projection —
+translated into RIB requests and fed through the normal pipeline.
+`render scene.usda` just works; `render catrib scene.usda out.rib`
+shows the translation. This round also brought distributed rendering
+(`--sample-range` + `render merge` — bitwise-identical to a
+single-machine render), IES photometric profiles, and GPU adaptive
+sampling on the wavefront scheduler.
+
+---
+
 ## Early development
 
 **`three_primitives.png`**, **`shadows.png`**, **`materials.png`**,

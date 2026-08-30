@@ -505,6 +505,26 @@ fn wavefront_matches_megakernel_exactly() {
 }
 
 #[test]
+fn wavefront_adaptive_saves_samples() {
+    // GPU adaptive sampling: converged pixels stop spawning paths; the
+    // weight channel keeps the estimator exact.
+    let scene = load_fixture_scene("quadric_zoo.rib", 96, 96);
+    let mut session = metal::WfSession::new(&scene).unwrap();
+    session.set_adaptive(0.05);
+    session.render_samples(0, 256).unwrap();
+    let avg = session.average_spp();
+    assert!(avg < 200.0, "adaptive averaged {avg} spp");
+    assert!(avg >= 32.0, "warmup floor violated: {avg}");
+    let adaptive = session.image();
+    let full = metal::render_pt(&scene, 256).unwrap();
+    let ma = image_mean(&adaptive);
+    let mf = image_mean(&full);
+    let rel = ((ma.x - mf.x).abs() + (ma.y - mf.y).abs() + (ma.z - mf.z).abs())
+        / (mf.x + mf.y + mf.z).max(0.05);
+    assert!(rel < 0.02, "adaptive mean {ma:?} vs full {mf:?} (rel {rel:.4})");
+}
+
+#[test]
 fn metal_pt_deterministic() {
     let scene = load_fixture_scene("cornell.rib", 64, 64);
     let a = metal::render_pt(&scene, 16).unwrap();

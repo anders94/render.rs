@@ -79,8 +79,18 @@ sharp. `--tonemap aces|srgb|linear` selects the display transform.
 
 **Scale.** Binary RIB read/write (`render catrib`), `Procedural`
 generators (`DelayedReadArchive`, `RunProgram`), checkpoint/resume for
-long GPU renders (`--checkpoint`), and stress scenes to 772k instances /
-35M effective triangles / 1200 lights at 4K.
+long GPU renders (`--checkpoint`), distributed rendering
+(`--sample-range A:B` per node + `render merge` — deterministic seeding
+makes the partition exact, merged output is bitwise identical to a
+single machine), and stress scenes to 772k instances / 35M effective
+triangles / 1200 lights at 4K.
+
+**Interchange & lights.** `render scene.usda` ingests a USD stage
+through a pure-Rust `.usda` subset importer (prims, Xform ops, Mesh/
+Sphere/Cube, `UsdPreviewSurface`, the standard lights, the USD camera) —
+translated to RIB requests and fed through the same pipeline.
+Point lights accept IES photometric profiles
+(`"iesProfile" ["file.ies"]`), oriented by the light's transform.
 
 See **[renders/README.md](renders/README.md)** for the full gallery — one
 image per milestone, with what each demonstrates.

@@ -1,5 +1,6 @@
-use crate::math::{Point3, Vec3};
+use crate::math::{Matrix4, Point3, Vec3};
 use crate::scene::envmap::EnvMap;
+use crate::scene::ies::IesProfile;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,10 @@ pub struct Light {
     pub color: Vec3,
     /// HDRI for dome lights.
     pub env: Option<Arc<EnvMap>>,
+    /// IES photometric profile (point lights) + world-to-light rotation
+    /// orienting it (profile 0° = light-local -y).
+    pub ies: Option<Arc<IesProfile>>,
+    pub ies_to_local: Matrix4,
 }
 
 impl std::fmt::Debug for Light {
@@ -58,6 +63,8 @@ impl Light {
             intensity,
             color,
             env: None,
+            ies: None,
+            ies_to_local: Matrix4::identity(),
         }
     }
 
@@ -70,6 +77,8 @@ impl Light {
             intensity,
             color,
             env: None,
+            ies: None,
+            ies_to_local: Matrix4::identity(),
         }
     }
 
@@ -82,6 +91,8 @@ impl Light {
             intensity,
             color,
             env: None,
+            ies: None,
+            ies_to_local: Matrix4::identity(),
         }
     }
 
@@ -99,6 +110,8 @@ impl Light {
             intensity,
             color,
             env: None,
+            ies: None,
+            ies_to_local: Matrix4::identity(),
         }
     }
 
@@ -108,6 +121,8 @@ impl Light {
             intensity,
             color,
             env: None,
+            ies: None,
+            ies_to_local: Matrix4::identity(),
         }
     }
 
@@ -119,6 +134,8 @@ impl Light {
             intensity,
             color,
             env: None,
+            ies: None,
+            ies_to_local: Matrix4::identity(),
         }
     }
 
@@ -128,12 +145,29 @@ impl Light {
             intensity,
             color,
             env,
+            ies: None,
+            ies_to_local: Matrix4::identity(),
         }
     }
 
     /// Emitted radiance (for area lights) / radiance scale (dome).
     pub fn radiance(&self) -> Vec3 {
         self.color * self.intensity
+    }
+
+    /// Direction-dependent radiance: point lights with an IES profile
+    /// reshape their output; everything else is `radiance()`.
+    /// `wi` points FROM the shading point TOWARD the light; the profile
+    /// wants the light's emission direction (the reverse).
+    pub fn radiance_toward(&self, wi: &Vec3) -> Vec3 {
+        match &self.ies {
+            Some(profile) => {
+                let emit_world = -*wi;
+                let local = self.ies_to_local.transform_vec(&emit_world);
+                self.radiance() * profile.factor(&local)
+            }
+            None => self.radiance(),
+        }
     }
 
     /// Representative direction toward the light (Whitted shading; area

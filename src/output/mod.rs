@@ -1,5 +1,6 @@
 mod exr_writer;
 pub mod film;
+pub mod accum;
 pub mod denoise;
 pub mod multilayer;
 pub mod oidn;

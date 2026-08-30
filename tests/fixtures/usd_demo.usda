@@ -1,0 +1,115 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{
+    def Camera "RenderCam"
+    {
+        float focalLength = 40
+        float horizontalAperture = 36
+        double3 xformOp:translate = (0, 2.2, -11)
+        float3 xformOp:rotateXYZ = (-8, 180, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def DomeLight "Sky"
+    {
+        float inputs:intensity = 1.0
+        asset inputs:texture:file = @sky.hdr@
+    }
+
+    def Scope "Materials"
+    {
+        def Material "RedPlastic"
+        {
+            def Shader "PBR"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.75, 0.12, 0.08)
+                float inputs:roughness = 0.25
+                float inputs:metallic = 0
+                float inputs:ior = 1.5
+            }
+        }
+        def Material "Gold"
+        {
+            def Shader "PBR"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (1.0, 0.77, 0.34)
+                float inputs:roughness = 0.18
+                float inputs:metallic = 1
+            }
+        }
+        def Material "Floor"
+        {
+            def Shader "PBR"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.42, 0.43, 0.47)
+                float inputs:roughness = 0.5
+                float inputs:metallic = 0
+            }
+        }
+        def Material "Glow"
+        {
+            def Shader "PBR"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0, 0, 0)
+                color3f inputs:emissiveColor = (6.0, 2.4, 0.8)
+                float inputs:roughness = 0.5
+            }
+        }
+    }
+
+    def Mesh "Floor"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-40, 0, -40), (40, 0, -40), (40, 0, 40), (-40, 0, 40)]
+        rel material:binding = </World/Materials/Floor>
+    }
+
+    def Xform "Set"
+    {
+        def Cube "Pedestal"
+        {
+            double size = 2
+            double3 xformOp:translate = (-2.4, 0.75, 0)
+            float3 xformOp:scale = (1, 0.75, 1)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </World/Materials/Gold>
+        }
+
+        def Sphere "Hero"
+        {
+            double radius = 1.1
+            double3 xformOp:translate = (-2.4, 2.6, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            rel material:binding = </World/Materials/RedPlastic>
+        }
+
+        def Sphere "Companion"
+        {
+            double radius = 0.85
+            double3 xformOp:translate = (1.6, 0.85, 1.2)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            rel material:binding = </World/Materials/Gold>
+        }
+
+        def Cube "GlowBar"
+        {
+            double size = 1
+            double3 xformOp:translate = (0.6, 0.35, -2.6)
+            float3 xformOp:rotateXYZ = (0, 28, 0)
+            float3 xformOp:scale = (3.2, 0.7, 0.35)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Materials/Glow>
+        }
+    }
+}

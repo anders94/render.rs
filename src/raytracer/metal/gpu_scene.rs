@@ -73,6 +73,10 @@ pub struct GpuLightAux {
     pub leaf: u32,
     /// Power weight within the infinite group (0 for finite lights).
     pub inf_weight: f32,
+    /// Offset of this light's 32x16 IES factor grid in tex_data
+    /// (u32::MAX = no profile).
+    pub ies_offset: u32,
+    pub pad: u32,
 }
 
 #[repr(C)]
@@ -231,6 +235,9 @@ pub struct GpuPtUniforms {
     pub wf_slab_base: u32,
     /// Inverse camera-motion delta at shutter close (row-major 4x4).
     pub cam_motion_inv: [f32; 16],
+    /// Wavefront adaptive sampling: 95% CI relative tolerance (0 = off).
+    pub adaptive_tol: f32,
+    pub pad_ad: [f32; 3],
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
@@ -241,8 +248,8 @@ const _: () = assert!(std::mem::size_of::<GpuCurveInfo>() == 16);
 const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 220);
 const _: () = assert!(std::mem::size_of::<GpuMedium>() == 80);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
-const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 256);
-const _: () = assert!(std::mem::size_of::<GpuLightAux>() == 8);
+const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 272);
+const _: () = assert!(std::mem::size_of::<GpuLightAux>() == 16);
 
 pub struct GpuPtScene {
     pub objects: Vec<GpuObject>,
@@ -402,10 +409,22 @@ impl GpuPtScene {
                     pad: [0.0; 2],
                 };
                 match &l.light_type {
-                    LightType::Point { position } => GpuPtLight {
-                        a: [position.x as f32, position.y as f32, position.z as f32],
-                        ..zero
-                    },
+                    LightType::Point { position } => {
+                        // IES orientation: the world-to-light rotation's
+                        // rows (as images of the basis vectors) ride in
+                        // the otherwise-unused e1/e2/normal fields.
+                        let m = &l.ies_to_local;
+                        let bx = m.transform_vec(&crate::math::Vec3::new(1.0, 0.0, 0.0));
+                        let by = m.transform_vec(&crate::math::Vec3::new(0.0, 1.0, 0.0));
+                        let bz = m.transform_vec(&crate::math::Vec3::new(0.0, 0.0, 1.0));
+                        GpuPtLight {
+                            a: [position.x as f32, position.y as f32, position.z as f32],
+                            e1: [bx.x as f32, by.x as f32, bz.x as f32],
+                            e2: [bx.y as f32, by.y as f32, bz.y as f32],
+                            normal: [bx.z as f32, by.z as f32, bz.z as f32],
+                            ..zero
+                        }
+                    }
                     LightType::Distant { direction, angular_radius } => GpuPtLight {
                         kind: 1,
                         a: v3(direction),
@@ -511,6 +530,21 @@ impl GpuPtScene {
             });
         }
 
+        let mut patterns = super::pattern_codegen::build(scene);
+        // IES factor grids append to the pattern texture table (flat f32
+        // buffer with offsets — no new GPU binding needed).
+        let ies_offsets: Vec<u32> = scene
+            .lights
+            .iter()
+            .map(|l| match &l.ies {
+                Some(profile) => {
+                    let off = patterns.tex_data.len() as u32;
+                    patterns.tex_data.extend(profile.export_grid());
+                    off
+                }
+                None => u32::MAX,
+            })
+            .collect();
         // Light sampler export: nodes verbatim, per-light aux.
         let ls = &scene.light_sampler;
         let light_bvh = ls.nodes.clone();
@@ -522,7 +556,12 @@ impl GpuPtScene {
                     .position(|&k| k as usize == i)
                     .map(|k| ls.infinite_power[k] as f32)
                     .unwrap_or(0.0);
-                GpuLightAux { leaf: ls.light_leaf[i], inf_weight }
+                GpuLightAux {
+                    leaf: ls.light_leaf[i],
+                    inf_weight,
+                    ies_offset: ies_offsets[i],
+                    pad: 0,
+                }
             })
             .collect();
 
@@ -678,9 +717,10 @@ impl GpuPtScene {
                     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
                     0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 ]),
+            adaptive_tol: 0.0,
+            pad_ad: [0.0; 3],
         };
 
-        let patterns = super::pattern_codegen::build(scene);
         let mut out = Self {
             objects,
             object_materials,
