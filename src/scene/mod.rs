@@ -1,6 +1,7 @@
 mod camera;
 pub mod envmap;
 mod light;
+pub mod light_sampler;
 mod material;
 pub mod pbr;
 pub mod transform;
@@ -8,6 +9,7 @@ pub mod transform;
 pub use camera::{Camera, PixelFilter, Projection};
 pub use envmap::EnvMap;
 pub use light::{Light, LightType};
+pub use light_sampler::LightSampler;
 pub use material::{Material, MaterialType};
 pub use pbr::PbrParams;
 pub use transform::TransformStack;
@@ -38,6 +40,8 @@ pub struct Scene {
     pub has_motion: bool,
     /// Samples per pixel in x and y (from the PixelSamples directive).
     pub pixel_samples: (u32, u32),
+    /// Many-light sampler (built once after lights are final).
+    pub light_sampler: LightSampler,
     tlas: Bvh,
 }
 
@@ -55,6 +59,7 @@ impl Scene {
             background_color: Vec3::new(0.0, 0.0, 0.0),
             has_motion: false,
             pixel_samples: (1, 1),
+            light_sampler: LightSampler::build(&[]),
             tlas: Bvh::build(&[]),
         }
     }
@@ -64,6 +69,7 @@ impl Scene {
     pub fn build_tlas(&mut self) {
         let bounds: Vec<_> = self.instances.iter().map(|i| i.world_bounds).collect();
         self.tlas = Bvh::build(&bounds);
+        self.light_sampler = LightSampler::build(&self.lights);
     }
 
     pub fn triangle_count(&self) -> usize {

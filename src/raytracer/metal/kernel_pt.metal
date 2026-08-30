@@ -46,6 +46,10 @@ struct PtUniforms {
     uint  filter_kind;      // 0 box, 1 triangle, 2 gaussian
     float filter_width;
     uint  has_motion;
+    uint  light_bvh_count;  // 0 = no finite-light BVH
+    float p_infinite;
+    float infinite_total;
+    uint  pad_ls;
 };
 
 // PtMaterial is defined in pattern_prelude.metal (compiled just before
@@ -104,6 +108,21 @@ struct CurveInfoG {
     uint pad[2];
 };
 
+struct LightBvhNodeG {
+    float mn[3];
+    float power;
+    float mx[3];
+    uint parent;
+    uint a;          // interior: left child; leaf: light index
+    uint b;          // 0xFFFFFFFF marks a leaf
+    uint pad[2];
+};
+
+struct LightAuxG {
+    uint leaf;       // light BVH leaf, 0xFFFFFFFF for infinite lights
+    float inf_weight;
+};
+
 // All scene pointers bundled so helpers have sane signatures.
 struct PtScene {
     device const Object*    objects;
@@ -121,6 +140,8 @@ struct PtScene {
     device const float*     vertices1;
     device const CurveSegG* curve_segs;
     device const CurveInfoG* curve_infos;
+    device const LightBvhNodeG* light_bvh;
+    device const LightAuxG* light_aux;
     device const float*     tex_data;
     device const TexMipG*   tex_mips;
     device const float*     env_pixels;
@@ -1336,6 +1357,105 @@ inline FrameL fiber_frame(float3 tangent, float3 n, float3 wo, thread float& h_o
     return f;
 }
 
+// ---- many-light sampling: stochastic light-BVH descent ------------------
+// Mirrors scene::light_sampler (importance = power / max(d^2, r^2)).
+
+inline float ls_importance(device const LightBvhNodeG& n, float3 p) {
+    float3 c = float3(n.mn[0] + n.mx[0], n.mn[1] + n.mx[1], n.mn[2] + n.mx[2]) * 0.5f;
+    float3 d = p - c;
+    float d2 = dot(d, d);
+    float3 r = float3(n.mx[0] - n.mn[0], n.mx[1] - n.mn[1], n.mx[2] - n.mn[2]) * 0.5f;
+    float r2 = dot(r, r);
+    return n.power / max(max(d2, r2), 1e-6f);
+}
+
+// Pick a light for NEE; returns light index, writes the selection pmf.
+inline uint ls_sample(thread const PtScene& s, float3 p, float u,
+                      thread float& pmf_out) {
+    constant PtUniforms& un = *s.u;
+    bool has_finite = un.light_bvh_count > 0u;
+    bool has_infinite = un.infinite_total > 0.0f;
+    float pmf = 1.0f;
+    bool pick_infinite = has_infinite;
+    if (has_finite && has_infinite) {
+        if (u < un.p_infinite) {
+            u /= un.p_infinite;
+            pmf *= un.p_infinite;
+        } else {
+            u = (u - un.p_infinite) / (1.0f - un.p_infinite);
+            pmf *= 1.0f - un.p_infinite;
+            pick_infinite = false;
+        }
+    }
+    if (pick_infinite) {
+        float target = u * un.infinite_total;
+        float acc = 0.0f;
+        uint last = 0u;
+        for (uint i = 0u; i < un.light_count; i++) {
+            float w = s.light_aux[i].inf_weight;
+            if (w <= 0.0f) continue;
+            acc += w;
+            last = i;
+            if (target <= acc) {
+                pmf_out = pmf * w / max(un.infinite_total, 1e-12f);
+                return i;
+            }
+        }
+        pmf_out = pmf * s.light_aux[last].inf_weight / max(un.infinite_total, 1e-12f);
+        return last;
+    }
+    uint node = 0u;
+    for (int guard = 0; guard < 64; guard++) {
+        device const LightBvhNodeG& nd = s.light_bvh[node];
+        if (nd.b == 0xFFFFFFFFu) {
+            pmf_out = pmf;
+            return nd.a;
+        }
+        float ia = ls_importance(s.light_bvh[nd.a], p);
+        float ib = ls_importance(s.light_bvh[nd.b], p);
+        float total = ia + ib;
+        float pa = total > 1e-30f ? ia / total : 0.5f;
+        if (u < pa) {
+            u = min(u / pa, 1.0f - 1e-7f);
+            pmf *= pa;
+            node = nd.a;
+        } else {
+            u = min((u - pa) / (1.0f - pa), 1.0f - 1e-7f);
+            pmf *= 1.0f - pa;
+            node = nd.b;
+        }
+    }
+    pmf_out = pmf;
+    return s.light_bvh[node].a;
+}
+
+// Selection probability of `light` from p (MIS on emitter hits).
+inline float ls_pmf(thread const PtScene& s, float3 p, uint light) {
+    constant PtUniforms& un = *s.u;
+    bool has_finite = un.light_bvh_count > 0u;
+    float infw = s.light_aux[light].inf_weight;
+    if (infw > 0.0f) {
+        float group = has_finite ? un.p_infinite : 1.0f;
+        return group * infw / max(un.infinite_total, 1e-12f);
+    }
+    uint leaf = s.light_aux[light].leaf;
+    if (leaf == 0xFFFFFFFFu) return 0.0f;
+    float pmf = un.infinite_total > 0.0f ? 1.0f - un.p_infinite : 1.0f;
+    uint node = leaf;
+    for (int guard = 0; guard < 64; guard++) {
+        uint parent = s.light_bvh[node].parent;
+        if (parent == 0xFFFFFFFFu) break;
+        device const LightBvhNodeG& pn = s.light_bvh[parent];
+        float ia = ls_importance(s.light_bvh[pn.a], p);
+        float ib = ls_importance(s.light_bvh[pn.b], p);
+        float total = ia + ib;
+        float mine = (node == pn.a) ? ia : ib;
+        pmf *= total > 1e-30f ? mine / total : 0.5f;
+        node = parent;
+    }
+    return pmf;
+}
+
 // ---- unified BSDF evaluation for light sampling -------------------------
 // Returns the BSDF value with any cosine already applied (surfaces:
 // f * cos+; hair: f alone) and the solid-angle pdf for MIS.
@@ -1367,7 +1487,7 @@ inline float3 eval_bsdf_weighted(thread const EvalCtx& c, float3 wi_world,
 
 inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
                                float3 nbias, thread const EvalCtx& ec,
-                               float time, thread Pcg32& rng) {
+                               float pick_pmf, float time, thread Pcg32& rng) {
     float3 n = nbias;
     float3 rad = m3(l.radiance);
 
@@ -1380,7 +1500,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float3 f = eval_bsdf_weighted(ec, wi, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float vis = pt_visibility(s, p, n, wi, dist, time);
-        return f * rad * (vis / dist2);
+        return f * rad * (vis / (dist2 * pick_pmf));
     }
     if (l.kind == 1u) {                       // distant (soft when area>0)
         float3 base = -m3(l.a);
@@ -1399,7 +1519,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float3 f = eval_bsdf_weighted(ec, wi, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float vis = pt_visibility(s, p, n, wi, PT_BIG, time);
-        return f * rad * vis;
+        return f * rad * (vis / pick_pmf);
     }
     if (l.kind == 2u || l.kind == 4u) {       // rect / disk
         float uu = pcg_f32(rng);
@@ -1423,7 +1543,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float vis = pt_visibility(s, p, n, wi, dist, time);
         if (vis <= 0.0f) return float3(0.0f);
-        float pdf_sa = dist2 / (cl * l.area);
+        float pdf_sa = pick_pmf * dist2 / (cl * l.area);
         float w = power_heuristic(pdf_sa, bp);
         return f * rad * (vis / pdf_sa) * w;
     }
@@ -1449,7 +1569,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
             - sqrt(max(radius * radius - dist2 * st * st, 0.0f));
         float vis = pt_visibility(s, p, n, wi, dist, time);
         if (vis <= 0.0f) return float3(0.0f);
-        float pdf_sa = 1.0f / max(2.0f * PT_PI * (1.0f - cm), 1e-12f);
+        float pdf_sa = pick_pmf / max(2.0f * PT_PI * (1.0f - cm), 1e-12f);
         float w = power_heuristic(pdf_sa, bp);
         return f * rad * (vis / pdf_sa) * w;
     }
@@ -1458,6 +1578,7 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
     float pdf_sa;
     env_sample(s, rng, wi, er, pdf_sa);
     if (pdf_sa <= 0.0f) return float3(0.0f);
+    pdf_sa *= pick_pmf;
     float bp;
     float3 f = eval_bsdf_weighted(ec, wi, bp);
     if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
@@ -1491,7 +1612,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                 float3 d = normalize_cpu(dir);
                 float w = 1.0f;
                 if (!from_camera) {
-                    float pl = env_pdf(s, d) / num_lights;
+                    float pl = env_pdf(s, d) * ls_pmf(s, prev_origin, u.dome_index);
                     w = power_heuristic(prev_pdf, pl);
                 }
                 float3 dome_rad = env_eval(s, d) * m3(s.lights[u.dome_index].radiance);
@@ -1523,7 +1644,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             float w = 1.0f;
             if (!from_camera && m.area_light != 0xFFFFFFFFu) {
                 float pl = light_pdf_solid_angle(s.lights[m.area_light], prev_origin, h.p)
-                    / num_lights;
+                    * ls_pmf(s, prev_origin, m.area_light);
                 w = power_heuristic(prev_pdf, pl);
             }
             l += beta * em * w;
@@ -1543,9 +1664,10 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                 ec.m = m;
                 ec.eta = m.hair_eta;
                 ec.h = hh;
-                uint li = min((uint)(pcg_f32(rng) * num_lights), u.light_count - 1u);
-                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, time, rng);
-                l += beta * c * num_lights;
+                float pick;
+                uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
+                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, rng);
+                l += beta * c;
             }
             float3 wi_f, fv;
             float pv;
@@ -1581,9 +1703,10 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             ec.m = m;
             ec.eta = eta;
             ec.h = 0.0f;
-            uint li = min((uint)(pcg_f32(rng) * num_lights), u.light_count - 1u);
-            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, time, rng);
-            l += beta * c * num_lights;
+            float pick;
+            uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
+            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, rng);
+            l += beta * c;
         }
 
         float3 wi_l, f;
@@ -1651,8 +1774,10 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const float*      vertices1        [[buffer(17)]],
                       device const CurveSegG*  curve_segs       [[buffer(18)]],
                       device const CurveInfoG* curve_infos      [[buffer(19)]],
-                      constant PtUniforms&     u                [[buffer(20)]],
-                      device float*            accum            [[buffer(21)]],
+                      device const LightBvhNodeG* light_bvh     [[buffer(20)]],
+                      device const LightAuxG*  light_aux        [[buffer(21)]],
+                      constant PtUniforms&     u                [[buffer(22)]],
+                      device float*            accum            [[buffer(23)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint py_row = gid.y + u.y_offset;
     if (gid.x >= u.width || py_row >= u.height) return;
@@ -1673,6 +1798,8 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
     s.vertices1 = vertices1;
     s.curve_segs = curve_segs;
     s.curve_infos = curve_infos;
+    s.light_bvh = light_bvh;
+    s.light_aux = light_aux;
     s.tex_data = tex_data;
     s.tex_mips = tex_mips;
     s.env_pixels = env_pixels;

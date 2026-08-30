@@ -314,6 +314,57 @@ fn hair_curves_statistical_parity() {
 }
 
 #[test]
+fn many_lights_statistical_parity() {
+    // Phase 9: 500 point lights through the light BVH, CPU vs Metal.
+    let mut lights = String::new();
+    for i in 0..500 {
+        let a = i as f64 * 0.61803 * std::f64::consts::TAU;
+        let r = 2.0 + (i % 23) as f64 * 1.2;
+        let (x, z) = (r * a.cos(), 8.0 + r * a.sin().abs() * 2.0);
+        let y = 0.4 + (i % 7) as f64 * 0.5;
+        let (cr, cg, cb) = match i % 3 {
+            0 => (1.0, 0.6, 0.3),
+            1 => (0.4, 0.7, 1.0),
+            _ => (0.9, 0.3, 0.5),
+        };
+        lights.push_str(&format!(
+            "LightSource \"pointlight\" \"l{i}\" \"from\" [{x:.3} {y:.3} {z:.3}] \
+             \"intensity\" [0.05] \"lightcolor\" [{cr} {cg} {cb}]\n"
+        ));
+    }
+    let scene_rib = format!(
+        r#"
+        Format 96 96 1.0
+        Projection "perspective" "fov" [40]
+        WorldBegin
+            {lights}
+            AttributeBegin
+                Color 0.65 0.65 0.65
+                Polygon "P" [-60 0 -5  60 0 -5  60 0 80  -60 0 80]
+            AttributeEnd
+            Color 0.7 0.4 0.3
+            Translate 0 1 9
+            Sphere 1 -1 1 360
+        WorldEnd
+    "#
+    );
+    let requests = render_rs::parser::parse_rib(&scene_rib).unwrap();
+    let scene = render_rs::parser::SceneBuilder::new().build(&requests).unwrap();
+    assert_eq!(scene.lights.len(), 500);
+    assert!(scene.light_sampler.nodes.len() >= 999);
+
+    let cpu = pt::render(&scene, 128);
+    let gpu = metal::render_pt(&scene, 128).unwrap();
+    let mc = image_mean(&cpu);
+    let mg = image_mean(&gpu);
+    let rel = ((mc.x - mg.x).abs() + (mc.y - mg.y).abs() + (mc.z - mg.z).abs())
+        / (mc.x + mc.y + mc.z).max(0.05);
+    assert!(rel < 0.04, "many-light mean mismatch: {mc:?} vs {mg:?} (rel {rel:.4})");
+    let e = rmse(&cpu, &gpu);
+    assert!(e < 0.12, "many-light RMSE {e:.4}");
+}
+
+#[test]
 fn metal_pt_deterministic() {
     let scene = load_fixture_scene("cornell.rib", 64, 64);
     let a = metal::render_pt(&scene, 16).unwrap();

@@ -58,6 +58,14 @@ impl EnvMap {
         self.total <= 1e-9
     }
 
+    /// Sin-weighted mean luminance over the sphere (light-power heuristic).
+    pub fn mean_luminance(&self) -> f64 {
+        // `total` accumulates lum * sin(theta) over all texels; the sin
+        // weights sum to ~ width * height * (2/pi).
+        let weight_sum = self.width as f64 * self.height as f64 * (2.0 / PI);
+        self.total / weight_sum.max(1e-12)
+    }
+
     /// GPU export: (width, height, rgb pixels, marginal CDF, conditional
     /// CDFs, total weight), all f32.
     pub fn export(&self) -> (usize, usize, Vec<f32>, Vec<f32>, Vec<f32>, f64) {

@@ -196,7 +196,6 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
     let mut prev_origin = ray.origin;
     let mut from_camera = true;
     let mut presence_skips = 0usize;
-    let num_lights = scene.lights.len() as f64;
     // Ray cone for texture filtering: width grows with distance, spread
     // widens after rough bounces.
     let mut cone_width = 0.0f64;
@@ -206,12 +205,13 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
     while depth < MAX_BOUNCES {
         let Some(hit) = scene.intersect(&ray) else {
             // Miss: dome light (with MIS) or flat background.
-            if let Some((_, dome)) = dome_of(scene) {
+            if let Some((dome_idx, dome)) = dome_of(scene) {
                 let dir = ray.direction.normalize();
                 let weight = if from_camera {
                     1.0
                 } else {
-                    let pdf_light = dome_pdf(dome, &dir) / num_lights;
+                    let pick = scene.light_sampler.pmf(&prev_origin, dome_idx);
+                    let pdf_light = dome_pdf(dome, &dir) * pick;
                     power_heuristic(prev_pdf, pdf_light)
                 };
                 l = l + beta * dome_radiance(dome, &dir) * weight;
@@ -251,8 +251,8 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                 1.0
             } else if let Some(light_idx) = material.area_light {
                 let light = &scene.lights[light_idx];
-                let pdf_light =
-                    light_pdf_solid_angle(light, &prev_origin, &hit) / num_lights;
+                let pick = scene.light_sampler.pmf(&prev_origin, light_idx);
+                let pdf_light = light_pdf_solid_angle(light, &prev_origin, &hit) * pick;
                 power_heuristic(prev_pdf, pdf_light)
             } else {
                 1.0
@@ -274,17 +274,21 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                         let pv = hair::pdf(hp, &wo_f, &wi_f, hh);
                         (fv, pv)
                     };
-                    let light_idx = rng.next_below(scene.lights.len());
-                    let c = sample_light(
-                        scene,
-                        &scene.lights[light_idx],
-                        &hit.point,
-                        n,
-                        &eval,
-                        ray.time,
-                        rng,
-                    );
-                    l = l + beta * c * num_lights;
+                    if let Some((light_idx, pmf)) =
+                        scene.light_sampler.sample(&hit.point, rng.next_f64())
+                    {
+                        let c = sample_light(
+                            scene,
+                            &scene.lights[light_idx],
+                            &hit.point,
+                            n,
+                            &eval,
+                            pmf,
+                            ray.time,
+                            rng,
+                        );
+                        l = l + beta * c;
+                    }
                 }
                 let Some((wi_f, fv, pv)) = hair::sample(hp, &wo_f, hh, rng) else {
                     break;
@@ -322,17 +326,21 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                 let (f, pdf) = bxdf::eval_pdf(&pbr, &wo_l, &wi_l, eta_rel);
                 (f * wi_l.z, pdf)
             };
-            let light_idx = rng.next_below(scene.lights.len());
-            let contribution = sample_light(
-                scene,
-                &scene.lights[light_idx],
-                &hit.point,
-                n,
-                &eval,
-                ray.time,
-                rng,
-            );
-            l = l + beta * contribution * num_lights;
+            if let Some((light_idx, pmf)) =
+                scene.light_sampler.sample(&hit.point, rng.next_f64())
+            {
+                let contribution = sample_light(
+                    scene,
+                    &scene.lights[light_idx],
+                    &hit.point,
+                    n,
+                    &eval,
+                    pmf,
+                    ray.time,
+                    rng,
+                );
+                l = l + beta * contribution;
+            }
         }
 
         // Continue the path with a BSDF sample.
@@ -400,7 +408,9 @@ fn light_pdf_solid_angle(light: &Light, origin: &Point3, hit: &Intersection) -> 
 /// Direct lighting for one light. `eval` returns the BSDF value with any
 /// cosine factor already applied (surfaces: f·cos⁺; hair: f alone) plus
 /// the BSDF's solid-angle pdf for MIS. `n` is only the shadow-bias
-/// direction.
+/// direction. `pick_pmf` is the light-selection probability: the full
+/// light-strategy density is pick_pmf * pdf_sa, and BOTH the estimator
+/// divisor and the MIS weight must use it (the emitter-hit side does).
 #[allow(clippy::too_many_arguments)]
 fn sample_light(
     scene: &Scene,
@@ -408,6 +418,7 @@ fn sample_light(
     p: &Point3,
     n: Vec3,
     eval: &dyn Fn(&Vec3) -> (Vec3, f64),
+    pick_pmf: f64,
     time: f64,
     rng: &mut Pcg32,
 ) -> Vec3 {
@@ -425,7 +436,7 @@ fn sample_light(
             if vis <= 0.0 {
                 return Vec3::zero();
             }
-            f * light.radiance() * (vis / dist2)
+            f * light.radiance() * (vis / (dist2 * pick_pmf))
         }
         LightType::Distant { direction, angular_radius } => {
             let base = -*direction;
@@ -454,15 +465,15 @@ fn sample_light(
                 return Vec3::zero();
             }
             // Soft sun: radiance constant over the cone; the cone pdf
-            // divides itself out.
+            // divides itself out. Delta/cone light: no BSDF-side MIS.
             let _ = pdf_sa;
-            f * light.radiance() * vis
+            f * light.radiance() * (vis / pick_pmf)
         }
         LightType::Rect { corner, edge1, edge2, normal, area } => {
             let (u, v) = rng.next_2d();
             let sample_point = *corner + *edge1 * u + *edge2 * v;
             area_light_contribution(
-                scene, p, &n, &sample_point, normal, *area, light, eval, time,
+                scene, p, &n, &sample_point, normal, *area, light, eval, pick_pmf, time,
             )
         }
         LightType::DiskArea { center, e1, e2, normal, area } => {
@@ -472,7 +483,7 @@ fn sample_light(
             let phi = 2.0 * PI * v;
             let sample_point = *center + *e1 * (r * phi.cos()) + *e2 * (r * phi.sin());
             area_light_contribution(
-                scene, p, &n, &sample_point, normal, *area, light, eval, time,
+                scene, p, &n, &sample_point, normal, *area, light, eval, pick_pmf, time,
             )
         }
         LightType::SphereArea { center, radius } => {
@@ -501,7 +512,7 @@ fn sample_light(
             if vis <= 0.0 {
                 return Vec3::zero();
             }
-            let pdf_sa = 1.0 / (2.0 * PI * (1.0 - cos_max)).max(1e-12);
+            let pdf_sa = pick_pmf / (2.0 * PI * (1.0 - cos_max)).max(1e-12);
             let weight = power_heuristic(pdf_sa, bsdf_pdf);
             f * light.radiance() * (vis / pdf_sa) * weight
         }
@@ -527,6 +538,7 @@ fn sample_light(
             if pdf_sa <= 0.0 {
                 return Vec3::zero();
             }
+            let pdf_sa = pdf_sa * pick_pmf;
             let (f, bsdf_pdf) = eval(&wi);
             if max_component(&f) <= 0.0 {
                 return Vec3::zero();
@@ -551,6 +563,7 @@ fn area_light_contribution(
     area: f64,
     light: &Light,
     eval: &dyn Fn(&Vec3) -> (Vec3, f64),
+    pick_pmf: f64,
     time: f64,
 ) -> Vec3 {
     let to_light = *sample_point - *p;
@@ -568,7 +581,7 @@ fn area_light_contribution(
     if vis <= 0.0 {
         return Vec3::zero();
     }
-    let pdf_sa = dist2 / (cos_light * area);
+    let pdf_sa = pick_pmf * dist2 / (cos_light * area);
     let weight = power_heuristic(pdf_sa, bsdf_pdf);
     f * light.radiance() * (vis / pdf_sa) * weight
 }

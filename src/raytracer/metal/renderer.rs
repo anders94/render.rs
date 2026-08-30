@@ -31,8 +31,17 @@ const PATTERN_PRELUDE_SRC: &str = include_str!("pattern_prelude.metal");
 const ROWS_PER_BAND: usize = 256;
 /// The path tracer keeps each command buffer small — one sample over a
 /// bounded row band — so heavy scenes never trip the macOS GPU watchdog
-/// ("Impacting Interactivity" kills buffers that run too long).
-const PT_ROWS_PER_BAND: usize = 512;
+/// ("Impacting Interactivity" kills buffers that run too long). The band
+/// height scales inversely with image width (bounding pixels per buffer);
+/// RENDER_PT_BAND_ROWS overrides for very heavy or very light scenes.
+fn pt_rows_per_band(width: usize) -> usize {
+    if let Ok(v) = std::env::var("RENDER_PT_BAND_ROWS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.clamp(8, 4096);
+        }
+    }
+    (250_000 / width.max(1)).clamp(16, 512)
+}
 
 fn whitted_source() -> String {
     format!("{ISECT_COMMON_SRC}\n{WHITTED_SRC}")
@@ -144,11 +153,64 @@ fn render_impl(flat: &FlatScene, bufs: &SceneBuffers) -> Result<Image> {
 /// reference (`raytracer::pt`), f32, statistically convergent to the same
 /// image. Samples run in batches of PT_SAMPLE_BATCH per command buffer.
 pub fn render_pt(scene: &Scene, spp: u32) -> Result<Image> {
-    let gpu = super::gpu_scene::GpuPtScene::build(scene)?;
-    autoreleasepool(|_| render_pt_impl(&gpu, spp))
+    render_pt_checkpointed(scene, spp, None)
 }
 
-fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image> {
+/// Path tracing with optional checkpoint/resume: the accumulation buffer
+/// and completed-sample counter persist to `checkpoint` every
+/// CHECKPOINT_EVERY samples (atomic tmp+rename), and a matching file is
+/// loaded on start so interrupted renders continue where they stopped.
+pub fn render_pt_checkpointed(
+    scene: &Scene,
+    spp: u32,
+    checkpoint: Option<&std::path::Path>,
+) -> Result<Image> {
+    let gpu = super::gpu_scene::GpuPtScene::build(scene)?;
+    autoreleasepool(|_| render_pt_impl(&gpu, spp, checkpoint))
+}
+
+const CHECKPOINT_MAGIC: &[u8; 4] = b"RCKP";
+const CHECKPOINT_EVERY: u32 = 4;
+
+fn save_checkpoint(path: &std::path::Path, w: u32, h: u32, done: u32, accum: &[f32]) {
+    let mut bytes = Vec::with_capacity(16 + accum.len() * 4);
+    bytes.extend_from_slice(CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(&w.to_le_bytes());
+    bytes.extend_from_slice(&h.to_le_bytes());
+    bytes.extend_from_slice(&done.to_le_bytes());
+    for v in accum {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        eprintln!("warning: checkpoint write to {} failed", path.display());
+    }
+}
+
+fn load_checkpoint(path: &std::path::Path, w: u32, h: u32) -> Option<(u32, Vec<f32>)> {
+    let bytes = std::fs::read(path).ok()?;
+    let expect = 16 + (w as usize * h as usize * 4) * 4;
+    if bytes.len() != expect || &bytes[0..4] != CHECKPOINT_MAGIC {
+        return None;
+    }
+    let rw = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let rh = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let done = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    if rw != w || rh != h {
+        return None;
+    }
+    let accum: Vec<f32> = bytes[16..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Some((done, accum))
+}
+
+fn render_pt_impl(
+    gpu: &super::gpu_scene::GpuPtScene,
+    spp: u32,
+    checkpoint: Option<&std::path::Path>,
+) -> Result<Image> {
     use super::gpu_scene::GpuPtUniforms;
 
     let device = MTLCreateSystemDefaultDevice()
@@ -196,6 +258,8 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
         gpu.vertices1_bytes(),
         gpu.curve_segs_bytes(),
         gpu.curve_infos_bytes(),
+        gpu.light_bvh_bytes(),
+        gpu.light_aux_bytes(),
     ]
     .into_iter()
     .map(|bytes| upload(&device, bytes))
@@ -210,15 +274,35 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
         std::ptr::write_bytes(accum_buf.contents().as_ptr() as *mut u8, 0, accum_len);
     }
 
+    // Resume from a matching checkpoint.
+    let mut sample_start = 0u32;
+    if let Some(path) = checkpoint {
+        if let Some((done, accum)) =
+            load_checkpoint(path, gpu.uniforms.width, gpu.uniforms.height)
+        {
+            let done = done.min(spp);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    accum.as_ptr(),
+                    accum_buf.contents().as_ptr() as *mut f32,
+                    accum.len(),
+                );
+            }
+            sample_start = done;
+            println!("Resuming from checkpoint: {done}/{spp} samples done");
+        }
+    }
+
     // 8x8 threadgroups: the PT kernel is register-heavy (traversal
     // stacks), and smaller groups schedule better under that pressure.
     let _ = pipeline.maxTotalThreadsPerThreadgroup();
     let tg = MTLSize { width: 8, height: 8, depth: 1 };
 
-    for sample in 0..spp {
+    let band_rows = pt_rows_per_band(w);
+    for sample in sample_start..spp {
         let mut y0 = 0usize;
         while y0 < h {
-            let band = (h - y0).min(PT_ROWS_PER_BAND);
+            let band = (h - y0).min(band_rows);
             let mut uniforms: GpuPtUniforms = gpu.uniforms;
             uniforms.sample_start = sample;
             uniforms.sample_count = 1;
@@ -238,9 +322,9 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
                 enc.setBytes_length_atIndex(
                     NonNull::new(&uniforms as *const GpuPtUniforms as *mut c_void).unwrap(),
                     std::mem::size_of::<GpuPtUniforms>(),
-                    20,
+                    22,
                 );
-                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 21);
+                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 23);
             }
             let grid = MTLSize { width: w, height: band, depth: 1 };
             enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
@@ -252,9 +336,70 @@ fn render_pt_impl(gpu: &super::gpu_scene::GpuPtScene, spp: u32) -> Result<Image>
                     .error()
                     .map(|e| e.localizedDescription().to_string())
                     .unwrap_or_else(|| "no error detail".to_string());
+                // The macOS GPU watchdog kills buffers that run long
+                // ("Impacting Interactivity") — transient and load-
+                // dependent, not a real failure. Retry in small slices.
+                // Pixels the killed buffer already finished get their
+                // sample re-added, but color and weight (w channel) double
+                // together, so the mean stays correct — only the per-pixel
+                // effective sample count shifts slightly.
+                if detail.contains("Interactivity") {
+                    eprintln!(
+                        "GPU watchdog killed a band at sample {sample}, y0={y0};                          retrying in 8-row slices"
+                    );
+                    let mut ry = y0;
+                    let band_end = y0 + band;
+                    while ry < band_end {
+                        let rband = (band_end - ry).min(8);
+                        let mut runi: GpuPtUniforms = gpu.uniforms;
+                        runi.sample_start = sample;
+                        runi.sample_count = 1;
+                        runi.y_offset = ry as u32;
+                        let cmd2 = queue
+                            .commandBuffer()
+                            .ok_or_else(|| anyhow!("failed to create command buffer"))?;
+                        let enc2 = cmd2
+                            .computeCommandEncoder()
+                            .ok_or_else(|| anyhow!("failed to create compute encoder"))?;
+                        enc2.setComputePipelineState(&pipeline);
+                        unsafe {
+                            for (i, buf) in buffers.iter().enumerate() {
+                                enc2.setBuffer_offset_atIndex(Some(buf), 0, i);
+                            }
+                            enc2.setBytes_length_atIndex(
+                                NonNull::new(&runi as *const GpuPtUniforms as *mut c_void)
+                                    .unwrap(),
+                                std::mem::size_of::<GpuPtUniforms>(),
+                                22,
+                            );
+                            enc2.setBuffer_offset_atIndex(Some(&accum_buf), 0, 23);
+                        }
+                        let grid2 = MTLSize { width: w, height: rband, depth: 1 };
+                        enc2.dispatchThreads_threadsPerThreadgroup(grid2, tg);
+                        enc2.endEncoding();
+                        cmd2.commit();
+                        cmd2.waitUntilCompleted();
+                        if cmd2.status() != MTLCommandBufferStatus::Completed {
+                            return Err(anyhow!(
+                                "PT command buffer failed even at 8 rows: {detail}"
+                            ));
+                        }
+                        ry += rband;
+                    }
+                    y0 += band;
+                    continue;
+                }
                 return Err(anyhow!("PT command buffer failed: {detail}"));
             }
             y0 += band;
+        }
+        if let Some(path) = checkpoint {
+            let done = sample + 1;
+            if done % CHECKPOINT_EVERY == 0 || done == spp {
+                let ptr = accum_buf.contents().as_ptr() as *const f32;
+                let accum = unsafe { std::slice::from_raw_parts(ptr, w * h * 4) };
+                save_checkpoint(path, gpu.uniforms.width, gpu.uniforms.height, done, accum);
+            }
         }
     }
 

@@ -1,0 +1,41 @@
+##RenderMan RIB-Structure 1.1
+# Phase 9 demo gate: firefly forest at dusk. Hundreds of thousands of
+# instanced trees (binary-RIB archive via Procedural DelayedReadArchive),
+# a million-plus grass curve segments, and 1200 point lights sampled
+# through the light BVH, under a dim evening dome.
+version 3.04
+Display "forest.exr" "file" "rgb"
+Format 3840 1608 1.0
+Projection "perspective" "fov" [46]
+PixelFilter "gaussian" 2 2
+Rotate -4 1 0 0
+Translate 0 -5.4 0
+
+WorldBegin
+    Light "PxrDomeLight" "sky" "intensity" [0.12] "lightColorMap" ["sky.hdr"]
+
+    # Rolling forest floor: displaced grid, fractal moss/dirt blend.
+    AttributeBegin
+        Pattern "PxrFractal" "mottle" "frequency" [0.35] "layers" [5] "gain" [0.55]
+        Pattern "PxrMix" "floorColor"
+            "color1" [0.05 0.09 0.03] "color2" [0.16 0.12 0.07]
+            "reference color mix" ["mottle:resultRGB"]
+        Bxdf "PxrSurface" "floor"
+            "reference color diffuseColor" ["floorColor:resultRGB"]
+            "diffuseRoughness" [0.6] "specularIor" [1]
+        ReadArchive "forest_ground.rib"
+    AttributeEnd
+
+    # Trees + rocks (generated; binary-encoded instance archive).
+    ReadArchive "forest_defs.rib"
+    Procedural "DelayedReadArchive" ["forest_instances.brib"] [-240 240 -10 30 0 480]
+
+    # Grass near the camera (Marschner-shaded linear curves).
+    AttributeBegin
+        ShadingRate 8
+        ReadArchive "forest_grass.rib"
+    AttributeEnd
+
+    # Fireflies: 1200 point lights + visible glow motes.
+    ReadArchive "forest_lights.rib"
+WorldEnd

@@ -82,7 +82,7 @@ skipped forever.
 | Points | ✅ | sphere particles ("width" per point or "constantwidth") |
 | Blobby | 🚫 | revisit only if a real scene needs it |
 | Volume | ⏭ P10 | |
-| Procedural (DelayedReadArchive/RunProgram/DynamicLoad) | ⏭ P9 | |
+| Procedural (DelayedReadArchive/RunProgram/DynamicLoad) | ✅ / ✅ / ⏭ | DelayedReadArchive loads eagerly (bounds ignored); RunProgram spawns the generator and parses its stdout; DynamicLoad needs FFI and warns |
 | Geometry (renderer-specific) | 🚫 | |
 
 ## Archives & external
@@ -91,7 +91,7 @@ skipped forever.
 | ReadArchive | ✅ | file (relative to RIB dir) or inline archive; depth-capped |
 | ArchiveBegin/ArchiveEnd | ✅ | inline archives |
 | MakeTexture/MakeLatLongEnvironment/etc. | 🟡 | `render txmake in.png out.tex` CLI converts any image to the tiled-mip .tex format (in-RIB MakeTexture requests still warn) |
-| Binary RIB encoding | ⏭ P9 | |
+| Binary RIB encoding | ✅ | RISpec App. C decode (mixed ASCII+binary); `render catrib [--binary]` converts both ways; ~45% smaller archives |
 
 ## RSL-era shading (all skipped forever)
 `ShadingModel`, `Imager`, RSL `Surface`/`Displacement`/`Volume` shader

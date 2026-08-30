@@ -246,7 +246,9 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 4. **Acceleration structure** - Quadrics and loose polygons still use a linear scan; meshes (where the polygon counts live) go through a binned-SAH BVH with TLAS instancing.
 
-5. **Global illumination** - The `--integrator path` path tracer (CPU and Metal) does full GI with NEE+MIS; the default Whitted integrator remains the fast direct-light preview.
+5. **Global illumination** - The `--integrator path` path tracer (CPU and Metal) does full GI with NEE+MIS; the default Whitted integrator remains the fast direct-light preview. Scenes with many lights (tested to 1200+) are sampled through a light BVH (power/distance importance) on both backends. Long Metal renders can be checkpointed and resumed with `--checkpoint <file>`.
+
+6. **Movie-scale I/O** - Binary RIB reads transparently (mixed ASCII+binary per RISpec Appendix C); `render catrib --binary` converts archives (~45% smaller). `Procedural "DelayedReadArchive"` (eager) and `"RunProgram"` (spawned generators) work; ReadArchive nests both text and binary.
 
 ## Future Enhancements
 

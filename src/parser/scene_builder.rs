@@ -98,7 +98,9 @@ struct SceneData {
 struct ObjectDefEntry {
     mesh_id: u32,
     local_transform: Matrix4,
-    material: Material,
+    /// Shared by every instance of this definition (deduplicated so a
+    /// million ObjectInstances cost one material, not a million).
+    material_id: usize,
 }
 
 pub struct SceneBuilder {
@@ -280,6 +282,65 @@ impl SceneBuilder {
                     self.read_archive(name, data)?;
                 }
             }
+            // Procedural geometry: DelayedReadArchive loads eagerly (we
+            // have no lazy loading yet — bounds ignored); RunProgram
+            // spawns the generator and parses its stdout as RIB.
+            "Procedural" => {
+                let kind = req.string(0).unwrap_or("");
+                let args: Vec<String> = match req.values.get(1) {
+                    Some(RibValue::Strings(v)) => v.clone(),
+                    Some(RibValue::String(s)) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                match kind {
+                    "DelayedReadArchive" => {
+                        self.warn_once(
+                            "Procedural \"DelayedReadArchive\" loads eagerly (no lazy loading)",
+                        );
+                        if let Some(file) = args.first() {
+                            self.read_archive(&file.clone(), data)?;
+                        }
+                    }
+                    "RunProgram" => {
+                        let Some(program) = args.first() else {
+                            self.warn_once("Procedural \"RunProgram\" without a program; skipping");
+                            return Ok(());
+                        };
+                        let prog_path = self.resource_path(program);
+                        let mut cmd = std::process::Command::new(&prog_path);
+                        if let Some(extra) = args.get(1) {
+                            cmd.args(extra.split_whitespace());
+                        }
+                        if let Some(dir) = &self.base_dir {
+                            cmd.current_dir(dir);
+                        }
+                        match cmd.output() {
+                            Ok(out) if out.status.success() => {
+                                match super::parse_rib_bytes(&out.stdout) {
+                                    Ok(requests) => {
+                                        self.archive_depth += 1;
+                                        self.run(&requests, data)?;
+                                        self.archive_depth -= 1;
+                                    }
+                                    Err(e) => self.warn_once(&format!(
+                                        "RunProgram {program}: output failed to parse: {e:#}"
+                                    )),
+                                }
+                            }
+                            Ok(out) => self.warn_once(&format!(
+                                "RunProgram {program} exited with {}",
+                                out.status
+                            )),
+                            Err(e) => {
+                                self.warn_once(&format!("RunProgram {program}: {e}"))
+                            }
+                        }
+                    }
+                    other => self.warn_once(&format!(
+                        "Procedural \"{other}\" not implemented (DynamicLoad needs FFI); skipping"
+                    )),
+                }
+            }
             "ObjectBegin" => {
                 let handle = req
                     .string(0)
@@ -312,11 +373,9 @@ impl SceneBuilder {
                     let placement = self.transform_stack.current();
                     let placement1 = self.motion_endpoint(&placement);
                     for entry in entries {
-                        data.materials.push(entry.material.clone());
-                        let material_id = data.materials.len() - 1;
                         data.instances.push(Instance::with_motion(
                             entry.mesh_id,
-                            material_id,
+                            entry.material_id,
                             placement * entry.local_transform,
                             placement1.map(|p1| p1 * entry.local_transform),
                             &data.meshes[entry.mesh_id as usize],
@@ -1046,11 +1105,14 @@ impl SceneBuilder {
             material.emission = color * intensity;
         }
 
-        if let Some((_, entries)) = &mut self.defining_object {
+        if self.defining_object.is_some() {
+            data.materials.push(material);
+            let material_id = data.materials.len() - 1;
+            let (_, entries) = self.defining_object.as_mut().unwrap();
             entries.push(ObjectDefEntry {
                 mesh_id,
                 local_transform: self.transform_stack.current(),
-                material,
+                material_id,
             });
         } else {
             data.materials.push(material);
@@ -1297,8 +1359,8 @@ impl SceneBuilder {
             Some(dir) => dir.join(name),
             None => PathBuf::from(name),
         };
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match super::parse_rib(&content) {
+        match std::fs::read(&path) {
+            Ok(content) => match super::parse_rib_bytes(&content) {
                 Ok(requests) => {
                     self.archive_depth += 1;
                     self.run(&requests, data)?;

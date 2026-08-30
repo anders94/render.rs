@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use render_rs::output::{write_exr, write_png, write_ppm, write_ppm_ascii};
-use render_rs::parser::{parse_rib, SceneBuilder};
+use render_rs::parser::{parse_rib_bytes, SceneBuilder};
 use render_rs::raytracer::renderer::render;
 use std::fs;
 use std::path::PathBuf;
@@ -61,12 +61,30 @@ struct Args {
     /// budget. Try 0.02.
     #[arg(long)]
     adaptive: Option<f64>,
+
+    /// Checkpoint file for the Metal path tracer: progress is saved
+    /// periodically and resumed from this file if it exists.
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, clap::ValueEnum)]
 enum Integrator {
     Whitted,
     Path,
+}
+
+/// catrib-equivalent: decode/re-encode RIB between text and binary.
+#[derive(Parser, Debug)]
+#[command(name = "render catrib")]
+struct CatribArgs {
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+    /// Emit binary RIB (default: canonical text)
+    #[arg(long)]
+    binary: bool,
 }
 
 /// txmake-equivalent: convert any image to the renderer's tiled-mip .tex.
@@ -81,6 +99,26 @@ struct TxmakeArgs {
 
 fn main() -> Result<()> {
     // Subcommand dispatch that keeps `render scene.rib` working unchanged.
+    if std::env::args().nth(1).as_deref() == Some("catrib") {
+        let cr = CatribArgs::parse_from(std::env::args().skip(1));
+        let data = fs::read(&cr.input)?;
+        let requests = parse_rib_bytes(&data)?;
+        if cr.binary {
+            fs::write(&cr.output, render_rs::parser::binary::encode_binary(&requests))?;
+        } else {
+            fs::write(&cr.output, render_rs::parser::binary::encode_text(&requests))?;
+        }
+        let out_len = fs::metadata(&cr.output)?.len();
+        println!(
+            "{} ({} bytes) -> {} ({} bytes, {})",
+            cr.input.display(),
+            data.len(),
+            cr.output.display(),
+            out_len,
+            if cr.binary { "binary" } else { "text" }
+        );
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("txmake") {
         let tx = TxmakeArgs::parse_from(std::env::args().skip(1));
         let header = render_rs::texture::tex::txmake(&tx.input, &tx.output)
@@ -109,10 +147,10 @@ fn main() -> Result<()> {
     println!("render.rs - RenderMan RIB Renderer");
     println!("Reading RIB file: {}", args.rib_file.display());
 
-    let rib_content = fs::read_to_string(&args.rib_file)?;
+    let rib_content = fs::read(&args.rib_file)?;
 
     println!("Parsing RIB file...");
-    let commands = parse_rib(&rib_content)?;
+    let commands = parse_rib_bytes(&rib_content)?;
 
     println!("Building scene...");
     let mut builder = SceneBuilder::new();
@@ -167,7 +205,11 @@ fn main() -> Result<()> {
             println!("Path tracing on Metal at {spp} spp...");
             #[cfg(target_os = "macos")]
             {
-                render_rs::raytracer::metal::render_pt(&scene, spp)?
+                render_rs::raytracer::metal::render_pt_checkpointed(
+                    &scene,
+                    spp,
+                    args.checkpoint.as_deref(),
+                )?
             }
             #[cfg(not(target_os = "macos"))]
             anyhow::bail!("the metal backend requires macOS")

@@ -44,6 +44,16 @@ pub struct GpuMeshInfo {
     pub has_deform: u32,
 }
 
+/// Per-light sampler data: BVH leaf (finite) or infinite-group weight.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuLightAux {
+    /// Leaf node index in the light BVH, u32::MAX for infinite lights.
+    pub leaf: u32,
+    /// Power weight within the infinite group (0 for finite lights).
+    pub inf_weight: f32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GpuCurveSeg {
@@ -177,6 +187,11 @@ pub struct GpuPtUniforms {
     pub filter_width: f32,
     /// 1 when rays draw a shutter time.
     pub has_motion: u32,
+    /// Light-BVH sampler config (0 nodes = uniform single-light fallback).
+    pub light_bvh_count: u32,
+    pub p_infinite: f32,
+    pub infinite_total: f32,
+    pub pad_ls: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
@@ -186,7 +201,8 @@ const _: () = assert!(std::mem::size_of::<GpuCurveSeg>() == 48);
 const _: () = assert!(std::mem::size_of::<GpuCurveInfo>() == 16);
 const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 184);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
-const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 160);
+const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 176);
+const _: () = assert!(std::mem::size_of::<GpuLightAux>() == 8);
 
 pub struct GpuPtScene {
     pub objects: Vec<GpuObject>,
@@ -209,6 +225,9 @@ pub struct GpuPtScene {
     /// Curve segments, all sets concatenated (BLAS leaf order).
     pub curve_segs: Vec<GpuCurveSeg>,
     pub curve_infos: Vec<GpuCurveInfo>,
+    /// Light BVH nodes (byte-identical to scene.light_sampler.nodes).
+    pub light_bvh: Vec<crate::scene::light_sampler::LightBvhNode>,
+    pub light_aux: Vec<GpuLightAux>,
     pub mesh_infos: Vec<GpuMeshInfo>,
     /// Packed texture table + generated pattern MSL (pattern_codegen).
     pub tex_data: Vec<f32>,
@@ -434,6 +453,21 @@ impl GpuPtScene {
             });
         }
 
+        // Light sampler export: nodes verbatim, per-light aux.
+        let ls = &scene.light_sampler;
+        let light_bvh = ls.nodes.clone();
+        let light_aux: Vec<GpuLightAux> = (0..scene.lights.len())
+            .map(|i| {
+                let inf_weight = ls
+                    .infinite
+                    .iter()
+                    .position(|&k| k as usize == i)
+                    .map(|k| ls.infinite_power[k] as f32)
+                    .unwrap_or(0.0);
+                GpuLightAux { leaf: ls.light_leaf[i], inf_weight }
+            })
+            .collect();
+
         // Curve sets: segments permuted into BLAS leaf order, nodes
         // appended to the shared blas buffer.
         let mut curve_segs: Vec<GpuCurveSeg> = Vec::new();
@@ -527,6 +561,10 @@ impl GpuPtScene {
                 | crate::scene::PixelFilter::Gaussian { width } => width as f32,
             },
             has_motion: scene.has_motion as u32,
+            light_bvh_count: light_bvh.len() as u32,
+            p_infinite: ls.p_infinite as f32,
+            infinite_total: ls.infinite_total as f32,
+            pad_ls: 0,
         };
 
         let patterns = super::pattern_codegen::build(scene);
@@ -545,6 +583,8 @@ impl GpuPtScene {
             vertices1,
             curve_segs,
             curve_infos,
+            light_bvh,
+            light_aux,
             mesh_infos,
             tex_data: patterns.tex_data,
             tex_mips: patterns.tex_mips,
@@ -600,6 +640,12 @@ impl GpuPtScene {
         }
         if self.curve_infos.is_empty() {
             self.curve_infos.push(unsafe { std::mem::zeroed() });
+        }
+        if self.light_bvh.is_empty() {
+            self.light_bvh.push(unsafe { std::mem::zeroed() });
+        }
+        if self.light_aux.is_empty() {
+            self.light_aux.push(unsafe { std::mem::zeroed() });
         }
         if self.tex_data.is_empty() {
             self.tex_data.extend_from_slice(&[0.0; 3]);
@@ -662,6 +708,12 @@ impl GpuPtScene {
     }
     pub fn curve_infos_bytes(&self) -> &[u8] {
         as_bytes(&self.curve_infos)
+    }
+    pub fn light_bvh_bytes(&self) -> &[u8] {
+        as_bytes(&self.light_bvh)
+    }
+    pub fn light_aux_bytes(&self) -> &[u8] {
+        as_bytes(&self.light_aux)
     }
     pub fn tex_data_bytes(&self) -> &[u8] {
         as_bytes(&self.tex_data)
