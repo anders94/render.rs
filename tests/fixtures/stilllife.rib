@@ -15,6 +15,7 @@ WorldBegin
 
     # --- Wooden deck: 2x2 UDIM parquet, grazing angles to the far edge --
     AttributeBegin
+        Attribute "identifier" "name" ["deck"]
         Pattern "PxrTexture" "wood" "filename" ["wood_<UDIM>.tex"]
         Bxdf "PxrSurface" "deck"
             "reference color diffuseColor" ["wood:resultRGB"]
@@ -32,6 +33,7 @@ WorldBegin
 
     # --- Left: shipping crate with the label texture -------------------
     AttributeBegin
+        Attribute "identifier" "name" ["crate"]
         Pattern "PxrTexture" "poster" "filename" ["label.tex"]
         Pattern "PxrColorCorrect" "posterGraded"
             "reference color inputRGB" ["poster:resultRGB"]
@@ -60,6 +62,7 @@ WorldBegin
 
     # --- Right: turned-wood sphere (triplanar; no st needed) -----------
     AttributeBegin
+        Attribute "identifier" "name" ["woodball"]
         Pattern "triplanar" "woodwrap" "filename" ["wood_1001.tex"] "frequency" [1.6]
         Pattern "PxrFractal" "rough" "frequency" [3.0] "layers" [4]
         Bxdf "PxrSurface" "woodball"
@@ -72,6 +75,7 @@ WorldBegin
 
     # --- Center: checkered picnic cloth (b-spline patch) ---------------
     AttributeBegin
+        Attribute "identifier" "name" ["cloth"]
         Pattern "PxrChecker" "check" "colorA" [0.75 0.12 0.10] "colorB" [0.92 0.88 0.82]
             "sScale" [10] "tScale" [10]
         Pattern "PxrMix" "checkSoft"
@@ -98,6 +102,7 @@ WorldBegin
 
     # --- Back: teal NURBS band with a vertical ramp --------------------
     AttributeBegin
+        Attribute "identifier" "name" ["band"]
         Pattern "PxrRamp" "fade" "axis" ["t"]
             "positions" [0 0.5 1]
             "colors" [0.06 0.22 0.28  0.1 0.4 0.45  0.75 0.82 0.8]
@@ -116,6 +121,7 @@ WorldBegin
 
     # --- Front: glass sphere over the parquet --------------------------
     AttributeBegin
+        Attribute "identifier" "name" ["glassball"]
         Bxdf "PxrSurface" "glass"
             "diffuseGain" [0]
             "glassRefractionGain" [1] "glassIor" [1.5] "glassRoughness" [0.02]

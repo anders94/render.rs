@@ -157,7 +157,8 @@ pub struct GpuPtMaterial {
     pub sss_gain: f32,
     pub sss_sigma_t: [f32; 3],
     pub sss_sigma_s: [f32; 3],
-    pub pad_sss: u32,
+    /// Object id for the id AOV.
+    pub obj_id: u32,
 }
 
 #[repr(C)]
@@ -354,7 +355,7 @@ impl GpuPtScene {
                         );
                         v3(&sm.sigma_s)
                     },
-                    pad_sss: 0,
+                    obj_id: m.id,
                     is_hair: m.hair.is_some() as u32,
                     hair_sigma_a: m
                         .hair

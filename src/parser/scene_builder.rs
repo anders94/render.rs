@@ -56,6 +56,8 @@ struct GraphicsState {
     hair: Option<crate::raytracer::pt::hair::HairParams>,
     /// Interior medium bound to subsequent geometry.
     interior: Option<u32>,
+    /// Attribute "identifier" "name": groups geometry under one id.
+    identifier: Option<String>,
     basis_u: (Basis4, usize),
     basis_v: (Basis4, usize),
 }
@@ -78,6 +80,7 @@ impl Default for GraphicsState {
             motion_t1: None,
             hair: None,
             interior: None,
+            identifier: None,
             basis_u: (BEZIER, 3),
             basis_v: (BEZIER, 3),
         }
@@ -150,6 +153,10 @@ pub struct SceneBuilder {
     pattern_nodes: Vec<PatternNode>,
     /// Pattern handle -> node index.
     pattern_handles: HashMap<String, u32>,
+    /// identifier name -> object id, and the id counter.
+    object_ids: HashMap<String, u32>,
+    next_object_id: u32,
+    id_manifest: std::collections::BTreeMap<u32, String>,
 }
 
 impl SceneBuilder {
@@ -183,6 +190,9 @@ impl SceneBuilder {
             archive_depth: 0,
             pattern_nodes: Vec::new(),
             pattern_handles: HashMap::new(),
+            object_ids: HashMap::new(),
+            next_object_id: 1,
+            id_manifest: std::collections::BTreeMap::new(),
         }
     }
 
@@ -221,6 +231,7 @@ impl SceneBuilder {
         scene.patterns = self.pattern_nodes;
         scene.media = data.media.clone();
         scene.atmosphere = data.atmosphere;
+        scene.id_manifest = self.id_manifest.clone();
         scene.has_motion = scene.instances.iter().any(|i| i.transform1.is_some())
             || scene.meshes.iter().any(|m| m.positions1.is_some());
         scene.build_tlas();
@@ -510,6 +521,12 @@ impl SceneBuilder {
             }
             "Option" | "Attribute" => {
                 if let Some(category) = req.string(0) {
+                    // Attribute "identifier" "name" ["x"]: id-AOV grouping.
+                    if req.name == "Attribute" && category == "identifier" {
+                        if let Some(name) = req.params_from(1).get_string("name") {
+                            self.state.identifier = Some(name.to_string());
+                        }
+                    }
                     // Extension: `Option "background" "color" [r g b]` sets
                     // the miss color (a dome light supersedes this at P4).
                     if req.name == "Option" && category == "background" {
@@ -1788,13 +1805,14 @@ impl SceneBuilder {
     }
 
     /// Material from the current attribute state.
-    fn make_material(&self) -> Material {
+    fn make_material(&mut self) -> Material {
         if let Some(hp) = &self.state.hair {
             // Whitted fallback: a plain brown matte so hair still shows up
             // outside the path tracer.
             let mut m = Material::matte(Vec3::new(0.35, 0.22, 0.12));
             m.hair = Some(hp.clone());
             m.interior = self.state.interior;
+            m.id = self.assign_object_id();
             return m;
         }
         if let Some(pbr) = &self.state.bxdf {
@@ -1804,6 +1822,7 @@ impl SceneBuilder {
             m.emission = Vec3::zero();
             m.pattern_bindings = self.state.bxdf_bindings.clone();
             m.interior = self.state.interior;
+            m.id = self.assign_object_id();
             return m;
         }
         let mut m = match self.state.surface.as_str() {
@@ -1812,13 +1831,32 @@ impl SceneBuilder {
             _ => Material::matte(self.state.color),
         };
         m.interior = self.state.interior;
+        m.id = self.assign_object_id();
         m
     }
 
     /// Create a material from the current attribute state; returns its id.
-    fn push_material(&self, materials: &mut Vec<Material>) -> usize {
+    fn push_material(&mut self, materials: &mut Vec<Material>) -> usize {
         materials.push(self.make_material());
         materials.len() - 1
+    }
+
+    /// Object id for the id AOV: identifier-named geometry shares an id;
+    /// unnamed geometry gets a fresh auto id.
+    fn assign_object_id(&mut self) -> u32 {
+        let name = self
+            .state
+            .identifier
+            .clone()
+            .unwrap_or_else(|| format!("object_{}", self.next_object_id));
+        if let Some(id) = self.object_ids.get(&name) {
+            return *id;
+        }
+        let id = self.next_object_id;
+        self.next_object_id += 1;
+        self.object_ids.insert(name.clone(), id);
+        self.id_manifest.insert(id, name);
+        id
     }
 }
 

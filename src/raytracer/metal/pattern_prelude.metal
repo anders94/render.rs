@@ -37,7 +37,7 @@ struct PtMaterial {
     float sss_gain;         // subsurface walk fields (precomputed fits)
     float sss_sigma_t[3];
     float sss_sigma_s[3];
-    uint  pad_sss;
+    uint  obj_id;
 };
 
 struct TexMipG {

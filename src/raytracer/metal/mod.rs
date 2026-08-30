@@ -10,4 +10,4 @@ pub mod pattern_codegen;
 mod renderer;
 pub mod scene_buffers;
 
-pub use renderer::{intersect_probe, render, render_pt, render_pt_checkpointed};
+pub use renderer::{intersect_probe, render, render_pt, render_pt_checkpointed, render_pt_film};

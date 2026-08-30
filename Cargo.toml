@@ -14,6 +14,7 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1.10"
 image = "0.25"
+exr = "1.73"
 nom = "7.1"
 anyhow = "1.0"
 thiserror = "1.0"

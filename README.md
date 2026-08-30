@@ -250,7 +250,9 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 6. **Volumes & subsurface** - Participating media via `Atmosphere` (global, bounded by `maxdistance`) and `Interior` (bound to geometry hulls or glass): homogeneous fog analytically, heterogeneous fBm clouds by delta/ratio tracking, Henyey-Greenstein phase, colored medium-aware shadows — on CPU and Metal. Subsurface scattering on PxrSurface (`subsurfaceGain/Color/Dmfp`) as a spectral random walk (Kulla-Conty albedo inversion + Burley scaling). Deferred: VDB grid ingest, equiangular sampling, nested media.
 
-7. **Movie-scale I/O** - Binary RIB reads transparently (mixed ASCII+binary per RISpec Appendix C); `render catrib --binary` converts archives (~45% smaller). `Procedural "DelayedReadArchive"` (eager) and `"RunProgram"` (spawned generators) work; ReadArchive nests both text and binary.
+7. **Production output** - `--aovs` renders the full AOV stack (beauty, diffuse/specular split, albedo, normal, depth, object id with an `Attribute "identifier"` manifest); `-f exr` then writes a multilayer OpenEXR that Nuke/Natron split by layer. `--denoise` runs an albedo/normal/depth/id-guided à-trous filter on the diffuse layer (specular passes through raw, keeping glass sharp) — at 32 spp it beats a raw render's MSE by ~1.4x on specular-heavy scenes, more on diffuse ones. `--tonemap aces|srgb|linear` selects the display transform for PNG output. OSL remains staged per the roadmap (the native pattern graph is the workhorse); OIDN can slot behind `--denoise` later. Interactive preview deferred.
+
+8. **Movie-scale I/O** - Binary RIB reads transparently (mixed ASCII+binary per RISpec Appendix C); `render catrib --binary` converts archives (~45% smaller). `Procedural "DelayedReadArchive"` (eager) and `"RunProgram"` (spawned generators) work; ReadArchive nests both text and binary.
 
 ## Future Enhancements
 

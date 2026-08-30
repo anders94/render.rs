@@ -1092,12 +1092,14 @@ inline float3 cosine_sample_local(thread Pcg32& rng) {
 // Composite sample; returns false on rejection.
 inline bool bsdf_sample(PtMaterial m, float3 wo, float eta, thread Pcg32& rng,
                         thread float3& wi_out, thread float3& f_out,
-                        thread float& pdf_out, thread bool& transmitted) {
+                        thread float& pdf_out, thread bool& transmitted,
+                        thread bool& spec_lobe) {
     float wd = m.weights[0], ws = m.weights[1], wc = m.weights[2],
           wf = m.weights[3], wg = m.weights[4];
     if (wd + ws + wc + wf + wg <= 0.0f) return false;
     transmitted = false;
     float pick = pcg_f32(rng);
+    spec_lobe = pick >= wd + wf;
     float3 wi;
     if (pick < wd + wf) {
         wi = cosine_sample_local(rng);
@@ -1764,8 +1766,10 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
 
 // ---- the path integrator (mirror of pt::trace) --------------------------
 
+// aux layout: 0-2 albedo, 3-5 normal, 6 depth, 7 id, 8-10 diffuse share,
+// 11 hit flag. Mirrors pt::trace_full's AuxSample.
 inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
-                    float time, thread Pcg32& rng) {
+                    float time, thread Pcg32& rng, thread float* aux) {
     constant PtUniforms& u = *s.u;
     float3 l = float3(0.0f);
     float3 beta = float3(1.0f);
@@ -1779,6 +1783,9 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
     float cone_spread = 2.0f * u.half_height / (float)u.height;
     // Participating medium the ray currently travels in.
     uint medium = u.atmosphere;
+    int first_spec = -1;      // -1 unset, 0 diffuse-like, 1 specular-like
+    bool aux_set = false;
+    float travel = 0.0f;
 
     uint depth = 0u;
     while (depth < u.max_bounces) {
@@ -1793,6 +1800,21 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             if (med_sample_distance(med, origin, dir, t_limit, beta, rng, mt, mweight)) {
                 beta *= mweight;
                 float3 p = origin + dir * mt;
+                if (!aux_set) {
+                    aux_set = true;
+                    float3 stv = float3(med.sigma_a[0] + med.sigma_s[0],
+                                        med.sigma_a[1] + med.sigma_s[1],
+                                        med.sigma_a[2] + med.sigma_s[2]);
+                    aux[0] = med.sigma_s[0] / max(stv.x, 1e-9f);
+                    aux[1] = med.sigma_s[1] / max(stv.y, 1e-9f);
+                    aux[2] = med.sigma_s[2] / max(stv.z, 1e-9f);
+                    float3 nv = -normalize_cpu(dir);
+                    aux[3] = nv.x; aux[4] = nv.y; aux[5] = nv.z;
+                    aux[6] = travel + mt;
+                    aux[7] = 0.0f;
+                    aux[11] = 1.0f;
+                }
+                if (first_spec < 0) first_spec = 0;
                 float3 emv = float3(med.emission[0], med.emission[1], med.emission[2]);
                 if (emv.x + emv.y + emv.z > 0.0f) l += beta * emv;
                 float3 wo = -normalize_cpu(dir);
@@ -1810,7 +1832,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                     uint li = ls_sample(s, p, pcg_f32(rng), pick);
                     float3 c = sample_one_light(s, s.lights[li], p, float3(0.0f), ec,
                                                 pick, time, medium, rng);
-                    l += beta * c;
+                    { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
                 }
                 float ppdf;
                 float3 wi = hg_sample_g(med.g, wo, pcg_f32(rng), pcg_f32(rng), ppdf);
@@ -1841,9 +1863,9 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                     w = power_heuristic(prev_pdf, pl);
                 }
                 float3 dome_rad = env_eval(s, d) * m3(s.lights[u.dome_index].radiance);
-                l += beta * dome_rad * w;
+                { float3 _c = beta * dome_rad * w; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
             } else {
-                l += beta * c3(u.background);
+                { float3 _c = beta * c3(u.background); l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
             }
             break;
         }
@@ -1852,6 +1874,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
         // Invisible volume hull: crossing toggles the medium.
         if (is_volume_hull(m) && presence_skips < 16u) {
             presence_skips++;
+            travel += h.t;
             medium = h.front ? m.interior : u.atmosphere;
             origin = h.p + normalize_cpu(dir) * PT_RAY_OFFSET;
             continue;
@@ -1859,12 +1882,30 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
 
         float3 wo = -normalize_cpu(dir);
         cone_width += h.t * cone_spread;
+        travel += h.t;
         apply_patterns(h.material, m, h.st, h.p, h.n,
                        cone_width * h.st_density, s.tex_data, s.tex_mips);
+        if (!aux_set) {
+            aux_set = true;
+            float lum_f0 = 0.2126f * m.spec_f0[0] + 0.7152f * m.spec_f0[1]
+                + 0.0722f * m.spec_f0[2];
+            float has_spec = lum_f0 > 1e-6f ? 1.0f : 0.0f;
+            for (int k = 0; k < 3; k++) {
+                aux[k] = min(m.diffuse_color[k] * m.diffuse_gain
+                    + m.spec_f0[k] * has_spec
+                    + m.refr_color[k] * m.glass_gain, 1.0f);
+            }
+            float3 nv = dot(h.n, wo) >= 0.0f ? h.n : -h.n;
+            aux[3] = nv.x; aux[4] = nv.y; aux[5] = nv.z;
+            aux[6] = travel;
+            aux[7] = (float)m.obj_id;
+            aux[11] = 1.0f;
+        }
 
         float presence = clamp(m.presence, 0.0f, 1.0f);
         if (presence < 1.0f && pcg_f32(rng) >= presence && presence_skips < 16u) {
             presence_skips++;
+            travel += h.t;
             origin = h.p + normalize_cpu(dir) * PT_RAY_OFFSET;
             continue;
         }
@@ -1881,7 +1922,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                     * ls_pmf(s, prev_origin, m.area_light);
                 w = power_heuristic(prev_pdf, pl);
             }
-            l += beta * em * w;
+            { float3 _c = beta * em * w; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
         }
 
         // Hair fibers: full-sphere Marschner scattering (mirror of the
@@ -1903,13 +1944,14 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                 float pick;
                 uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
                 float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, medium, rng);
-                l += beta * c;
+                { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
             }
             float3 wi_f, fv;
             float pv;
             if (!hair_sample(m, wo_f, hh, rng, wi_f, fv, pv)) break;
             float3 wi = to_world(ff, wi_f);
             beta *= fv / pv;   // per-solid-angle f: no cosine
+            if (first_spec < 0) first_spec = 0;
             prev_pdf = pv;
             prev_origin = h.p;
             from_camera = false;
@@ -1928,6 +1970,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
 
         // Subsurface random walk (mirror of pt::trace's SSS branch).
         if (m.sss_gain > 0.0f && m.is_hair == 0u && pcg_f32(rng) < m.sss_gain) {
+            if (first_spec < 0) first_spec = 0;
             MediumG sm;
             for (int k = 0; k < 3; k++) {
                 sm.sigma_s[k] = m.sss_sigma_s[k];
@@ -2008,7 +2051,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                     uint li = ls_sample(s, exit_p, pcg_f32(rng), pick);
                     float3 c = sample_one_light(s, s.lights[li], exit_p, out_n, ec,
                                                 pick, time, medium, rng);
-                    l += beta * c;
+                    { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
                 }
                 float xu1 = pcg_f32(rng);
                 float xu2 = pcg_f32(rng);
@@ -2054,15 +2097,17 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             float pick;
             uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
             float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, medium, rng);
-            l += beta * c;
+            { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
         }
 
         float3 wi_l, f;
         float pdf;
         bool transmitted;
-        if (!bsdf_sample(m, wo_l, eta, rng, wi_l, f, pdf, transmitted)) break;
+        bool spec_lobe;
+        if (!bsdf_sample(m, wo_l, eta, rng, wi_l, f, pdf, transmitted, spec_lobe)) break;
         float3 wi = to_world(frame, wi_l);
         beta *= f * (fabs(wi_l.z) / pdf);
+        if (first_spec < 0) first_spec = spec_lobe ? 1 : 0;
         prev_pdf = pdf;
         prev_origin = h.p;
         from_camera = false;
@@ -2130,6 +2175,7 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const MediumG*    media            [[buffer(22)]],
                       constant PtUniforms&     u                [[buffer(23)]],
                       device float*            accum            [[buffer(24)]],
+                      device float*            aux_accum        [[buffer(25)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint py_row = gid.y + u.y_offset;
     if (gid.x >= u.width || py_row >= u.height) return;
@@ -2201,10 +2247,24 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
             }
         }
         float rtime = (u.has_motion != 0u) ? pcg_f32(rng) : 0.0f;
-        float3 li = pt_li(s, ray_o, d, rtime, rng);
+        float aux[12];
+        for (int k = 0; k < 12; k++) aux[k] = 0.0f;
+        float3 li = pt_li(s, ray_o, d, rtime, rng, aux);
         float lum = 0.2126f * li.x + 0.7152f * li.y + 0.0722f * li.z;
-        if (lum > u.firefly_clamp) li *= u.firefly_clamp / lum;
+        if (lum > u.firefly_clamp) {
+            float kk = u.firefly_clamp / lum;
+            li *= kk;
+            aux[8] *= kk; aux[9] *= kk; aux[10] *= kk;
+        }
         sum += li;
+        uint aidx = (py_row * u.width + gid.x) * 12u;
+        for (int k = 0; k < 7; k++) aux_accum[aidx + k] += aux[k];
+        // id: first writer wins (deterministic: sample 0 lands first).
+        if (aux_accum[aidx + 11u] == 0.0f && aux[11] > 0.0f) {
+            aux_accum[aidx + 7u] = aux[7];
+        }
+        for (int k = 8; k < 11; k++) aux_accum[aidx + k] += aux[k];
+        aux_accum[aidx + 11u] += aux[11];
     }
 
     uint idx = (py_row * u.width + gid.x) * 4u;

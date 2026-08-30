@@ -35,6 +35,8 @@ pub struct Material {
     /// Participating medium inside this geometry (Interior request);
     /// index into Scene::media.
     pub interior: Option<u32>,
+    /// Object id for the id AOV / manifest (0 = unassigned).
+    pub id: u32,
 }
 
 impl Material {
@@ -51,6 +53,7 @@ impl Material {
             pattern_bindings: Vec::new(),
             hair: None,
             interior: None,
+            id: 0,
         }
     }
 
@@ -67,6 +70,7 @@ impl Material {
             pattern_bindings: Vec::new(),
             hair: None,
             interior: None,
+            id: 0,
         }
     }
 
@@ -83,6 +87,7 @@ impl Material {
             pattern_bindings: Vec::new(),
             hair: None,
             interior: None,
+            id: 0,
         }
     }
 

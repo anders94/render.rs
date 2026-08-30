@@ -48,6 +48,8 @@ pub struct Scene {
     pub media: Vec<Medium>,
     /// Global medium the camera starts in (Atmosphere request).
     pub atmosphere: Option<u32>,
+    /// Object-id manifest for the id AOV (id -> identifier name).
+    pub id_manifest: std::collections::BTreeMap<u32, String>,
     tlas: Bvh,
 }
 
@@ -68,6 +70,7 @@ impl Scene {
             light_sampler: LightSampler::build(&[]),
             media: Vec::new(),
             atmosphere: None,
+            id_manifest: std::collections::BTreeMap::new(),
             tlas: Bvh::build(&[]),
         }
     }

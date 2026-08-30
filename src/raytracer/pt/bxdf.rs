@@ -39,6 +39,9 @@ impl Frame {
 }
 
 pub struct BsdfSample {
+    /// True when the sampled lobe was specular-like (GGX reflect,
+    /// clearcoat, or glass) — drives the beauty diffuse/specular AOV split.
+    pub specular_lobe: bool,
     /// Local-frame incoming direction (z < 0 for transmission).
     pub wi: Vec3,
     pub f: Vec3,
@@ -309,6 +312,7 @@ pub fn sample(p: &PbrParams, wo: &Vec3, eta_rel: f64, rng: &mut Pcg32) -> Option
 
     let pick = rng.next_f64();
     let mut transmitted = false;
+    let specular_lobe = pick >= wd + wf;
     let wi = if pick < wd + wf {
         // Diffuse / fuzz share cosine sampling.
         cosine_sample_local(rng)
@@ -366,7 +370,7 @@ pub fn sample(p: &PbrParams, wo: &Vec3, eta_rel: f64, rng: &mut Pcg32) -> Option
     if pdf <= 0.0 {
         return None;
     }
-    Some(BsdfSample { wi, f, pdf, transmitted })
+    Some(BsdfSample { wi, f, pdf, transmitted, specular_lobe })
 }
 
 #[cfg(test)]

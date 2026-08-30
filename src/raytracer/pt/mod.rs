@@ -12,6 +12,7 @@ pub mod sampler;
 pub mod volume;
 
 use crate::math::{Point3, Vec3};
+use crate::output::film::{AuxSample, Film};
 use crate::output::Image;
 use crate::raytracer::{Intersection, Ray};
 use crate::scene::medium::{hg_phase, hg_sample};
@@ -60,6 +61,123 @@ pub fn render(scene: &Scene, spp: u32) -> Image {
                 .collect()
         })
         .collect()
+}
+
+/// Render with the full AOV stack (roadmap Phase 11): beauty plus
+/// diffuse/specular split, first-hit albedo/normal/depth, and the
+/// dominant-object id layer with coverage.
+pub fn render_film(scene: &Scene, spp: u32) -> Film {
+    let width = scene.camera.width as usize;
+    let height = scene.camera.height as usize;
+    let pixel_spread =
+        (scene.camera.fov.to_radians() / 2.0).tan() * 2.0 / scene.camera.height as f64;
+
+    struct Row {
+        beauty: Vec<Vec3>,
+        diffuse: Vec<Vec3>,
+        albedo: Vec<Vec3>,
+        normal: Vec<Vec3>,
+        depth: Vec<Vec3>,
+        id: Vec<Vec3>,
+    }
+    let rows: Vec<Row> = (0..height)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = Row {
+                beauty: Vec::with_capacity(width),
+                diffuse: Vec::with_capacity(width),
+                albedo: Vec::with_capacity(width),
+                normal: Vec::with_capacity(width),
+                depth: Vec::with_capacity(width),
+                id: Vec::with_capacity(width),
+            };
+            for x in 0..width {
+                let pixel_index = (y * width + x) as u64;
+                let mut sum = Vec3::zero();
+                let mut d_sum = Vec3::zero();
+                let mut alb = Vec3::zero();
+                let mut nrm = Vec3::zero();
+                let mut depth_sum = 0.0f64;
+                let mut hits = 0u32;
+                let mut votes: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                for s in 0..spp {
+                    let mut rng = Pcg32::for_pixel_sample(pixel_index, s as u64);
+                    let ray = camera_ray(scene, x, y, &mut rng);
+                    let mut aux = AuxSample::default();
+                    let mut l = trace_full(scene, ray, pixel_spread, &mut rng, &mut aux);
+                    let lum = luminance(&l);
+                    if lum > FIREFLY_CLAMP {
+                        let k = FIREFLY_CLAMP / lum;
+                        l = l * k;
+                        aux.diffuse = aux.diffuse * k;
+                    }
+                    sum = sum + l;
+                    d_sum = d_sum + aux.diffuse;
+                    alb = alb + aux.albedo;
+                    nrm = nrm + aux.normal;
+                    if aux.depth > 0.0 {
+                        depth_sum += aux.depth;
+                        hits += 1;
+                    }
+                    *votes.entry(aux.id).or_insert(0) += 1;
+                }
+                let inv = 1.0 / spp as f64;
+                let (best_id, best_n) = votes
+                    .into_iter()
+                    .max_by_key(|(_, n)| *n)
+                    .unwrap_or((0, 0));
+                row.beauty.push(sum * inv);
+                row.diffuse.push(d_sum * inv);
+                row.albedo.push(alb * inv);
+                row.normal.push(nrm * inv);
+                row.depth.push(Vec3::new(
+                    if hits > 0 { depth_sum / hits as f64 } else { 0.0 },
+                    0.0,
+                    0.0,
+                ));
+                row.id.push(Vec3::new(
+                    best_id as f64,
+                    best_n as f64 * inv,
+                    0.0,
+                ));
+            }
+            row
+        })
+        .collect();
+
+    let mut film = Film {
+        beauty: Vec::with_capacity(height),
+        diffuse: Vec::with_capacity(height),
+        specular: Vec::with_capacity(height),
+        albedo: Vec::with_capacity(height),
+        normal: Vec::with_capacity(height),
+        depth: Vec::with_capacity(height),
+        id: Vec::with_capacity(height),
+        manifest: scene.id_manifest.clone(),
+    };
+    for row in rows {
+        let spec: Vec<Vec3> = row
+            .beauty
+            .iter()
+            .zip(&row.diffuse)
+            .map(|(b, d)| {
+                Vec3::new(
+                    (b.x - d.x).max(0.0),
+                    (b.y - d.y).max(0.0),
+                    (b.z - d.z).max(0.0),
+                )
+            })
+            .collect();
+        film.beauty.push(row.beauty);
+        film.diffuse.push(row.diffuse);
+        film.specular.push(spec);
+        film.albedo.push(row.albedo);
+        film.normal.push(row.normal);
+        film.depth.push(row.depth);
+        film.id.push(row.id);
+    }
+    film
 }
 
 /// Adaptive sampling (roadmap Phase 7): each pixel keeps sampling until
@@ -190,8 +308,36 @@ fn shade_params(
     material.resolved_pbr(&scene.patterns, &ctx)
 }
 
-fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec3 {
+fn trace(scene: &Scene, ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec3 {
+    let mut aux = AuxSample::default();
+    trace_full(scene, ray, pixel_spread, rng, &mut aux)
+}
+
+/// Full trace: beauty radiance plus auxiliary AOV data (first-hit
+/// albedo/normal/depth/id and the diffuse share of the beauty — the
+/// specular layer is beauty minus diffuse).
+fn trace_full(
+    scene: &Scene,
+    mut ray: Ray,
+    pixel_spread: f64,
+    rng: &mut Pcg32,
+    aux: &mut AuxSample,
+) -> Vec3 {
     let mut l = Vec3::zero();
+    // Which lobe the FIRST path continuation used (None until sampled);
+    // contributions land in the diffuse AOV unless it was specular.
+    let mut first_specular: Option<bool> = None;
+    let mut aux_set = false;
+    let mut travel = 0.0f64;
+    macro_rules! emit {
+        ($c:expr) => {{
+            let c = $c;
+            l = l + c;
+            if first_specular != Some(true) {
+                aux.diffuse = aux.diffuse + c;
+            }
+        }};
+    }
     let mut beta = Vec3::one();
     // pdf of the previous BSDF sample (solid angle), for MIS on emitter hits.
     let mut prev_pdf = 0.0f64;
@@ -219,8 +365,23 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                 volume::MediumEvent::Scatter { t, weight } => {
                     beta = beta * weight;
                     let p = ray.at(t);
+                    if !aux_set {
+                        aux_set = true;
+                        let st = med.sigma_t();
+                        aux.albedo = Vec3::new(
+                            med.sigma_s.x / st.x.max(1e-9),
+                            med.sigma_s.y / st.y.max(1e-9),
+                            med.sigma_s.z / st.z.max(1e-9),
+                        );
+                        aux.normal = -ray.direction.normalize();
+                        aux.depth = travel + t;
+                        aux.id = 0;
+                    }
+                    if first_specular.is_none() {
+                        first_specular = Some(false);
+                    }
                     if max_component(&med.emission) > 0.0 {
-                        l = l + beta * med.emission;
+                        emit!(beta * med.emission);
                     }
                     // NEE from the volume point: the phase function is the
                     // "BSDF" (no cosine), shadow rays are medium-aware.
@@ -244,7 +405,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                             medium,
                             rng,
                         );
-                        l = l + beta * c;
+                        emit!(beta * c);
                     }
                     // Continue with an HG sample: phase/pdf = 1.
                     let (wi, pdf) = hg_sample(g, &wo, rng.next_f64(), rng.next_f64());
@@ -283,9 +444,9 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                     let pdf_light = dome_pdf(dome, &dir) * pick;
                     power_heuristic(prev_pdf, pdf_light)
                 };
-                l = l + beta * dome_radiance(dome, &dir) * weight;
+                emit!(beta * dome_radiance(dome, &dir) * weight);
             } else {
-                l = l + beta * scene.background_color;
+                emit!(beta * scene.background_color);
             }
             break;
         };
@@ -300,6 +461,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
         {
             if presence_skips < MAX_PRESENCE_SKIPS {
                 presence_skips += 1;
+                travel += hit.t;
                 medium = if hit.front_face { material.interior } else { scene.atmosphere };
                 ray = Ray::new(
                     hit.point + ray.direction.normalize() * RAY_OFFSET,
@@ -312,12 +474,25 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
 
         let wo = -ray.direction.normalize();
         cone_width += hit.t * cone_spread;
+        travel += hit.t;
         let pbr = shade_params(scene, material, &hit, cone_width);
+        if !aux_set {
+            aux_set = true;
+            let a = pbr.diffuse_color * pbr.diffuse_gain
+                + pbr.specular_f0() * if pbr.has_specular() { 1.0 } else { 0.0 }
+                + pbr.subsurface_color * pbr.subsurface_gain
+                + pbr.refraction_color * pbr.glass_gain;
+            aux.albedo = Vec3::new(a.x.min(1.0), a.y.min(1.0), a.z.min(1.0));
+            aux.normal = if hit.normal.dot(&wo) >= 0.0 { hit.normal } else { -hit.normal };
+            aux.depth = travel;
+            aux.id = material.id;
+        }
 
         // Presence cutout: stochastically pass through.
         let presence = pbr.presence.clamp(0.0, 1.0);
         if presence < 1.0 && rng.next_f64() >= presence && presence_skips < MAX_PRESENCE_SKIPS {
             presence_skips += 1;
+            travel += hit.t;
             ray = Ray::new(hit.point + ray.direction.normalize() * RAY_OFFSET, ray.direction)
                 .with_time(ray.time);
             continue;
@@ -346,7 +521,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
             } else {
                 1.0
             };
-            l = l + beta * emission * weight;
+            emit!(beta * emission * weight);
         }
 
         // Hair fibers scatter over the full sphere with their own BSDF;
@@ -377,7 +552,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                             medium,
                             rng,
                         );
-                        l = l + beta * c;
+                        emit!(beta * c);
                     }
                 }
                 let Some((wi_f, fv, pv)) = hair::sample(hp, &wo_f, hh, rng) else {
@@ -385,6 +560,9 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                 };
                 let wi_world = ff.to_world(&wi_f);
                 beta = beta * fv / pv; // f is per-solid-angle: no cosine
+                if first_specular.is_none() {
+                    first_specular = Some(false);
+                }
                 prev_pdf = pv;
                 prev_origin = hit.point;
                 from_camera = false;
@@ -411,6 +589,9 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
             && material.hair.is_none()
             && rng.next_f64() < pbr.subsurface_gain.clamp(0.0, 1.0)
         {
+            if first_specular.is_none() {
+                first_specular = Some(false);
+            }
             let sss = volume::sss_medium(&pbr.subsurface_color, &pbr.subsurface_dmfp);
             // Diffuse transmission entry: cosine hemisphere around -n.
             let entry_frame = Frame::new(-n);
@@ -492,7 +673,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                                 medium,
                                 rng,
                             );
-                            l = l + beta * c;
+                            emit!(beta * c);
                         }
                         let (u1, u2) = rng.next_2d();
                         let r = u1.sqrt();
@@ -554,7 +735,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                     medium,
                     rng,
                 );
-                l = l + beta * contribution;
+                emit!(beta * contribution);
             }
         }
 
@@ -564,6 +745,9 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
         };
         let wi_world = frame.to_world(&s.wi);
         beta = beta * s.f * (s.wi.z.abs() / s.pdf);
+        if first_specular.is_none() {
+            first_specular = Some(s.specular_lobe);
+        }
         prev_pdf = s.pdf;
         prev_origin = hit.point;
         from_camera = false;

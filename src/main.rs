@@ -66,6 +66,24 @@ struct Args {
     /// periodically and resumed from this file if it exists.
     #[arg(long)]
     checkpoint: Option<PathBuf>,
+
+    /// Render the full AOV stack (path integrator only). With -f exr the
+    /// output becomes a multilayer EXR (beauty/diffuse/specular/albedo/
+    /// N/depth/id + manifest); other formats still write beauty.
+    #[arg(long)]
+    aovs: bool,
+
+    /// AOV-guided denoise of the beauty layer (implies --aovs).
+    #[arg(long)]
+    denoise: bool,
+
+    /// Display transform for png/ppm output: linear, srgb, or aces.
+    #[arg(long, default_value = "srgb")]
+    tonemap: String,
+
+    /// Also dump each AOV layer as <prefix>_<layer>.png (with --aovs).
+    #[arg(long)]
+    aov_dump: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, clap::ValueEnum)]
@@ -181,6 +199,105 @@ fn main() -> Result<()> {
         scene.camera.width, scene.camera.height,
         scene.pixel_samples.0, scene.pixel_samples.1
     );
+    let tonemap = render_rs::output::Tonemap::from_name(&args.tonemap)
+        .ok_or_else(|| anyhow::anyhow!("unknown tonemap {:?}", args.tonemap))?;
+
+    // AOV path: render the film, optionally denoise, then write.
+    if (args.aovs || args.denoise) && args.integrator == Integrator::Path {
+        let spp = args.spp.unwrap_or_else(|| {
+            let (sx, sy) = scene.pixel_samples;
+            (sx * sy).max(64)
+        });
+        let film = match args.backend {
+            Backend::Cpu => {
+                println!("Path tracing AOVs at {spp} spp...");
+                render_rs::raytracer::pt::render_film(&scene, spp)
+            }
+            Backend::Metal => {
+                println!("Path tracing AOVs on Metal at {spp} spp...");
+                #[cfg(target_os = "macos")]
+                {
+                    render_rs::raytracer::metal::render_pt_film(&scene, spp)?
+                }
+                #[cfg(not(target_os = "macos"))]
+                anyhow::bail!("the metal backend requires macOS")
+            }
+        };
+        let beauty = if args.denoise {
+            println!("Denoising (albedo/normal-guided a-trous)...");
+            render_rs::output::denoise(&film)
+        } else {
+            film.beauty.clone()
+        };
+        if let Some(prefix) = &args.aov_dump {
+            use render_rs::math::Vec3;
+            let tm = |img: &render_rs::output::Image| {
+                render_rs::output::apply_tonemap(tonemap, img)
+            };
+            write_png(&tm(&beauty), &format!("{prefix}_beauty.png"))?;
+            write_png(&tm(&film.diffuse), &format!("{prefix}_diffuse.png"))?;
+            write_png(&tm(&film.specular), &format!("{prefix}_specular.png"))?;
+            write_png(&tm(&film.albedo), &format!("{prefix}_albedo.png"))?;
+            let nrm: render_rs::output::Image = film
+                .normal
+                .iter()
+                .map(|r| r.iter().map(|n| (*n + Vec3::one()) * 0.5).collect())
+                .collect();
+            write_png(&nrm, &format!("{prefix}_normal.png"))?;
+            let dmax = film
+                .depth
+                .iter()
+                .flatten()
+                .map(|d| d.x)
+                .fold(0.0f64, f64::max)
+                .max(1e-6);
+            let dep: render_rs::output::Image = film
+                .depth
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|d| Vec3::one() * (1.0 - (d.x / dmax)).max(0.0))
+                        .collect()
+                })
+                .collect();
+            write_png(&dep, &format!("{prefix}_depth.png"))?;
+            let idc: render_rs::output::Image = film
+                .id
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|v| {
+                            let id = v.x as u32;
+                            if id == 0 {
+                                return Vec3::zero();
+                            }
+                            let h = id.wrapping_mul(2654435761);
+                            Vec3::new(
+                                (h & 0xFF) as f64 / 255.0,
+                                ((h >> 8) & 0xFF) as f64 / 255.0,
+                                ((h >> 16) & 0xFF) as f64 / 255.0,
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            write_png(&idc, &format!("{prefix}_id.png"))?;
+            println!("AOV layers dumped to {prefix}_*.png");
+        }
+        println!("Writing output to {}...", args.output.display());
+        match args.format.as_str() {
+            "exr" => render_rs::output::write_multilayer_exr(&film, args.output.to_str().unwrap())?,
+            "png" => write_png(
+                &render_rs::output::apply_tonemap(tonemap, &beauty),
+                args.output.to_str().unwrap(),
+            )?,
+            "ppm-ascii" => write_ppm_ascii(&beauty, args.output.to_str().unwrap())?,
+            _ => write_ppm(&beauty, args.output.to_str().unwrap())?,
+        }
+        println!("Done!");
+        return Ok(());
+    }
+
     let image = match (args.integrator, args.backend) {
         (Integrator::Path, Backend::Cpu) => {
             let spp = args.spp.unwrap_or_else(|| {
@@ -233,7 +350,10 @@ fn main() -> Result<()> {
 
     println!("Writing output to {}...", args.output.display());
     match args.format.as_str() {
-        "png" => write_png(&image, args.output.to_str().unwrap())?,
+        "png" => write_png(
+            &render_rs::output::apply_tonemap(tonemap, &image),
+            args.output.to_str().unwrap(),
+        )?,
         "exr" => write_exr(&image, args.output.to_str().unwrap())?,
         "ppm-ascii" => write_ppm_ascii(&image, args.output.to_str().unwrap())?,
         _ => write_ppm(&image, args.output.to_str().unwrap())?,

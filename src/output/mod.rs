@@ -1,8 +1,16 @@
 mod exr_writer;
+pub mod film;
+pub mod denoise;
+pub mod multilayer;
+pub mod tonemap;
 mod ppm;
 mod png_writer;
 
 pub use exr_writer::write_exr;
+pub use film::{AuxSample, Film};
+pub use denoise::denoise;
+pub use multilayer::write_multilayer_exr;
+pub use tonemap::{apply_image as apply_tonemap, Tonemap};
 pub use ppm::{write_ppm, write_ppm_ascii};
 pub use png_writer::write_png;
 

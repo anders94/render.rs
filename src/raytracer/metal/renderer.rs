@@ -166,7 +166,47 @@ pub fn render_pt_checkpointed(
     checkpoint: Option<&std::path::Path>,
 ) -> Result<Image> {
     let gpu = super::gpu_scene::GpuPtScene::build(scene)?;
-    autoreleasepool(|_| render_pt_impl(&gpu, spp, checkpoint))
+    autoreleasepool(|_| render_pt_impl(&gpu, spp, checkpoint).map(|(img, _)| img))
+}
+
+/// Path tracing with the full AOV stack (roadmap Phase 11).
+pub fn render_pt_film(scene: &Scene, spp: u32) -> Result<crate::output::Film> {
+    let gpu = super::gpu_scene::GpuPtScene::build(scene)?;
+    let (beauty, aux) = autoreleasepool(|_| render_pt_impl(&gpu, spp, None))?;
+    let (w, h) = (gpu.uniforms.width as usize, gpu.uniforms.height as usize);
+    let mut film = crate::output::Film {
+        beauty,
+        diffuse: vec![vec![Vec3::zero(); w]; h],
+        specular: vec![vec![Vec3::zero(); w]; h],
+        albedo: vec![vec![Vec3::zero(); w]; h],
+        normal: vec![vec![Vec3::zero(); w]; h],
+        depth: vec![vec![Vec3::zero(); w]; h],
+        id: vec![vec![Vec3::zero(); w]; h],
+        manifest: scene.id_manifest.clone(),
+    };
+    let inv = 1.0 / spp as f64;
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 12;
+            let hits = aux[i + 11] as f64;
+            film.albedo[y][x] =
+                Vec3::new(aux[i] as f64, aux[i + 1] as f64, aux[i + 2] as f64) * inv;
+            film.normal[y][x] =
+                Vec3::new(aux[i + 3] as f64, aux[i + 4] as f64, aux[i + 5] as f64) * inv;
+            film.depth[y][x] = Vec3::new(
+                if hits > 0.0 { aux[i + 6] as f64 / hits } else { 0.0 },
+                0.0,
+                0.0,
+            );
+            film.id[y][x] = Vec3::new(aux[i + 7] as f64, (hits * inv).min(1.0), 0.0);
+            let d = Vec3::new(aux[i + 8] as f64, aux[i + 9] as f64, aux[i + 10] as f64) * inv;
+            film.diffuse[y][x] = d;
+            let b = film.beauty[y][x];
+            film.specular[y][x] =
+                Vec3::new((b.x - d.x).max(0.0), (b.y - d.y).max(0.0), (b.z - d.z).max(0.0));
+        }
+    }
+    Ok(film)
 }
 
 const CHECKPOINT_MAGIC: &[u8; 4] = b"RCKP";
@@ -210,7 +250,7 @@ fn render_pt_impl(
     gpu: &super::gpu_scene::GpuPtScene,
     spp: u32,
     checkpoint: Option<&std::path::Path>,
-) -> Result<Image> {
+) -> Result<(Image, Vec<f32>)> {
     use super::gpu_scene::GpuPtUniforms;
 
     let device = MTLCreateSystemDefaultDevice()
@@ -274,6 +314,13 @@ fn render_pt_impl(
     unsafe {
         std::ptr::write_bytes(accum_buf.contents().as_ptr() as *mut u8, 0, accum_len);
     }
+    let aux_len = w * h * 12 * std::mem::size_of::<f32>();
+    let aux_buf = device
+        .newBufferWithLength_options(aux_len, MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| anyhow!("aux buffer allocation failed"))?;
+    unsafe {
+        std::ptr::write_bytes(aux_buf.contents().as_ptr() as *mut u8, 0, aux_len);
+    }
 
     // Resume from a matching checkpoint.
     let mut sample_start = 0u32;
@@ -326,6 +373,7 @@ fn render_pt_impl(
                     23,
                 );
                 enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 24);
+                enc.setBuffer_offset_atIndex(Some(&aux_buf), 0, 25);
             }
             let grid = MTLSize { width: w, height: band, depth: 1 };
             enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
@@ -374,6 +422,7 @@ fn render_pt_impl(
                                 23,
                             );
                             enc2.setBuffer_offset_atIndex(Some(&accum_buf), 0, 24);
+                            enc2.setBuffer_offset_atIndex(Some(&aux_buf), 0, 25);
                         }
                         let grid2 = MTLSize { width: w, height: rband, depth: 1 };
                         enc2.dispatchThreads_threadsPerThreadgroup(grid2, tg);
@@ -418,7 +467,9 @@ fn render_pt_impl(
             );
         }
     }
-    Ok(image)
+    let aux_ptr = aux_buf.contents().as_ptr() as *const f32;
+    let aux = unsafe { std::slice::from_raw_parts(aux_ptr, w * h * 12) }.to_vec();
+    Ok((image, aux))
 }
 
 /// Test-support entry point: intersect one object with a batch of rays via

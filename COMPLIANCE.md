@@ -31,7 +31,7 @@ skipped forever.
 | PixelFilter / PixelVariance | ✅ / 🟡 | box/triangle/gaussian via filter importance sampling; adaptive variance stopping via the --adaptive CLI flag (CPU) |
 | DepthOfField | ✅ | thin-lens bokeh: fstop / focallength / focaldistance |
 | Exposure / Quantize | 🟡 | |
-| Display | 🟡 | filename/driver recorded; CLI overrides |
+| Display | 🟡 | filename/driver recorded; CLI overrides. `--aovs -f exr` writes a multilayer EXR (beauty + diffuse/specular/albedo/N/depth/id + id manifest); `Attribute "identifier" "name"` groups geometry for the id AOV |
 | Hider / Integrator | ⏭ P1/P4 | |
 | Option (generic) | ✅ | passthrough dictionary; extension: `Option "background" "color" [r g b]` sets the miss color |
 | Declare | ✅ | |
