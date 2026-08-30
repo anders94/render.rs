@@ -1,267 +1,195 @@
 # render.rs
 
-A high-performance RenderMan-compatible RIB (RenderMan Interface Bytestream) renderer implemented in Rust.
+A RenderMan RIB renderer in Rust: a physically-based, path-traced renderer
+that reads Pixar's RIB scene description and runs on two backends — a
+multithreaded f64 CPU reference and a native Metal compute megakernel for
+Apple GPUs. Built phase by phase from a Phong ray tracer into a renderer in
+the spirit of modern PRMan, with every capability gated on a demo image and
+a test suite that includes white-furnace energy checks and statistical
+CPU/GPU parity.
 
-## Features
+![motion-blurred pan with bokeh](renders/pan.png)
+*Motion blur, thin-lens depth of field, and bokeh — the camera tracks the
+crate while the world streaks past ([more](renders/README.md)).*
 
-### Rendering Engine
-- **Multi-threaded raytracer** using rayon for parallel pixel rendering
-- **Ray-primitive intersection** for Sphere, Cone, and Cylinder
-- **Blinn-Phong shading** with ambient, diffuse, and specular components
-- **Reflection support** for shiny materials
-- **Gamma correction** for accurate color output
+## What it does
 
-### Geometric Primitives
-- **Sphere** - `Sphere radius zmin zmax thetamax`
-- **Cone** - `Cone height radius thetamax`
-- **Cylinder** - `Cylinder radius zmin zmax thetamax`
+**Light transport.** Progressive Monte Carlo path tracing with next-event
+estimation, multiple importance sampling (power heuristic), Russian
+roulette, and firefly clamping. Scenes with many lights (tested to 1200+)
+sample through a light BVH with power/distance importance. A Whitted
+integrator remains as the fast direct-light preview (`--integrator whitted`
+is the default; pass `--integrator path` for GI).
 
-All primitives support:
-- Arbitrary transformations (translate, rotate, scale)
-- Partial geometry (zmin/zmax clipping, thetamax < 360)
+**Materials.** A PxrSurface-style über-material with PRMan-compatible
+parameter names: Oren-Nayar diffuse, GGX specular with VNDF sampling and
+height-correlated Smith shadowing, clearcoat, fuzz/sheen, rough dielectric
+glass with true refraction, glow, presence cutouts, and random-walk
+subsurface scattering (`subsurfaceGain/Color/Dmfp`). Hair gets its own
+energy-conserving Marschner/d'Eon BSDF (`Bxdf "PxrMarschnerHair"`). Every
+lobe is validated against a white furnace.
 
-### Materials
-- **Matte** - Pure Lambertian diffuse (rough, non-reflective)
-- **Plastic** - Diffuse + specular (moderate shininess)
-- **Metal** - High specular, reflective
+![furry critter — 400k hair strands](renders/furball.png)
+*400,000 cubic b-spline strands shaded with the Marschner hair BSDF.*
 
-### Transformations
-- Translate, Rotate, Scale
-- Hierarchical transform stack
-- Matrix-based transformations with proper normal handling
+**Geometry.** All seven RiSpec quadrics; polygons (including
+`GeneralPolygon` with holes); triangle meshes under a binned-SAH BVH with
+two-level (BLAS/TLAS) instancing — billions of effective triangles via
+`ObjectInstance`; Catmull-Clark subdivision surfaces with semi-sharp
+creases; bicubic patch meshes with all standard bases; NURBS; fBm
+displacement at dice time; curves/hair as rounded-cone capsule chains; and
+`Points` particles.
 
-### Output Formats
-- **PPM** - Simple text format for debugging
-- **PNG** - Compressed format for production
+**Volumes.** Participating media via `Atmosphere` and `Interior`:
+homogeneous fog analytically, heterogeneous fBm clouds by delta tracking,
+with ratio-tracked colored transmittance and Henyey-Greenstein phase.
 
-## Performance
+![subsurface scattering busts](renders/bust.png)
+*Backlit marble and skin — random-walk subsurface scattering bleeding
+light through thin edges.*
 
-- Whitted on Metal: 1080p, 64 objects, 4spp in 0.23s
-- Path-traced glade (10k instances, 10B effective triangles) at 720p/96spp
-  in 84s on Metal, 178s on CPU
-- 79 tests including GPU parity, statistical PT parity, and BVH
-  brute-force cross-checks
+**Textures & patterns.** A tiled-mip `.tex` texture format with a
+`render txmake` converter, a sharded-LRU tile cache with a byte budget,
+trilinear filtering driven by ray-cone footprints (no shimmer at grazing
+angles), UDIM tile sets, and a pattern node graph
+(texture/checker/fractal/mix/colorCorrect/ramp/triplanar) connected to
+material parameters with `"reference"` declarations — compiled to Metal
+Shading Language at runtime for the GPU.
 
-## Usage
+**Camera.** Perspective and orthographic projections, thin-lens depth of
+field, motion blur (transform and deformation, `MotionBegin`/`Shutter`),
+box/triangle/gaussian pixel filters via filter importance sampling, and
+adaptive sampling with variance-based stopping (`--adaptive`).
+
+**Production output.** `--aovs` renders a full AOV stack — beauty,
+diffuse/specular split, albedo, normal, depth, and object id with an
+`Attribute "identifier"` manifest — written as a multilayer OpenEXR that
+Nuke/Natron split by layer. `--denoise` runs an AOV-guided à-trous filter
+on the diffuse layer (specular passes through raw, so glass stays sharp).
+`--tonemap aces|srgb|linear` selects the display transform.
+
+**Scale.** Binary RIB read/write (`render catrib`), `Procedural`
+generators (`DelayedReadArchive`, `RunProgram`), checkpoint/resume for
+long GPU renders (`--checkpoint`), and stress scenes to 772k instances /
+35M effective triangles / 1200 lights at 4K.
+
+See **[renders/README.md](renders/README.md)** for the full gallery — one
+image per milestone, with what each demonstrates.
+
+## Quick start
 
 ```bash
-# Render a RIB file to PNG
-cargo run --release -- scene.rib -o output.png -f png
+# Release build (the only sensible way to render)
+cargo build --release
 
-# Render to PPM
-cargo run --release -- scene.rib -o output.ppm
+# Fast preview (Whitted, direct light only)
+./target/release/render scene.rib -f png -o out.png
 
-# Override resolution
-cargo run --release -- scene.rib -w 1920 -h 1080 -o hd.png -f png
+# Full global illumination on the GPU (macOS)
+./target/release/render scene.rib --integrator path --backend metal \
+    --spp 256 -f png -o out.png --tonemap aces
 
-# Set thread count
-cargo run --release -- scene.rib -t 8 -o output.png -f png
+# Production AOVs to multilayer EXR, denoised beauty to PNG
+./target/release/render scene.rib --integrator path --backend metal \
+    --spp 128 --aovs -f exr -o out.exr
+./target/release/render scene.rib --integrator path --backend metal \
+    --spp 64 --denoise -f png -o out.png
 
-# Render on the Apple GPU (macOS, no build flags needed)
-cargo run --release -- scene.rib --backend metal -o output.png -f png
+# Long render with checkpoint/resume
+./target/release/render big.rib --integrator path --backend metal \
+    --spp 1024 --checkpoint ck.bin -f png -o out.png
+
+# Tools
+./target/release/render txmake texture.png texture.tex   # tiled-mip textures
+./target/release/render catrib --binary in.rib out.brib  # binary RIB
 ```
 
-## GPU Rendering
+Useful flags: `-w/-H` resolution override, `--spp` samples per pixel,
+`--adaptive <tol>` variance-based stopping (CPU), `--threads`,
+`--aov-dump <prefix>` per-layer PNGs, `RENDER_TEX_CACHE_MB` texture cache
+budget, `RENDER_PT_BAND_ROWS` GPU dispatch sizing.
 
-Backends share one scene model and are cross-validated by the test suite:
+## The two backends
 
-| | CPU (default) | `--backend metal` |
-|---|---|---|
-| Whitted integrator | rayon, f64 | native MSL megakernel, pixel-exact parity tests |
-| Path integrator | f64 reference | f32 megakernel with TLAS/BLAS traversal, statistical parity tests |
-| Cornell 300px 512spp (path) | 10.9s | 3.4s |
-| Glade: 10k instances / 10B tris, 720p 96spp (path) | 178s | 84s |
+- **CPU** — the f64 reference implementation. Every feature lands here
+  first; correctness fixtures (furnace tests, unbiased-estimator checks,
+  BVH brute-force cross-checks) run against it.
+- **Metal** — an f32 compute megakernel, compiled from embedded MSL at
+  runtime (no build-time GPU toolchain). The scene is flattened once into
+  `#[repr(C)]` buffers shared byte-identically by both sides; pattern
+  graphs are code-generated into the kernel per scene. Parity with the CPU
+  is *statistical* (same light transport, independent float error) and
+  enforced by mean/RMSE tests on every subsystem: textures, hair, motion
+  blur, volumes, SSS, many-light sampling.
 
-The Metal path tracer is a megakernel; incoherent traversal on huge scenes
-limits it to a few× CPU until the wavefront refactor (roadmap Phase 9).
-The MLX backend was removed in Phase 3 (it was memory-bandwidth-bound by
-design; see ROADMAP.md history).
+Typical numbers on Apple Silicon: the 10-billion-effective-triangle glade
+at 720p/96spp in 84s (178s CPU); the still life at 1280×640/1024spp in
+52s; a 4K forest frame (772k instances, 1200 lights) at 64spp in ~1 hour
+on the megakernel.
 
-### Metal backend (recommended)
+## RIB compliance
 
-A single Metal compute megakernel — one GPU thread per pixel, with the
-object loop, shadow rays, and 5-bounce reflections all in registers. Built
-on [objc2-metal](https://crates.io/crates/objc2-metal); always available on
-macOS builds with no extra flags or tooling (the kernel source is embedded
-and compiled at runtime by the OS). Output is deterministic (no atomics) and
-parity-tested against the CPU backend — `cargo test` runs the suite on
-macOS.
+The policy is *accept everything*: any syntactically valid RIB parses
+(text or binary), implemented requests take effect, and everything else
+warns once and is skipped. [COMPLIANCE.md](COMPLIANCE.md) tracks every
+request — implemented, partial, deferred, or skipped-forever (REYES-era
+constructs like `SolidBegin` and RSL shaders are consciously out of
+scope; the modern Bxdf/Pattern/Light path replaces them).
 
-The GPU computes in f32 (Metal GPUs have no f64): whitted output can
-differ from the CPU by about one 8-bit step on silhouette edges; the path
-integrator's f32/f64 difference is far below its Monte Carlo noise.
-
-## Example RIB Files
-
-### Minimal Sphere
-```rib
-Display "test.ppm" "file" "rgb"
-Format 320 240 1.0
-WorldBegin
-    Color 1 0 0
-    Sphere 1 -1 1 360
-WorldEnd
-```
-
-### Multiple Primitives
-```rib
-Display "scene.ppm" "file" "rgb"
-Format 640 480 1.0
-Projection "perspective" "fov" [45]
-
-WorldBegin
-    # Red sphere
-    Color 1 0 0
-    Translate -2 0 8
-    Sphere 1 -1 1 360
-
-    # Green cylinder
-    Color 0 1 0
-    Translate 0 0 8
-    Cylinder 0.8 -1.5 1.5 360
-
-    # Blue cone
-    Color 0 0 1
-    Translate 2 0 8
-    Rotate -90 1 0 0
-    Cone 2 0.8 360
-WorldEnd
-```
-
-### Materials
-```rib
-WorldBegin
-    # Matte (diffuse)
-    Color 1 0.2 0.2
-    Surface "matte"
-    Sphere 1 -1 1 360
-
-    # Plastic (shiny)
-    Color 0.2 1 0.2
-    Surface "plastic"
-    Translate 2 0 0
-    Sphere 1 -1 1 360
-
-    # Metal (reflective)
-    Color 0.2 0.2 1
-    Surface "metal"
-    Translate 4 0 0
-    Sphere 1 -1 1 360
-WorldEnd
-```
-
-## Supported RIB Commands
-
-See **COMPLIANCE.md** for the full request matrix. Policy: every
-syntactically valid RIB request is accepted — implemented requests take
-effect, state-only requests are recorded, everything else warns once and
-is skipped. Highlights: all seven quadrics, Polygon, PointsPolygons
-meshes, ObjectInstance instancing, ReadArchive, AreaLightSource,
-ConcatTransform/named coordinate systems, Declare/inline declarations.
-
-## Test Scenes
-
-The `tests/fixtures/` directory contains several test scenes:
-
-- `minimal.rib` - Single red sphere
-- `three_primitives.rib` - Sphere, cylinder, and cone
-- `materials.rib` - Three materials comparison
-- `transforms.rib` - Complex scene with 5 objects and transformations
-
-Render them with:
-```bash
-cargo run --release -- tests/fixtures/transforms.rib -o output.png -f png
-```
+Highlights: full graphics-state machinery (attribute/transform blocks,
+named coordinate systems, `Basis`, `ShadingRate`-driven dicing),
+`ReadArchive`/`ArchiveBegin`/`ObjectInstance`, `MotionBegin`, media
+requests, `Attribute "identifier"`, and modern `Bxdf`/`Light`/`Pattern`/
+`Displace` with PRMan parameter names.
 
 ## Architecture
 
 ```
-render.rs/
-├── src/
-│   ├── math/           # Vec3, Point3, Matrix4
-│   ├── raytracer/      # Ray, Intersection, Renderer
-│   ├── geometry/       # Sphere, Cone, Cylinder
-│   ├── scene/          # Camera, Light, Material
-│   ├── shading/        # Blinn-Phong shading
-│   ├── parser/         # RIB parser (nom-based)
-│   └── output/         # PPM and PNG writers
-└── tests/
-    └── fixtures/       # Example RIB files
+src/
+  parser/       nom tokenizer -> generalized request stream -> SceneBuilder
+                (binary RIB decoder, catrib encoder)
+  scene/        camera, lights (+ light BVH sampler), materials, media,
+                envmap (HDRI 2D-CDF importance sampling)
+  geometry/     quadrics, meshes, subdivision, patches/NURBS, curves,
+                displacement, ear-clipping
+  accel/        binned-SAH BVH (BLAS/TLAS)
+  raytracer/
+    pt/         the CPU path tracer: bxdf lobes, hair BSDF, volumes, SSS
+    metal/      GPU scene flattening, runtime MSL compilation, the
+                path-tracing megakernel, pattern-graph codegen
+  texture/      .tex format, sharded-LRU tile cache, pattern node graph
+  output/       film/AOVs, multilayer EXR, denoiser, tonemaps, PNG/PPM
 ```
 
-## Building
+Design decisions that shaped everything: one `#[repr(C)]` scene
+representation consumed by both backends; f32 render core with f64 scene
+composition; RGB radiance behind a spectrum-shaped API; megakernel until
+measured divergence justifies wavefront (the 4K forest hit that trigger —
+it's the designated next optimization); OSL staged behind the native
+pattern graph.
+
+## Testing
+
+~140 tests: unit tests per subsystem, white-furnace energy conservation
+for every BSDF lobe and the hair model, unbiased-estimator checks for
+volume sampling (verified against closed forms and quadrature),
+pixel-exact parity for the Whitted GPU path, statistical parity
+(mean + RMSE + determinism) for the path-traced GPU on every feature, and
+a parser fuzz test (arbitrary bytes must never panic).
 
 ```bash
-# Debug build
-cargo build
-
-# Release build (much faster)
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run specific scene
-cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
+cargo test --release
 ```
 
-## Dependencies
+## Status & roadmap
 
-- **clap** - CLI argument parsing
-- **rayon** - Multi-threaded rendering
-- **image** - PNG output
-- **nom** - RIB parser
-- **anyhow** - Error handling
-
-## Integrators
-
-- `--integrator whitted` (default): direct lighting + hard shadows + mirror
-  reflections. Fast, deterministic, what the GPU backends speak.
-- `--integrator path`: progressive Monte Carlo **global illumination**
-  with a physically-based material system (`Bxdf "PxrSurface"`: Oren-Nayar
-  diffuse, GGX specular with VNDF sampling, clearcoat, fuzz, rough glass
-  with true refraction, glow, presence cutouts) and physical lights
-  (`Light "PxrRectLight" / PxrSphereLight / PxrDiskLight / PxrDistantLight
-  / PxrDomeLight` with HDRI importance sampling), plus the legacy
-  `AreaLightSource`/`LightSource` forms. NEE + MIS, Russian roulette,
-  energy validated by white-furnace tests. `--spp N` controls samples per
-  pixel; `-f exr` writes linear HDR. Runs on the CPU (f64 reference) or
-  `--backend metal` (f32, statistically identical, faster). See
-  `tests/fixtures/cornell.rib` and `tests/fixtures/shaderball.rib`.
-
-## Features (rendering)
-
-- **Shadows** - Shadow rays are cast to every light; occluded lights contribute nothing.
-- **Reflections** - Recursive ray tracing (depth 5). Metal reflects strongly and tints by its color; plastic has a subtle clear-coat reflection.
-- **Anti-aliasing** - `PixelSamples x y` performs stratified supersampling (e.g. `PixelSamples 2 2` = 4 rays/pixel).
-- **Output formats** - Binary PPM (P6, default), ASCII PPM (`--format ppm-ascii`), PNG (`--format png`).
-
-## Known Limitations
-
-1. **Camera** - Fixed at origin looking down +Z (use object/world transforms); perspective and orthographic projections, thin-lens depth of field (`DepthOfField`), motion blur (`MotionBegin`/`Shutter` — transform motion on any instanced geometry plus PointsPolygons deformation), box/triangle/gaussian pixel filters, and adaptive sampling (`--adaptive <tol>` on the CPU path tracer).
-
-2. **Primitives** - Implemented: all seven RiSpec quadrics, Polygon/GeneralPolygon (ear-clipped holes), PointsPolygons meshes with SAH BVH + TLAS instancing, Catmull-Clark SubdivisionMesh with creases, bilinear/bicubic PatchMesh with basis matrices, NURBS NuPatch, fBm displacement at dice time (`Displace "noise"`), Curves (linear/cubic hair as rounded-cone capsule chains, shaded by an energy-conserving Marschner hair BSDF via `Bxdf "PxrMarschnerHair"`), and Points particles. COMPLIANCE.md tracks the full RIB request matrix.
-
-3. **Textures & patterns** - Implemented (roadmap Phase 6): a tiled-mip `.tex` format with a `render txmake` converter, a sharded-LRU tile cache with a byte budget, trilinear filtering driven by ray-cone mip selection, UDIM (`<UDIM>` filenames), and a pattern node graph (PxrTexture/PxrChecker/PxrFractal/PxrMix/PxrColorCorrect/PxrRamp/triplanar) connected to Bxdf params with `reference` declarations — on CPU and Metal (runtime MSL codegen). Not yet: EWA anisotropic filtering, pattern-driven displacement, `Pattern` st on GPU quadrics (use triplanar there).
-
-4. **Acceleration structure** - Quadrics and loose polygons still use a linear scan; meshes (where the polygon counts live) go through a binned-SAH BVH with TLAS instancing.
-
-5. **Global illumination** - The `--integrator path` path tracer (CPU and Metal) does full GI with NEE+MIS; the default Whitted integrator remains the fast direct-light preview. Scenes with many lights (tested to 1200+) are sampled through a light BVH (power/distance importance) on both backends. Long Metal renders can be checkpointed and resumed with `--checkpoint <file>`.
-
-6. **Volumes & subsurface** - Participating media via `Atmosphere` (global, bounded by `maxdistance`) and `Interior` (bound to geometry hulls or glass): homogeneous fog analytically, heterogeneous fBm clouds by delta/ratio tracking, Henyey-Greenstein phase, colored medium-aware shadows — on CPU and Metal. Subsurface scattering on PxrSurface (`subsurfaceGain/Color/Dmfp`) as a spectral random walk (Kulla-Conty albedo inversion + Burley scaling). Deferred: VDB grid ingest, equiangular sampling, nested media.
-
-7. **Production output** - `--aovs` renders the full AOV stack (beauty, diffuse/specular split, albedo, normal, depth, object id with an `Attribute "identifier"` manifest); `-f exr` then writes a multilayer OpenEXR that Nuke/Natron split by layer. `--denoise` runs an albedo/normal/depth/id-guided à-trous filter on the diffuse layer (specular passes through raw, keeping glass sharp) — at 32 spp it beats a raw render's MSE by ~1.4x on specular-heavy scenes, more on diffuse ones. `--tonemap aces|srgb|linear` selects the display transform for PNG output. OSL remains staged per the roadmap (the native pattern graph is the workhorse); OIDN can slot behind `--denoise` later. Interactive preview deferred.
-
-8. **Movie-scale I/O** - Binary RIB reads transparently (mixed ASCII+binary per RISpec Appendix C); `render catrib --binary` converts archives (~45% smaller). `Procedural "DelayedReadArchive"` (eager) and `"RunProgram"` (spawned generators) work; ReadArchive nests both text and binary.
-
-## Future Enhancements
-
-- Implement missing primitives
-- Texture mapping support
-- BVH acceleration structure
-- Progressive rendering
-- Motion blur and depth of field
-- RenderMan Shading Language (RSL) support
+Phases P0-P11 of [ROADMAP.md](ROADMAP.md) are complete — RIB
+generalization, the path-tracing pivot, meshes/BVH/instancing, the Metal
+port, PBR materials and lights, subdivision/patches/displacement, textures
+and patterns, camera and motion, hair, movie-scale infrastructure,
+volumes/SSS, and the production pipeline. Deferred items are recorded
+honestly where they were skipped: wavefront GPU scheduling, OSL via FFI,
+OIDN, interactive preview, EWA filtering, VDB ingest, deep EXR, USD.
 
 ## License
 
