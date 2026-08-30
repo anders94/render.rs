@@ -123,7 +123,7 @@ first run.
 ![firefly forest at 4K](forest.png)
 
 **`forest.png`** · `forest.rib` + `scripts/gen_forest.py` · path
-integrator, Metal, 3840×1608, 64 spp
+integrator, Metal, 64 spp — rendered at 3840×1608, downscaled here
 
 The stress gate: 772,120 instanced trees and rocks (35M effective
 triangles) loaded from a **binary RIB** archive through `Procedural
