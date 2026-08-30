@@ -202,6 +202,30 @@ sampling on the wavefront scheduler.
 
 ---
 
+## Character study
+
+![stylized kid portrait](kid.png)
+
+**`kid.png`** · `kid.rib` + `scripts/gen_kid.py` · path integrator,
+Metal, 512 spp, denoised, ACES
+
+An original stylized-kid character in classic cartoon-child
+proportions — big soft cranium, wide-set dark eyes, tiny nose and
+ears — exercising most of the renderer at once. The head is a
+procedurally *sculpted* mesh (a lat-long grid deformed by smooth radial
+fields: cheek and chin bulges, eye-socket dents, jaw taper), the skin is
+random-walk subsurface scattering, the hair is a 30,000-strand Marschner
+groom combed by a noisy direction field (random per-strand lift and
+flyaways break the head's silhouette), the eyes are glossy spheres whose
+catchlights come free from the key light, and the smile is a partial
+torus sweep. Lit warm-against-cool: a big warm rect key, a cool blue
+night dome fill, a rim light for the hair, and dozens of distant glow
+spheres defocused into soft bokeh stars. A thin scattering Atmosphere
+grades the horizon away and halos the stars; depth of field is focused
+on the eyes.
+
+---
+
 ## Early development
 
 **`three_primitives.png`**, **`shadows.png`**, **`materials.png`**,

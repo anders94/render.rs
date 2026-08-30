@@ -1,0 +1,123 @@
+##RenderMan RIB-Structure 1.1
+# Sample scene: an original stylized-kid portrait in classic cartoon
+# proportions (big soft cranium, wide-set eyes, tiny nose and ears),
+# showing off SSS skin, a Marschner hair groom, and warm-against-cool
+# night lighting. The character archive comes from scripts/gen_kid.py.
+version 3.04
+Display "kid.exr" "file" "rgb"
+Format 960 1200 1.0
+Projection "perspective" "fov" [24]
+PixelFilter "gaussian" 2 2
+DepthOfField 2.8 0.9 7.15
+Translate 0 -1.1 0
+
+WorldBegin
+    # Thin night haze: grades the ground/sky horizon over hundreds of
+    # units instead of a hard line, and halos the distant stars.
+    Atmosphere "nighthaze" "sigma_a" [0.0004 0.0004 0.0003] "sigma_s" [0.004 0.0048 0.0066] "g" [0.3] "maxdistance" [500]
+
+    # Cool night dome — a deep blue bath for the shadow side.
+    Light "PxrDomeLight" "night" "intensity" [0.26] "lightColor" [0.22 0.3 0.55]
+
+    # Warm key: big soft rect up-left-front (candlelight warmth).
+    TransformBegin
+        Translate -2.6 3.2 3.6
+        Rotate 150 0 1 0
+        Rotate -30 1 0 0
+        Scale 2.8 2.8 1
+        Light "PxrRectLight" "key" "intensity" [17] "lightColor" [1.0 0.76 0.5]
+    TransformEnd
+
+    # Cool rim from behind-right, separating hair from the sky.
+    TransformBegin
+        Translate 3.2 3.0 -3.4
+        Rotate -35 0 1 0
+        Rotate 25 1 0 0
+        Scale 1.8 1.8 1
+        Light "PxrRectLight" "rim" "intensity" [6] "lightColor" [0.55 0.7 1.0]
+    TransformEnd
+
+    # Soft dark ground far below (mostly out of frame; catches the body).
+    Bxdf "PxrSurface" "ground" "diffuseColor" [0.05 0.06 0.1] "specularIor" [1]
+    Polygon "P" [-300 -2.6 -300  300 -2.6 -300  300 -2.6 60  -300 -2.6 60]
+
+    # Distant soft stars (tiny, far, defocused to gentle points).
+        AttributeBegin Bxdf "PxrSurface" "star0" "diffuseGain" [0] "glowGain" [8.8] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate -4.1 17.4 102.5 Sphere 0.10 -0.10 0.10 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star1" "diffuseGain" [0] "glowGain" [9.2] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 43.8 6.9 139.9 Sphere 0.09 -0.09 0.09 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star2" "diffuseGain" [0] "glowGain" [11.4] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 22.4 20.3 155.3 Sphere 0.06 -0.06 0.06 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star3" "diffuseGain" [0] "glowGain" [13.0] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate 0.7 37.3 143.1 Sphere 0.10 -0.10 0.10 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star4" "diffuseGain" [0] "glowGain" [13.4] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -43.8 14.5 150.7 Sphere 0.09 -0.09 0.09 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star5" "diffuseGain" [0] "glowGain" [11.0] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate -25.7 11.6 115.3 Sphere 0.10 -0.10 0.10 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star6" "diffuseGain" [0] "glowGain" [9.0] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 41.7 6.0 124.1 Sphere 0.08 -0.08 0.08 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star7" "diffuseGain" [0] "glowGain" [15.2] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate 44.7 8.0 143.7 Sphere 0.06 -0.06 0.06 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star8" "diffuseGain" [0] "glowGain" [9.0] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -32.7 4.3 97.5 Sphere 0.08 -0.08 0.08 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star9" "diffuseGain" [0] "glowGain" [15.8] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -0.4 37.2 127.8 Sphere 0.07 -0.07 0.07 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star10" "diffuseGain" [0] "glowGain" [9.5] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate 8.8 10.2 144.8 Sphere 0.11 -0.11 0.11 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star11" "diffuseGain" [0] "glowGain" [19.8] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 11.7 9.4 114.1 Sphere 0.11 -0.11 0.11 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star12" "diffuseGain" [0] "glowGain" [9.2] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 22.6 38.2 111.3 Sphere 0.09 -0.09 0.09 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star13" "diffuseGain" [0] "glowGain" [12.5] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate 19.2 25.2 159.7 Sphere 0.06 -0.06 0.06 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star14" "diffuseGain" [0] "glowGain" [15.2] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 9.3 20.2 126.2 Sphere 0.11 -0.11 0.11 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star15" "diffuseGain" [0] "glowGain" [13.6] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 32.9 15.8 129.0 Sphere 0.06 -0.06 0.06 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star16" "diffuseGain" [0] "glowGain" [9.0] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate -45.2 26.7 99.3 Sphere 0.10 -0.10 0.10 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star17" "diffuseGain" [0] "glowGain" [16.9] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 33.8 21.9 153.9 Sphere 0.06 -0.06 0.06 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star18" "diffuseGain" [0] "glowGain" [18.3] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -29.6 38.7 126.1 Sphere 0.07 -0.07 0.07 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star19" "diffuseGain" [0] "glowGain" [9.5] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate 18.4 10.2 165.9 Sphere 0.07 -0.07 0.07 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star20" "diffuseGain" [0] "glowGain" [9.0] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -36.0 38.1 178.8 Sphere 0.09 -0.09 0.09 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star21" "diffuseGain" [0] "glowGain" [12.8] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -32.1 18.0 145.0 Sphere 0.11 -0.11 0.11 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star22" "diffuseGain" [0] "glowGain" [16.5] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 6.8 8.9 97.8 Sphere 0.08 -0.08 0.08 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star23" "diffuseGain" [0] "glowGain" [18.5] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -5.3 29.3 158.8 Sphere 0.07 -0.07 0.07 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star24" "diffuseGain" [0] "glowGain" [9.9] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 23.7 31.8 169.2 Sphere 0.08 -0.08 0.08 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star25" "diffuseGain" [0] "glowGain" [17.4] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 3.2 10.2 146.7 Sphere 0.06 -0.06 0.06 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star26" "diffuseGain" [0] "glowGain" [13.0] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate -53.6 10.3 131.1 Sphere 0.08 -0.08 0.08 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star27" "diffuseGain" [0] "glowGain" [9.0] "glowColor" [0.78 0.86 1.0]
+        TransformBegin Translate -2.0 38.1 138.2 Sphere 0.11 -0.11 0.11 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star28" "diffuseGain" [0] "glowGain" [18.7] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 42.8 23.6 137.1 Sphere 0.08 -0.08 0.08 360 TransformEnd AttributeEnd
+        AttributeBegin Bxdf "PxrSurface" "star29" "diffuseGain" [0] "glowGain" [16.7] "glowColor" [1.0 0.9 0.7]
+        TransformBegin Translate 15.7 23.5 117.0 Sphere 0.09 -0.09 0.09 360 TransformEnd AttributeEnd
+
+    # A few far, defocused warm motes for depth.
+    AttributeBegin
+        Bxdf "PxrSurface" "mote" "diffuseGain" [0] "glowGain" [11.0] "glowColor" [1.0 0.8 0.45]
+        TransformBegin Translate -6.5 5.6 26  Sphere 0.05 -0.05 0.05 360 TransformEnd
+        TransformBegin Translate  5.6 6.8 28  Sphere 0.05 -0.05 0.05 360 TransformEnd
+        TransformBegin Translate  3.4 4.4 32  Sphere 0.05 -0.05 0.05 360 TransformEnd
+        TransformBegin Translate -4.1 7.2 30  Sphere 0.05 -0.05 0.05 360 TransformEnd
+        TransformBegin Translate  7.8 5.7 27  Sphere 0.05 -0.05 0.05 360 TransformEnd
+    AttributeEnd
+
+    # --- The kid, facing camera, slight head tilt ----------------------
+    AttributeBegin
+        Translate 0 1.15 8.0
+        Rotate 180 0 1 0
+        Rotate -4 0 0 1
+        ReadArchive "kid_character.rib"
+    AttributeEnd
+WorldEnd
