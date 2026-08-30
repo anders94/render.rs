@@ -365,6 +365,48 @@ fn many_lights_statistical_parity() {
 }
 
 #[test]
+fn volumes_sss_statistical_parity() {
+    // Phase 10: atmosphere + heterogeneous cloud hull + SSS sphere.
+    let scene_rib = r#"
+        Format 96 96 1.0
+        Projection "perspective" "fov" [40]
+        Option "background" "color" [0.05 0.05 0.08]
+        Translate 0 -1.5 0
+        Atmosphere "haze" "sigma_a" [0.005 0.005 0.005] "sigma_s" [0.02 0.025 0.03] "g" [0.2]
+        WorldBegin
+            LightSource "pointlight" "beam" "from" [0 6 12] "intensity" [30] "lightcolor" [1 0.9 0.7]
+            LightSource "distantlight" "sun" "from" [4 8 -6] "to" [0 0 8] "intensity" [0.7]
+            Bxdf "PxrSurface" "floor" "diffuseColor" [0.3 0.3 0.32] "specularIor" [1]
+            Polygon "P" [-40 0 -5  40 0 -5  40 0 60  -40 0 60]
+            Bxdf "PxrSurface" "sss" "diffuseGain" [0]
+                "subsurfaceGain" [1] "subsurfaceColor" [0.8 0.45 0.3] "subsurfaceDmfp" [0.3 0.18 0.1]
+            TransformBegin Translate -1.8 1.1 9 Sphere 1.1 -1.1 1.1 360 TransformEnd
+            AttributeBegin
+                Bxdf "PxrSurface" "hull" "diffuseGain" [0] "specularIor" [1]
+                Interior "cloud" "sigma_a" [0.02 0.02 0.02] "sigma_s" [2.5 2.5 2.5] "g" [0.4]
+                    "density" ["fbm"] "frequency" [0.7] "octaves" [4] "coverage" [0.6] "sharpness" [5]
+                Translate 2.2 2.6 13
+                Sphere 2.2 -2.2 2.2 360
+            AttributeEnd
+        WorldEnd
+    "#;
+    let requests = render_rs::parser::parse_rib(scene_rib).unwrap();
+    let scene = render_rs::parser::SceneBuilder::new().build(&requests).unwrap();
+    assert_eq!(scene.media.len(), 2);
+    assert!(scene.atmosphere.is_some());
+
+    let cpu = pt::render(&scene, 160);
+    let gpu = metal::render_pt(&scene, 160).unwrap();
+    let mc = image_mean(&cpu);
+    let mg = image_mean(&gpu);
+    let rel = ((mc.x - mg.x).abs() + (mc.y - mg.y).abs() + (mc.z - mg.z).abs())
+        / (mc.x + mc.y + mc.z).max(0.05);
+    assert!(rel < 0.05, "volume scene mean mismatch: {mc:?} vs {mg:?} (rel {rel:.4})");
+    let e = rmse(&cpu, &gpu);
+    assert!(e < 0.15, "volume scene RMSE {e:.4}");
+}
+
+#[test]
 fn metal_pt_deterministic() {
     let scene = load_fixture_scene("cornell.rib", 64, 64);
     let a = metal::render_pt(&scene, 16).unwrap();

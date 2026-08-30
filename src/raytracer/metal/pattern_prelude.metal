@@ -33,6 +33,11 @@ struct PtMaterial {
     float hair_s;           // azimuthal logistic scale
     float hair_eta;
     uint  hair_pad;
+    uint  interior;         // medium index, 0xFFFFFFFF = none
+    float sss_gain;         // subsurface walk fields (precomputed fits)
+    float sss_sigma_t[3];
+    float sss_sigma_s[3];
+    uint  pad_sss;
 };
 
 struct TexMipG {

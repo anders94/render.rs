@@ -50,6 +50,9 @@ struct PtUniforms {
     float p_infinite;
     float infinite_total;
     uint  pad_ls;
+    uint  atmosphere;       // global medium index, 0xFFFFFFFF = none
+    uint  media_count;
+    uint  pad_med[2];
 };
 
 // PtMaterial is defined in pattern_prelude.metal (compiled just before
@@ -123,6 +126,23 @@ struct LightAuxG {
     float inf_weight;
 };
 
+struct MediumG {
+    float sigma_a[3];
+    float g;
+    float sigma_s[3];
+    float majorant;
+    float emission[3];
+    uint  has_density;
+    float frequency;
+    uint  octaves;
+    float gain;
+    float lacunarity;
+    float coverage;
+    float sharpness;
+    float max_distance;
+    float pad;
+};
+
 // All scene pointers bundled so helpers have sane signatures.
 struct PtScene {
     device const Object*    objects;
@@ -142,6 +162,7 @@ struct PtScene {
     device const CurveInfoG* curve_infos;
     device const LightBvhNodeG* light_bvh;
     device const LightAuxG* light_aux;
+    device const MediumG* media;
     device const float*     tex_data;
     device const TexMipG*   tex_mips;
     device const float*     env_pixels;
@@ -183,6 +204,132 @@ inline Pcg32 pcg_for_pixel_sample(ulong pixel, ulong sample) {
     pcg_next(r);
     return r;
 }
+
+// ---- participating media (mirror of pt/volume.rs + scene/medium.rs) -----
+
+inline float med_density(device const MediumG& m, float3 p) {
+    if (m.has_density == 0u) return 1.0f;
+    float n = pat_fbm(p, m.frequency, m.octaves, m.gain, m.lacunarity) * 0.5f + 0.5f;
+    return clamp((n - (1.0f - m.coverage)) * m.sharpness, 0.0f, 1.0f);
+}
+
+inline float hg_phase_g(float g, float cos_theta) {
+    float denom = 1.0f + g * g + 2.0f * g * cos_theta;
+    return (1.0f - g * g) / (4.0f * PT_PI * denom * sqrt(max(denom, 1e-9f)));
+}
+
+inline float3 hg_sample_g(float g, float3 wo, float u1, float u2,
+                          thread float& pdf_out) {
+    float cos_theta;
+    if (fabs(g) < 1e-3f) {
+        cos_theta = 1.0f - 2.0f * u1;
+    } else {
+        float sq = (1.0f - g * g) / (1.0f + g - 2.0f * g * u1);
+        cos_theta = -(1.0f + g * g - sq * sq) / (2.0f * g);
+    }
+    float sin_theta = sqrt(max(1.0f - cos_theta * cos_theta, 0.0f));
+    float phi = 2.0f * PT_PI * u2;
+    float3 w = -wo;
+    float3 a = fabs(w.x) > 0.9f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+    float3 t = normalize_cpu(cross(w, a));
+    float3 b = cross(w, t);
+    float3 wi = normalize_cpu(t * (sin_theta * cos(phi)) + b * (sin_theta * sin(phi))
+        + w * cos_theta);
+    pdf_out = hg_phase_g(g, -dot(wo, wi));
+    return wi;
+}
+
+// Distance sampling. Returns true on scatter (t_out, weight_out set);
+// false on pass (weight_out set).
+inline bool med_sample_distance(device const MediumG& m, float3 o, float3 d,
+                                float t_max, float3 beta, thread Pcg32& rng,
+                                thread float& t_out, thread float3& weight_out) {
+    t_max = min(t_max, m.max_distance);
+    float3 st = float3(m.sigma_a[0] + m.sigma_s[0],
+                       m.sigma_a[1] + m.sigma_s[1],
+                       m.sigma_a[2] + m.sigma_s[2]);
+    float3 ss = float3(m.sigma_s[0], m.sigma_s[1], m.sigma_s[2]);
+    if (m.has_density == 0u) {
+        float st_avg = (st.x + st.y + st.z) / 3.0f;
+        if (st_avg <= 1e-9f) { weight_out = float3(1.0f); return false; }
+        float3 b = max(beta, float3(0.0f));
+        float total = b.x + b.y + b.z;
+        float3 w = total > 1e-12f ? b / total : float3(1.0f / 3.0f);
+        float u = pcg_f32(rng);
+        float sigma_c = u < w.x ? st.x : (u < w.x + w.y ? st.y : st.z);
+        sigma_c = max(sigma_c, 1e-9f);
+        float t = -log(max(1.0f - pcg_f32(rng), 1e-12f)) / sigma_c;
+        if (t < t_max) {
+            float3 tr = exp(-st * t);
+            float pdf = w.x * st.x * tr.x + w.y * st.y * tr.y + w.z * st.z * tr.z;
+            if (pdf <= 1e-30f) { weight_out = float3(0.0f); return false; }
+            t_out = t;
+            weight_out = ss * tr / pdf;
+            return true;
+        }
+        float3 tr = exp(-st * t_max);
+        float pdf = w.x * tr.x + w.y * tr.y + w.z * tr.z;
+        weight_out = pdf > 1e-30f ? tr / pdf : float3(0.0f);
+        return false;
+    }
+    // Weighted delta tracking.
+    float majorant = m.majorant;
+    if (majorant <= 1e-9f) { weight_out = float3(1.0f); return false; }
+    float t = 0.0f;
+    float3 weight = float3(1.0f);
+    for (int i = 0; i < 4096; i++) {
+        t -= log(max(1.0f - pcg_f32(rng), 1e-12f)) / majorant;
+        if (t >= t_max) { weight_out = weight; return false; }
+        float rho = med_density(m, o + d * t);
+        float3 st_here = st * rho;
+        float p_real = clamp((st_here.x + st_here.y + st_here.z) / (3.0f * majorant),
+                             0.0f, 1.0f);
+        if (pcg_f32(rng) < p_real) {
+            t_out = t;
+            weight_out = weight * (ss * rho) / (majorant * p_real);
+            return true;
+        }
+        float p_null = max(1.0f - p_real, 1e-9f);
+        weight *= (float3(1.0f) - st_here / majorant) / p_null;
+        if (max(max(weight.x, weight.y), weight.z) < 1e-6f) {
+            weight_out = float3(0.0f);
+            return false;
+        }
+    }
+    weight_out = weight;
+    return false;
+}
+
+// Ratio-tracked (or closed-form) transmittance of one medium segment.
+inline float3 med_transmittance(device const MediumG& m, float3 o, float3 d,
+                                float dist, thread Pcg32& rng) {
+    dist = min(dist, m.max_distance);
+    float3 st = float3(m.sigma_a[0] + m.sigma_s[0],
+                       m.sigma_a[1] + m.sigma_s[1],
+                       m.sigma_a[2] + m.sigma_s[2]);
+    if (m.has_density == 0u) return exp(-st * dist);
+    float majorant = m.majorant;
+    if (majorant <= 1e-9f) return float3(1.0f);
+    float t = 0.0f;
+    float3 tr = float3(1.0f);
+    for (int i = 0; i < 4096; i++) {
+        t -= log(max(1.0f - pcg_f32(rng), 1e-12f)) / majorant;
+        if (t >= dist) break;
+        float rho = med_density(m, o + d * t);
+        tr *= float3(1.0f) - st * (rho / majorant);
+        if (max(max(tr.x, tr.y), tr.z) < 1e-5f) return float3(0.0f);
+    }
+    return tr;
+}
+
+// A volume hull: interior medium, no lobes, no emission — pure boundary.
+inline bool is_volume_hull(thread const PtMaterial& m) {
+    float wsum = m.weights[0] + m.weights[1] + m.weights[2] + m.weights[3]
+        + m.weights[4];
+    float em = m.emission[0] + m.emission[1] + m.emission[2];
+    return m.interior != 0xFFFFFFFFu && m.is_hair == 0u && wsum <= 0.0f && em <= 0.0f;
+}
+
 
 // ---- traversal ----
 
@@ -1118,21 +1265,34 @@ inline float light_pdf_solid_angle(PtLight l, float3 origin, float3 hit_p) {
     return 0.0f;
 }
 
-// Fractional visibility (presence cutouts attenuate; opaque kills).
-inline float pt_visibility(thread const PtScene& s, float3 p, float3 n,
-                           float3 dir, float dist, float time) {
+// Fractional visibility: presence cutouts attenuate, opaque kills,
+// volume hulls toggle the medium, media tint the segments.
+inline float3 pt_visibility(thread const PtScene& s, float3 p, float3 n,
+                            float3 dir, float dist, float time, uint medium,
+                            thread Pcg32& rng) {
     float3 origin = p + n * PT_RAY_OFFSET;
     float remaining = dist - 1e-3f;
-    float vis = 1.0f;
+    float3 vis = float3(1.0f);
     for (int i = 0; i < 16; i++) {
         PtHit h = pt_trace_scene(s, origin, dir, time);
+        float seg = h.hit ? min(h.t, remaining) : remaining;
+        if (medium != 0xFFFFFFFFu) {
+            vis *= med_transmittance(s.media[medium], origin, dir, seg, rng);
+            if (max(max(vis.x, vis.y), vis.z) < 1e-4f) return float3(0.0f);
+        }
         if (!h.hit || h.t >= remaining) return vis;
         PtMaterial pm = s.materials[h.material];
+        if (is_volume_hull(pm)) {
+            medium = h.front ? pm.interior : s.u->atmosphere;
+            origin = h.p + dir * PT_RAY_OFFSET;
+            remaining -= h.t + PT_RAY_OFFSET;
+            continue;
+        }
         apply_patterns(h.material, pm, h.st, h.p, h.n, 0.0f, s.tex_data, s.tex_mips);
         float presence = clamp(pm.presence, 0.0f, 1.0f);
-        if (presence >= 1.0f) return 0.0f;
+        if (presence >= 1.0f) return float3(0.0f);
         vis *= 1.0f - presence;
-        if (vis < 1e-4f) return 0.0f;
+        if (max(max(vis.x, vis.y), vis.z) < 1e-4f) return float3(0.0f);
         origin = h.p + dir * PT_RAY_OFFSET;
         remaining -= h.t + PT_RAY_OFFSET;
     }
@@ -1462,8 +1622,10 @@ inline float ls_pmf(thread const PtScene& s, float3 p, uint light) {
 
 struct EvalCtx {
     bool hair;
+    bool phase;        // volume scatter point: HG phase in world space
+    float phase_g;
     FrameL frame;      // surface frame (n = z) or fiber frame (t = x)
-    float3 wo_l;
+    float3 wo_l;       // local wo (surfaces/hair) or WORLD wo (phase)
     PtMaterial m;
     float eta;
     float h;
@@ -1471,7 +1633,18 @@ struct EvalCtx {
 
 inline float3 eval_bsdf_weighted(thread const EvalCtx& c, float3 wi_world,
                                  thread float& pdf_out) {
+    if (c.phase) {
+        float ph = hg_phase_g(c.phase_g, -dot(c.wo_l, wi_world));
+        pdf_out = ph;
+        return float3(ph);
+    }
     float3 wi_l = to_local(c.frame, wi_world);
+    if (c.h > 1.5f && !c.hair) {
+        // SSS exit vertex: white Lambert transmission (f*cos = cos/pi).
+        if (wi_l.z <= 0.0f) { pdf_out = 0.0f; return float3(0.0f); }
+        pdf_out = wi_l.z / PT_PI;
+        return float3(wi_l.z / PT_PI);
+    }
     if (c.hair) {
         pdf_out = hair_pdf(c.m, c.wo_l, wi_l, c.h);
         return hair_f(c.m, c.wo_l, wi_l, c.h);
@@ -1487,7 +1660,8 @@ inline float3 eval_bsdf_weighted(thread const EvalCtx& c, float3 wi_world,
 
 inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
                                float3 nbias, thread const EvalCtx& ec,
-                               float pick_pmf, float time, thread Pcg32& rng) {
+                               float pick_pmf, float time, uint medium,
+                               thread Pcg32& rng) {
     float3 n = nbias;
     float3 rad = m3(l.radiance);
 
@@ -1499,8 +1673,8 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float pdf;
         float3 f = eval_bsdf_weighted(ec, wi, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-        float vis = pt_visibility(s, p, n, wi, dist, time);
-        return f * rad * (vis / (dist2 * pick_pmf));
+        float3 vis = pt_visibility(s, p, n, wi, dist, time, medium, rng);
+        return f * rad * vis / (dist2 * pick_pmf);
     }
     if (l.kind == 1u) {                       // distant (soft when area>0)
         float3 base = -m3(l.a);
@@ -1518,8 +1692,8 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float pdf;
         float3 f = eval_bsdf_weighted(ec, wi, pdf);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-        float vis = pt_visibility(s, p, n, wi, PT_BIG, time);
-        return f * rad * (vis / pick_pmf);
+        float3 vis = pt_visibility(s, p, n, wi, PT_BIG, time, medium, rng);
+        return f * rad * vis / pick_pmf;
     }
     if (l.kind == 2u || l.kind == 4u) {       // rect / disk
         float uu = pcg_f32(rng);
@@ -1541,11 +1715,11 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         float bp;
         float3 f = eval_bsdf_weighted(ec, wi, bp);
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-        float vis = pt_visibility(s, p, n, wi, dist, time);
-        if (vis <= 0.0f) return float3(0.0f);
+        float3 vis = pt_visibility(s, p, n, wi, dist, time, medium, rng);
+        if (max(max(vis.x, vis.y), vis.z) <= 0.0f) return float3(0.0f);
         float pdf_sa = pick_pmf * dist2 / (cl * l.area);
         float w = power_heuristic(pdf_sa, bp);
-        return f * rad * (vis / pdf_sa) * w;
+        return f * rad * vis * (w / pdf_sa);
     }
     if (l.kind == 3u) {                       // sphere area: visible cone
         float3 c = m3(l.a);
@@ -1567,11 +1741,11 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
         if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
         float dist = sqrt(dist2) * ct
             - sqrt(max(radius * radius - dist2 * st * st, 0.0f));
-        float vis = pt_visibility(s, p, n, wi, dist, time);
-        if (vis <= 0.0f) return float3(0.0f);
+        float3 vis = pt_visibility(s, p, n, wi, dist, time, medium, rng);
+        if (max(max(vis.x, vis.y), vis.z) <= 0.0f) return float3(0.0f);
         float pdf_sa = pick_pmf / max(2.0f * PT_PI * (1.0f - cm), 1e-12f);
         float w = power_heuristic(pdf_sa, bp);
-        return f * rad * (vis / pdf_sa) * w;
+        return f * rad * vis * (w / pdf_sa);
     }
     // dome
     float3 wi, er;
@@ -1582,10 +1756,10 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
     float bp;
     float3 f = eval_bsdf_weighted(ec, wi, bp);
     if (max(max(f.x, f.y), f.z) <= 0.0f) return float3(0.0f);
-    float vis = pt_visibility(s, p, n, wi, PT_BIG, time);
-    if (vis <= 0.0f) return float3(0.0f);
+    float3 vis = pt_visibility(s, p, n, wi, PT_BIG, time, medium, rng);
+    if (max(max(vis.x, vis.y), vis.z) <= 0.0f) return float3(0.0f);
     float w = power_heuristic(pdf_sa, bp);
-    return f * (er * rad) * (vis / pdf_sa) * w;
+    return f * (er * rad) * vis * (w / pdf_sa);
 }
 
 // ---- the path integrator (mirror of pt::trace) --------------------------
@@ -1603,10 +1777,61 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
     // Ray cone for texture mip selection (mirror of pt::trace).
     float cone_width = 0.0f;
     float cone_spread = 2.0f * u.half_height / (float)u.height;
+    // Participating medium the ray currently travels in.
+    uint medium = u.atmosphere;
 
     uint depth = 0u;
     while (depth < u.max_bounces) {
         PtHit h = pt_trace_scene(s, origin, dir, time);
+
+        // Medium interaction along this segment (mirror of pt::trace).
+        if (medium != 0xFFFFFFFFu) {
+            device const MediumG& med = s.media[medium];
+            float t_limit = h.hit ? h.t : PT_BIG;
+            float mt;
+            float3 mweight;
+            if (med_sample_distance(med, origin, dir, t_limit, beta, rng, mt, mweight)) {
+                beta *= mweight;
+                float3 p = origin + dir * mt;
+                float3 emv = float3(med.emission[0], med.emission[1], med.emission[2]);
+                if (emv.x + emv.y + emv.z > 0.0f) l += beta * emv;
+                float3 wo = -normalize_cpu(dir);
+                if (u.light_count > 0u) {
+                    EvalCtx ec;
+                    ec.hair = false;
+                    ec.phase = true;
+                    ec.phase_g = med.g;
+                    ec.frame = frame_of(float3(0.0f, 0.0f, 1.0f));
+                    ec.wo_l = wo; // world-space wo for the phase path
+                    ec.m = s.materials[0];
+                    ec.eta = 1.0f;
+                    ec.h = 0.0f;
+                    float pick;
+                    uint li = ls_sample(s, p, pcg_f32(rng), pick);
+                    float3 c = sample_one_light(s, s.lights[li], p, float3(0.0f), ec,
+                                                pick, time, medium, rng);
+                    l += beta * c;
+                }
+                float ppdf;
+                float3 wi = hg_sample_g(med.g, wo, pcg_f32(rng), pcg_f32(rng), ppdf);
+                prev_pdf = ppdf;
+                prev_origin = p;
+                from_camera = false;
+                cone_spread += 0.4f;
+                origin = p;
+                dir = wi;
+                depth++;
+                if (depth >= u.rr_start) {
+                    float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
+                    if (q <= 0.0f || pcg_f32(rng) > q) break;
+                    beta /= q;
+                }
+                continue;
+            }
+            beta *= mweight;
+            if (max(max(beta.x, beta.y), beta.z) <= 0.0f) break;
+        }
+
         if (!h.hit) {
             if (u.dome_index != 0xFFFFFFFFu) {
                 float3 d = normalize_cpu(dir);
@@ -1623,6 +1848,15 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             break;
         }
         PtMaterial m = s.materials[h.material];
+
+        // Invisible volume hull: crossing toggles the medium.
+        if (is_volume_hull(m) && presence_skips < 16u) {
+            presence_skips++;
+            medium = h.front ? m.interior : u.atmosphere;
+            origin = h.p + normalize_cpu(dir) * PT_RAY_OFFSET;
+            continue;
+        }
+
         float3 wo = -normalize_cpu(dir);
         cone_width += h.t * cone_spread;
         apply_patterns(h.material, m, h.st, h.p, h.n,
@@ -1659,6 +1893,8 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             if (u.light_count > 0u) {
                 EvalCtx ec;
                 ec.hair = true;
+                ec.phase = false;
+                ec.phase_g = 0.0f;
                 ec.frame = ff;
                 ec.wo_l = wo_f;
                 ec.m = m;
@@ -1666,7 +1902,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                 ec.h = hh;
                 float pick;
                 uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
-                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, rng);
+                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, medium, rng);
                 l += beta * c;
             }
             float3 wi_f, fv;
@@ -1690,6 +1926,116 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             continue;
         }
 
+        // Subsurface random walk (mirror of pt::trace's SSS branch).
+        if (m.sss_gain > 0.0f && m.is_hair == 0u && pcg_f32(rng) < m.sss_gain) {
+            MediumG sm;
+            for (int k = 0; k < 3; k++) {
+                sm.sigma_s[k] = m.sss_sigma_s[k];
+                sm.sigma_a[k] = m.sss_sigma_t[k] - m.sss_sigma_s[k];
+            }
+            sm.g = 0.0f;
+            sm.has_density = 0u;
+            sm.majorant = 0.0f;
+            // Cosine entry around -n.
+            FrameL ef = frame_of(-n);
+            float eu1 = pcg_f32(rng);
+            float eu2 = pcg_f32(rng);
+            float er = sqrt(eu1);
+            float eph = 2.0f * PT_PI * eu2;
+            float3 wdir = to_world(ef, float3(er * cos(eph), er * sin(eph),
+                                              sqrt(max(1.0f - eu1, 0.0f))));
+            float3 wpos = h.p - n * PT_RAY_OFFSET;
+            bool exited = false;
+            for (int step = 0; step < 256; step++) {
+                PtHit wh = pt_trace_scene(s, wpos, wdir, time);
+                if (!wh.hit) break;
+                float mt;
+                float3 mweight;
+                // Local copy: device-const media functions need a device ref;
+                // build inline homogeneous sampling instead.
+                float3 st3 = float3(m.sss_sigma_t[0], m.sss_sigma_t[1], m.sss_sigma_t[2]);
+                float3 ss3 = float3(m.sss_sigma_s[0], m.sss_sigma_s[1], m.sss_sigma_s[2]);
+                {
+                    float3 b = max(beta, float3(0.0f));
+                    float total = b.x + b.y + b.z;
+                    float3 w = total > 1e-12f ? b / total : float3(1.0f / 3.0f);
+                    float u1 = pcg_f32(rng);
+                    float sigma_c = u1 < w.x ? st3.x : (u1 < w.x + w.y ? st3.y : st3.z);
+                    sigma_c = max(sigma_c, 1e-9f);
+                    float t = -log(max(1.0f - pcg_f32(rng), 1e-12f)) / sigma_c;
+                    if (t < wh.t) {
+                        float3 tr = exp(-st3 * t);
+                        float pdf = w.x * st3.x * tr.x + w.y * st3.y * tr.y
+                            + w.z * st3.z * tr.z;
+                        if (pdf <= 1e-30f) break;
+                        mweight = ss3 * tr / pdf;
+                        mt = t;
+                        // Scatter: isotropic direction.
+                        beta *= mweight;
+                        float3 sp = wpos + wdir * mt;
+                        float su = pcg_f32(rng);
+                        float sv = pcg_f32(rng);
+                        float z = 1.0f - 2.0f * su;
+                        float rr2 = sqrt(max(1.0f - z * z, 0.0f));
+                        float sph = 2.0f * PT_PI * sv;
+                        wpos = sp;
+                        wdir = float3(rr2 * cos(sph), rr2 * sin(sph), z);
+                        float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
+                        if (q <= 0.0f || (step > 8 && pcg_f32(rng) > q)) break;
+                        if (step > 8) beta /= q;
+                        continue;
+                    }
+                    // Pass to the boundary: exit diffusely.
+                    float3 tr = exp(-st3 * wh.t);
+                    float pdf = w.x * tr.x + w.y * tr.y + w.z * tr.z;
+                    if (pdf <= 1e-30f) break;
+                    beta *= tr / pdf;
+                }
+                float3 out_n = dot(wh.n, wdir) > 0.0f ? wh.n : -wh.n;
+                FrameL xf = frame_of(out_n);
+                float3 exit_p = wpos + wdir * wh.t;
+                if (u.light_count > 0u) {
+                    EvalCtx ec;
+                    ec.hair = false;
+                    ec.phase = false;
+                    ec.phase_g = 0.0f;
+                    ec.frame = xf;
+                    ec.wo_l = float3(0.0f, 0.0f, 1.0f);
+                    ec.m = m;
+                    ec.eta = 1.0f;
+                    ec.h = 2.0f; // sentinel: lambert-exit eval
+                    float pick;
+                    uint li = ls_sample(s, exit_p, pcg_f32(rng), pick);
+                    float3 c = sample_one_light(s, s.lights[li], exit_p, out_n, ec,
+                                                pick, time, medium, rng);
+                    l += beta * c;
+                }
+                float xu1 = pcg_f32(rng);
+                float xu2 = pcg_f32(rng);
+                float xr = sqrt(xu1);
+                float xph = 2.0f * PT_PI * xu2;
+                float3 lw = float3(xr * cos(xph), xr * sin(xph),
+                                   sqrt(max(1.0f - xu1, 0.0f)));
+                float3 wi = to_world(xf, lw);
+                prev_pdf = max(lw.z, 1e-9f) / PT_PI;
+                prev_origin = exit_p;
+                from_camera = false;
+                cone_spread += 0.4f;
+                origin = exit_p + out_n * PT_RAY_OFFSET;
+                dir = wi;
+                exited = true;
+                break;
+            }
+            if (!exited) break;
+            depth++;
+            if (depth >= u.rr_start) {
+                float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
+                if (q <= 0.0f || pcg_f32(rng) > q) break;
+                beta /= q;
+            }
+            continue;
+        }
+
         FrameL frame = frame_of(n);
         float3 wo_l = to_local(frame, wo);
         float wsum = m.weights[0] + m.weights[1] + m.weights[2] + m.weights[3]
@@ -1698,6 +2044,8 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
         if (u.light_count > 0u && wsum > 0.0f) {
             EvalCtx ec;
             ec.hair = false;
+            ec.phase = false;
+            ec.phase_g = 0.0f;
             ec.frame = frame;
             ec.wo_l = wo_l;
             ec.m = m;
@@ -1705,7 +2053,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             ec.h = 0.0f;
             float pick;
             uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
-            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, rng);
+            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, medium, rng);
             l += beta * c;
         }
 
@@ -1720,6 +2068,9 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
         from_camera = false;
         cone_spread += min(1.0f / (1.0f + pdf), 0.4f);
 
+        if (transmitted && m.interior != 0xFFFFFFFFu) {
+            medium = entering ? m.interior : u.atmosphere;
+        }
         float off = transmitted ? -PT_RAY_OFFSET : PT_RAY_OFFSET;
         origin = h.p + n * off;
         dir = wi;
@@ -1776,8 +2127,9 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
                       device const CurveInfoG* curve_infos      [[buffer(19)]],
                       device const LightBvhNodeG* light_bvh     [[buffer(20)]],
                       device const LightAuxG*  light_aux        [[buffer(21)]],
-                      constant PtUniforms&     u                [[buffer(22)]],
-                      device float*            accum            [[buffer(23)]],
+                      device const MediumG*    media            [[buffer(22)]],
+                      constant PtUniforms&     u                [[buffer(23)]],
+                      device float*            accum            [[buffer(24)]],
                       uint2 gid [[thread_position_in_grid]]) {
     uint py_row = gid.y + u.y_offset;
     if (gid.x >= u.width || py_row >= u.height) return;
@@ -1800,6 +2152,7 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
     s.curve_infos = curve_infos;
     s.light_bvh = light_bvh;
     s.light_aux = light_aux;
+    s.media = media;
     s.tex_data = tex_data;
     s.tex_mips = tex_mips;
     s.env_pixels = env_pixels;

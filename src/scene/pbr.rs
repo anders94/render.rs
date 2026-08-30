@@ -37,6 +37,14 @@ pub struct PbrParams {
     pub glow: Vec3,
     /// Stochastic cutout alpha (1 = solid).
     pub presence: f64,
+
+    /// Subsurface scattering: probability of entering the random walk
+    /// instead of surface shading (0 disables).
+    pub subsurface_gain: f64,
+    /// Multi-scatter surface albedo the walk should produce.
+    pub subsurface_color: Vec3,
+    /// Mean free path length, per channel, in scene units.
+    pub subsurface_dmfp: Vec3,
 }
 
 impl Default for PbrParams {
@@ -59,6 +67,9 @@ impl Default for PbrParams {
             refraction_color: Vec3::one(),
             glow: Vec3::zero(),
             presence: 1.0,
+            subsurface_gain: 0.0,
+            subsurface_color: Vec3::new(0.8, 0.6, 0.4),
+            subsurface_dmfp: Vec3::new(0.1, 0.1, 0.1),
         }
     }
 }
@@ -160,6 +171,15 @@ impl PbrParams {
         color("glowColor", &mut glow_color);
         p.glow = glow_color * glow_gain;
         scalar("presence", &mut p.presence);
+        scalar("subsurfaceGain", &mut p.subsurface_gain);
+        color("subsurfaceColor", &mut p.subsurface_color);
+        if let Some(v) = params.get_numbers("subsurfaceDmfp") {
+            p.subsurface_dmfp = if v.len() >= 3 {
+                Vec3::new(v[0], v[1], v[2])
+            } else {
+                Vec3::new(v[0], v[0], v[0])
+            };
+        }
         p.specular_roughness = p.specular_roughness.clamp(0.005, 1.0);
         p.glass_roughness = p.glass_roughness.clamp(0.005, 1.0);
         p.clearcoat_roughness = p.clearcoat_roughness.clamp(0.005, 1.0);

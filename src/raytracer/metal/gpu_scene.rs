@@ -44,6 +44,27 @@ pub struct GpuMeshInfo {
     pub has_deform: u32,
 }
 
+/// Participating medium, GPU-shaped (density params inline; the kernel
+/// reuses pat_fbm for the heterogeneous field).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuMedium {
+    pub sigma_a: [f32; 3],
+    pub g: f32,
+    pub sigma_s: [f32; 3],
+    pub majorant: f32,
+    pub emission: [f32; 3],
+    pub has_density: u32,
+    pub frequency: f32,
+    pub octaves: u32,
+    pub gain: f32,
+    pub lacunarity: f32,
+    pub coverage: f32,
+    pub sharpness: f32,
+    pub max_distance: f32,
+    pub pad: f32,
+}
+
 /// Per-light sampler data: BVH leaf (finite) or infinite-group weight.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -129,6 +150,14 @@ pub struct GpuPtMaterial {
     pub hair_s: f32,
     pub hair_eta: f32,
     pub hair_pad: u32,
+    /// Interior medium index (u32::MAX = none).
+    pub interior: u32,
+    /// Subsurface: entry probability + precomputed walk coefficients
+    /// (Kulla-Conty albedo inversion and Burley scaling done CPU-side).
+    pub sss_gain: f32,
+    pub sss_sigma_t: [f32; 3],
+    pub sss_sigma_s: [f32; 3],
+    pub pad_sss: u32,
 }
 
 #[repr(C)]
@@ -192,6 +221,10 @@ pub struct GpuPtUniforms {
     pub p_infinite: f32,
     pub infinite_total: f32,
     pub pad_ls: u32,
+    /// Global medium index (u32::MAX = none).
+    pub atmosphere: u32,
+    pub media_count: u32,
+    pub pad_med: [u32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
@@ -199,9 +232,10 @@ const _: () = assert!(std::mem::size_of::<GpuMeshInfo>() == 24);
 const _: () = assert!(std::mem::size_of::<GpuInstance>() == 224);
 const _: () = assert!(std::mem::size_of::<GpuCurveSeg>() == 48);
 const _: () = assert!(std::mem::size_of::<GpuCurveInfo>() == 16);
-const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 184);
+const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 220);
+const _: () = assert!(std::mem::size_of::<GpuMedium>() == 80);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
-const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 176);
+const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 192);
 const _: () = assert!(std::mem::size_of::<GpuLightAux>() == 8);
 
 pub struct GpuPtScene {
@@ -228,6 +262,7 @@ pub struct GpuPtScene {
     /// Light BVH nodes (byte-identical to scene.light_sampler.nodes).
     pub light_bvh: Vec<crate::scene::light_sampler::LightBvhNode>,
     pub light_aux: Vec<GpuLightAux>,
+    pub media: Vec<GpuMedium>,
     pub mesh_infos: Vec<GpuMeshInfo>,
     /// Packed texture table + generated pattern MSL (pattern_codegen).
     pub tex_data: Vec<f32>,
@@ -303,6 +338,23 @@ impl GpuPtScene {
                     under_scale: under as f32,
                     weights: weights.map(|w| w as f32),
                     area_light: m.area_light.map(|i| i as u32).unwrap_or(u32::MAX),
+                    interior: m.interior.unwrap_or(u32::MAX),
+                    sss_gain: p.subsurface_gain.clamp(0.0, 1.0) as f32,
+                    sss_sigma_t: {
+                        let sm = crate::raytracer::pt::volume::sss_medium(
+                            &p.subsurface_color,
+                            &p.subsurface_dmfp,
+                        );
+                        v3(&sm.sigma_t())
+                    },
+                    sss_sigma_s: {
+                        let sm = crate::raytracer::pt::volume::sss_medium(
+                            &p.subsurface_color,
+                            &p.subsurface_dmfp,
+                        );
+                        v3(&sm.sigma_s)
+                    },
+                    pad_sss: 0,
                     is_hair: m.hair.is_some() as u32,
                     hair_sigma_a: m
                         .hair
@@ -468,6 +520,47 @@ impl GpuPtScene {
             })
             .collect();
 
+        // Media.
+        let media: Vec<GpuMedium> = scene
+            .media
+            .iter()
+            .map(|m| {
+                let (has_density, frequency, octaves, gain, lacunarity, coverage, sharpness) =
+                    match &m.density {
+                        Some(crate::scene::DensityField::Fbm {
+                            params,
+                            coverage,
+                            sharpness,
+                        }) => (
+                            1u32,
+                            params.frequency as f32,
+                            params.octaves,
+                            params.gain as f32,
+                            params.lacunarity as f32,
+                            *coverage as f32,
+                            *sharpness as f32,
+                        ),
+                        None => (0, 0.0, 0, 0.0, 0.0, 0.0, 0.0),
+                    };
+                GpuMedium {
+                    sigma_a: v3(&m.sigma_a),
+                    g: m.g as f32,
+                    sigma_s: v3(&m.sigma_s),
+                    majorant: m.majorant() as f32,
+                    emission: v3(&m.emission),
+                    has_density,
+                    frequency,
+                    octaves,
+                    gain,
+                    lacunarity,
+                    coverage,
+                    sharpness,
+                    max_distance: m.max_distance.min(1e30) as f32,
+                    pad: 0.0,
+                }
+            })
+            .collect();
+
         // Curve sets: segments permuted into BLAS leaf order, nodes
         // appended to the shared blas buffer.
         let mut curve_segs: Vec<GpuCurveSeg> = Vec::new();
@@ -530,7 +623,7 @@ impl GpuPtScene {
             object_count: objects.len() as u32,
             instance_count: instances.len() as u32,
             light_count: lights.len() as u32,
-            max_bounces: MAX_BOUNCES,
+            max_bounces: if scene.media.is_empty() { MAX_BOUNCES } else { 64 },
             rr_start: RR_START,
             y_offset: 0,
             firefly_clamp: FIREFLY_CLAMP,
@@ -565,6 +658,9 @@ impl GpuPtScene {
             p_infinite: ls.p_infinite as f32,
             infinite_total: ls.infinite_total as f32,
             pad_ls: 0,
+            atmosphere: scene.atmosphere.unwrap_or(u32::MAX),
+            media_count: media.len() as u32,
+            pad_med: [0; 2],
         };
 
         let patterns = super::pattern_codegen::build(scene);
@@ -585,6 +681,7 @@ impl GpuPtScene {
             curve_infos,
             light_bvh,
             light_aux,
+            media,
             mesh_infos,
             tex_data: patterns.tex_data,
             tex_mips: patterns.tex_mips,
@@ -646,6 +743,9 @@ impl GpuPtScene {
         }
         if self.light_aux.is_empty() {
             self.light_aux.push(unsafe { std::mem::zeroed() });
+        }
+        if self.media.is_empty() {
+            self.media.push(unsafe { std::mem::zeroed() });
         }
         if self.tex_data.is_empty() {
             self.tex_data.extend_from_slice(&[0.0; 3]);
@@ -714,6 +814,9 @@ impl GpuPtScene {
     }
     pub fn light_aux_bytes(&self) -> &[u8] {
         as_bytes(&self.light_aux)
+    }
+    pub fn media_bytes(&self) -> &[u8] {
+        as_bytes(&self.media)
     }
     pub fn tex_data_bytes(&self) -> &[u8] {
         as_bytes(&self.tex_data)

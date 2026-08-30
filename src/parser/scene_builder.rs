@@ -54,6 +54,8 @@ struct GraphicsState {
     motion_t1: Option<Matrix4>,
     /// Hair material from Bxdf "PxrMarschnerHair".
     hair: Option<crate::raytracer::pt::hair::HairParams>,
+    /// Interior medium bound to subsequent geometry.
+    interior: Option<u32>,
     basis_u: (Basis4, usize),
     basis_v: (Basis4, usize),
 }
@@ -75,6 +77,7 @@ impl Default for GraphicsState {
             motion_t0: None,
             motion_t1: None,
             hair: None,
+            interior: None,
             basis_u: (BEZIER, 3),
             basis_v: (BEZIER, 3),
         }
@@ -84,6 +87,8 @@ impl Default for GraphicsState {
 /// Everything the builder accumulates into the Scene.
 #[derive(Default)]
 struct SceneData {
+    media: Vec<Medium>,
+    atmosphere: Option<u32>,
     objects: Vec<Arc<dyn Intersectable>>,
     meshes: Vec<Mesh>,
     curve_sets: Vec<CurveSet>,
@@ -214,6 +219,8 @@ impl SceneBuilder {
         scene.pixel_samples = self.pixel_samples;
         scene.background_color = self.background;
         scene.patterns = self.pattern_nodes;
+        scene.media = data.media.clone();
+        scene.atmosphere = data.atmosphere;
         scene.has_motion = scene.instances.iter().any(|i| i.transform1.is_some())
             || scene.meshes.iter().any(|m| m.positions1.is_some());
         scene.build_tlas();
@@ -282,6 +289,60 @@ impl SceneBuilder {
                     self.read_archive(name, data)?;
                 }
             }
+            // Participating media (roadmap Phase 10). Extension params:
+            // sigma_a/sigma_s [rgb], g, and for heterogeneous clouds
+            // density "fbm" + frequency/octaves/gain/lacunarity/coverage/
+            // sharpness. Exterior is accepted but unimplemented.
+            "Interior" | "Atmosphere" => {
+                let params = req.params_from(1);
+                let get3 = |name: &str, d: Vec3| {
+                    params
+                        .get_numbers(name)
+                        .and_then(|v| (v.len() >= 3).then(|| Vec3::new(v[0], v[1], v[2])))
+                        .unwrap_or(d)
+                };
+                let density = match params.get_string("density") {
+                    Some("fbm") | Some("noise") => Some(DensityField::Fbm {
+                        params: DisplaceParams {
+                            amplitude: 1.0,
+                            frequency: params.get_number("frequency").unwrap_or(0.3),
+                            octaves: params.get_number("octaves").unwrap_or(5.0) as u32,
+                            gain: params.get_number("gain").unwrap_or(0.55),
+                            lacunarity: params.get_number("lacunarity").unwrap_or(2.0),
+                            offset: [0.0; 3],
+                        },
+                        coverage: params.get_number("coverage").unwrap_or(0.5),
+                        sharpness: params.get_number("sharpness").unwrap_or(4.0),
+                    }),
+                    Some(other) => {
+                        self.warn_once(&format!(
+                            "Interior density \"{other}\" not implemented; homogeneous"
+                        ));
+                        None
+                    }
+                    None => None,
+                };
+                let default_extent = if req.name == "Atmosphere" { 1200.0 } else { f64::INFINITY };
+                let medium = Medium {
+                    sigma_a: get3("sigma_a", Vec3::new(0.1, 0.1, 0.1)),
+                    sigma_s: get3("sigma_s", Vec3::new(0.5, 0.5, 0.5)),
+                    g: params.get_number("g").unwrap_or(0.0),
+                    density,
+                    emission: get3("emission", Vec3::zero()),
+                    max_distance: params.get_number("maxdistance").unwrap_or(default_extent),
+                };
+                data.media.push(medium);
+                let idx = (data.media.len() - 1) as u32;
+                if req.name == "Atmosphere" {
+                    data.atmosphere = Some(idx);
+                } else {
+                    self.state.interior = Some(idx);
+                }
+            }
+            "Exterior" => {
+                self.warn_once("Exterior media not implemented; ignoring");
+            }
+
             // Procedural geometry: DelayedReadArchive loads eagerly (we
             // have no lazy loading yet — bounds ignored); RunProgram
             // spawns the generator and parses its stdout as RIB.
@@ -1733,6 +1794,7 @@ impl SceneBuilder {
             // outside the path tracer.
             let mut m = Material::matte(Vec3::new(0.35, 0.22, 0.12));
             m.hair = Some(hp.clone());
+            m.interior = self.state.interior;
             return m;
         }
         if let Some(pbr) = &self.state.bxdf {
@@ -1741,13 +1803,16 @@ impl SceneBuilder {
             m.pbr = pbr.clone();
             m.emission = Vec3::zero();
             m.pattern_bindings = self.state.bxdf_bindings.clone();
+            m.interior = self.state.interior;
             return m;
         }
-        match self.state.surface.as_str() {
+        let mut m = match self.state.surface.as_str() {
             "plastic" => Material::plastic(self.state.color, self.state.roughness),
             "metal" => Material::metal(self.state.color, self.state.roughness),
             _ => Material::matte(self.state.color),
-        }
+        };
+        m.interior = self.state.interior;
+        m
     }
 
     /// Create a material from the current attribute state; returns its id.

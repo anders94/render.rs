@@ -248,7 +248,9 @@ cargo run --release -- tests/fixtures/materials.rib -o test.png -f png
 
 5. **Global illumination** - The `--integrator path` path tracer (CPU and Metal) does full GI with NEE+MIS; the default Whitted integrator remains the fast direct-light preview. Scenes with many lights (tested to 1200+) are sampled through a light BVH (power/distance importance) on both backends. Long Metal renders can be checkpointed and resumed with `--checkpoint <file>`.
 
-6. **Movie-scale I/O** - Binary RIB reads transparently (mixed ASCII+binary per RISpec Appendix C); `render catrib --binary` converts archives (~45% smaller). `Procedural "DelayedReadArchive"` (eager) and `"RunProgram"` (spawned generators) work; ReadArchive nests both text and binary.
+6. **Volumes & subsurface** - Participating media via `Atmosphere` (global, bounded by `maxdistance`) and `Interior` (bound to geometry hulls or glass): homogeneous fog analytically, heterogeneous fBm clouds by delta/ratio tracking, Henyey-Greenstein phase, colored medium-aware shadows — on CPU and Metal. Subsurface scattering on PxrSurface (`subsurfaceGain/Color/Dmfp`) as a spectral random walk (Kulla-Conty albedo inversion + Burley scaling). Deferred: VDB grid ingest, equiangular sampling, nested media.
+
+7. **Movie-scale I/O** - Binary RIB reads transparently (mixed ASCII+binary per RISpec Appendix C); `render catrib --binary` converts archives (~45% smaller). `Procedural "DelayedReadArchive"` (eager) and `"RunProgram"` (spawned generators) work; ReadArchive nests both text and binary.
 
 ## Future Enhancements
 

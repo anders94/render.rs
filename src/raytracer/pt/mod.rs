@@ -9,10 +9,12 @@
 pub mod bxdf;
 pub mod hair;
 pub mod sampler;
+pub mod volume;
 
 use crate::math::{Point3, Vec3};
 use crate::output::Image;
 use crate::raytracer::{Intersection, Ray};
+use crate::scene::medium::{hg_phase, hg_sample};
 use crate::scene::{Light, LightType, Material, PbrParams, Scene};
 use crate::texture::pattern::ShadeCtx;
 use bxdf::Frame;
@@ -200,10 +202,77 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
     // widens after rough bounces.
     let mut cone_width = 0.0f64;
     let mut cone_spread = pixel_spread;
+    // Participating medium the ray currently travels in.
+    let mut medium: Option<u32> = scene.atmosphere;
+    // Multiple scattering in clouds needs a deeper budget than surfaces.
+    let max_bounces = if scene.media.is_empty() { MAX_BOUNCES } else { 64 };
 
     let mut depth = 0usize;
-    while depth < MAX_BOUNCES {
-        let Some(hit) = scene.intersect(&ray) else {
+    while depth < max_bounces {
+        let hit_opt = scene.intersect(&ray);
+
+        // Medium interaction along this segment (before any surface).
+        if let Some(mid) = medium {
+            let med = &scene.media[mid as usize];
+            let t_limit = hit_opt.as_ref().map(|h| h.t).unwrap_or(1e8);
+            match volume::sample_distance(med, &ray, t_limit, &beta, rng) {
+                volume::MediumEvent::Scatter { t, weight } => {
+                    beta = beta * weight;
+                    let p = ray.at(t);
+                    if max_component(&med.emission) > 0.0 {
+                        l = l + beta * med.emission;
+                    }
+                    // NEE from the volume point: the phase function is the
+                    // "BSDF" (no cosine), shadow rays are medium-aware.
+                    let wo = -ray.direction.normalize();
+                    let g = med.g;
+                    if let Some((light_idx, pmf)) =
+                        scene.light_sampler.sample(&p, rng.next_f64())
+                    {
+                        let eval = |wi: &Vec3| -> (Vec3, f64) {
+                            let ph = hg_phase(g, -wo.dot(wi));
+                            (Vec3::new(ph, ph, ph), ph)
+                        };
+                        let c = sample_light(
+                            scene,
+                            &scene.lights[light_idx],
+                            &p,
+                            Vec3::zero(),
+                            &eval,
+                            pmf,
+                            ray.time,
+                            medium,
+                            rng,
+                        );
+                        l = l + beta * c;
+                    }
+                    // Continue with an HG sample: phase/pdf = 1.
+                    let (wi, pdf) = hg_sample(g, &wo, rng.next_f64(), rng.next_f64());
+                    prev_pdf = pdf;
+                    prev_origin = p;
+                    from_camera = false;
+                    cone_spread += 0.4;
+                    ray = Ray::new(p, wi).with_time(ray.time);
+                    depth += 1;
+                    if depth >= RR_START {
+                        let q = max_component(&beta).min(0.95);
+                        if q <= 0.0 || rng.next_f64() > q {
+                            break;
+                        }
+                        beta = beta / q;
+                    }
+                    continue;
+                }
+                volume::MediumEvent::Pass { weight } => {
+                    beta = beta * weight;
+                    if max_component(&beta) <= 0.0 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some(hit) = hit_opt else {
             // Miss: dome light (with MIS) or flat background.
             if let Some((dome_idx, dome)) = dome_of(scene) {
                 let dir = ray.direction.normalize();
@@ -221,6 +290,26 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
             break;
         };
         let material = &scene.materials[hit.material_id];
+
+        // Invisible volume hull: no lobes, no emission, an interior medium
+        // — the crossing just toggles the medium.
+        if material.interior.is_some()
+            && material.hair.is_none()
+            && material.pbr.lobe_weights().is_none()
+            && max_component(&(material.emission + material.pbr.glow)) <= 0.0
+        {
+            if presence_skips < MAX_PRESENCE_SKIPS {
+                presence_skips += 1;
+                medium = if hit.front_face { material.interior } else { scene.atmosphere };
+                ray = Ray::new(
+                    hit.point + ray.direction.normalize() * RAY_OFFSET,
+                    ray.direction,
+                )
+                .with_time(ray.time);
+                continue;
+            }
+        }
+
         let wo = -ray.direction.normalize();
         cone_width += hit.t * cone_spread;
         let pbr = shade_params(scene, material, &hit, cone_width);
@@ -285,6 +374,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                             &eval,
                             pmf,
                             ray.time,
+                            medium,
                             rng,
                         );
                         l = l + beta * c;
@@ -313,6 +403,130 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
             }
         }
 
+        // Subsurface scattering: with probability subsurfaceGain the path
+        // enters an isotropic random walk inside the object (a homogeneous
+        // medium derived from the Burley scaling fit), exiting diffusely
+        // at the first surface the walk reaches.
+        if pbr.subsurface_gain > 0.0
+            && material.hair.is_none()
+            && rng.next_f64() < pbr.subsurface_gain.clamp(0.0, 1.0)
+        {
+            let sss = volume::sss_medium(&pbr.subsurface_color, &pbr.subsurface_dmfp);
+            // Diffuse transmission entry: cosine hemisphere around -n.
+            let entry_frame = Frame::new(-n);
+            let (u1, u2) = rng.next_2d();
+            let r = u1.sqrt();
+            let phi = 2.0 * PI * u2;
+            let local = Vec3::new(
+                r * phi.cos(),
+                r * phi.sin(),
+                (1.0 - u1).max(0.0).sqrt(),
+            );
+            let mut walk = Ray::new(hit.point - n * RAY_OFFSET, entry_frame.to_world(&local))
+                .with_time(ray.time);
+            let mut exited = false;
+            for step in 0..256 {
+                let Some(whit) = scene.intersect(&walk) else {
+                    break; // escaped through a crack: kill the path
+                };
+                match volume::sample_distance(&sss, &walk, whit.t, &beta, rng) {
+                    volume::MediumEvent::Scatter { t, weight } => {
+                        // weight = sigma_s * T / pdf — the complete
+                        // throughput multiplier for one walk step.
+                        beta = beta * weight;
+                        let p = walk.at(t);
+                        let dir = {
+                            let u = rng.next_f64();
+                            let v = rng.next_f64();
+                            let z = 1.0 - 2.0 * u;
+                            let rr = (1.0 - z * z).max(0.0).sqrt();
+                            let ph = 2.0 * PI * v;
+                            Vec3::new(rr * ph.cos(), rr * ph.sin(), z)
+                        };
+                        // Isotropic phase: value 1/4π, pdf 1/4π — cancels.
+                        walk = Ray::new(p, dir).with_time(ray.time);
+                        let _ = step;
+                        // Russian roulette inside long walks.
+                        let q = max_component(&beta).min(0.95);
+                        if q <= 0.0 || (step > 8 && rng.next_f64() > q) {
+                            break;
+                        }
+                        if step > 8 {
+                            beta = beta / q;
+                        }
+                    }
+                    volume::MediumEvent::Pass { weight } => {
+                        beta = beta * weight;
+                        // Exit: diffuse (cosine) leave at the walk's surface
+                        // hit, on the outside. Normal conventions differ by
+                        // primitive (quadrics report outward, meshes flip
+                        // toward the viewer) — outward is wherever the walk
+                        // is heading.
+                        let out_n = if whit.normal.dot(&walk.direction) > 0.0 {
+                            whit.normal
+                        } else {
+                            -whit.normal
+                        };
+                        let exit_frame = Frame::new(out_n);
+                        let exit_p = walk.at(whit.t);
+                        // NEE at the exit vertex (white Lambert transmission).
+                        if let Some((light_idx, pmf)) =
+                            scene.light_sampler.sample(&exit_p, rng.next_f64())
+                        {
+                            let eval = |wi_world: &Vec3| -> (Vec3, f64) {
+                                let wi_l = exit_frame.to_local(wi_world);
+                                if wi_l.z <= 0.0 {
+                                    return (Vec3::zero(), 0.0);
+                                }
+                                let f = wi_l.z / PI;
+                                (Vec3::new(f, f, f), wi_l.z / PI)
+                            };
+                            let c = sample_light(
+                                scene,
+                                &scene.lights[light_idx],
+                                &exit_p,
+                                out_n,
+                                &eval,
+                                pmf,
+                                ray.time,
+                                medium,
+                                rng,
+                            );
+                            l = l + beta * c;
+                        }
+                        let (u1, u2) = rng.next_2d();
+                        let r = u1.sqrt();
+                        let phi = 2.0 * PI * u2;
+                        let local = Vec3::new(
+                            r * phi.cos(),
+                            r * phi.sin(),
+                            (1.0 - u1).max(0.0).sqrt(),
+                        );
+                        let wi = exit_frame.to_world(&local);
+                        prev_pdf = local.z.max(1e-9) / PI;
+                        prev_origin = exit_p;
+                        from_camera = false;
+                        cone_spread += 0.4;
+                        ray = Ray::new(exit_p + out_n * RAY_OFFSET, wi).with_time(ray.time);
+                        exited = true;
+                        break;
+                    }
+                }
+            }
+            if !exited {
+                break;
+            }
+            depth += 1;
+            if depth >= RR_START {
+                let q = max_component(&beta).min(0.95);
+                if q <= 0.0 || rng.next_f64() > q {
+                    break;
+                }
+                beta = beta / q;
+            }
+            continue;
+        }
+
         let frame = Frame::new(n);
         let wo_l = frame.to_local(&wo);
 
@@ -337,6 +551,7 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
                     &eval,
                     pmf,
                     ray.time,
+                    medium,
                     rng,
                 );
                 l = l + beta * contribution;
@@ -356,6 +571,9 @@ fn trace(scene: &Scene, mut ray: Ray, pixel_spread: f64, rng: &mut Pcg32) -> Vec
         // almost nothing; diffuse adds ~0.3 rad).
         cone_spread += (1.0 / (1.0 + s.pdf)).min(0.4);
 
+        if s.transmitted && material.interior.is_some() {
+            medium = if entering { material.interior } else { scene.atmosphere };
+        }
         let offset = if s.transmitted { -RAY_OFFSET } else { RAY_OFFSET };
         ray = Ray::new(hit.point + n * offset, wi_world).with_time(ray.time);
         depth += 1;
@@ -420,6 +638,7 @@ fn sample_light(
     eval: &dyn Fn(&Vec3) -> (Vec3, f64),
     pick_pmf: f64,
     time: f64,
+    medium: Option<u32>,
     rng: &mut Pcg32,
 ) -> Vec3 {
 
@@ -432,11 +651,11 @@ fn sample_light(
             if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            let vis = visibility_to(scene, p, &n, position, time);
-            if vis <= 0.0 {
+            let vis = visibility_to(scene, p, &n, position, time, medium, rng);
+            if max_component(&vis) <= 0.0 {
                 return Vec3::zero();
             }
-            f * light.radiance() * (vis / (dist2 * pick_pmf))
+            f * light.radiance() * vis / (dist2 * pick_pmf)
         }
         LightType::Distant { direction, angular_radius } => {
             let base = -*direction;
@@ -460,20 +679,21 @@ fn sample_light(
             if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            let vis = visibility_toward(scene, p, &n, &wi, time);
-            if vis <= 0.0 {
+            let vis = visibility_toward(scene, p, &n, &wi, time, medium, rng);
+            if max_component(&vis) <= 0.0 {
                 return Vec3::zero();
             }
             // Soft sun: radiance constant over the cone; the cone pdf
             // divides itself out. Delta/cone light: no BSDF-side MIS.
             let _ = pdf_sa;
-            f * light.radiance() * (vis / pick_pmf)
+            f * light.radiance() * vis / pick_pmf
         }
         LightType::Rect { corner, edge1, edge2, normal, area } => {
             let (u, v) = rng.next_2d();
             let sample_point = *corner + *edge1 * u + *edge2 * v;
             area_light_contribution(
                 scene, p, &n, &sample_point, normal, *area, light, eval, pick_pmf, time,
+                medium, rng,
             )
         }
         LightType::DiskArea { center, e1, e2, normal, area } => {
@@ -484,6 +704,7 @@ fn sample_light(
             let sample_point = *center + *e1 * (r * phi.cos()) + *e2 * (r * phi.sin());
             area_light_contribution(
                 scene, p, &n, &sample_point, normal, *area, light, eval, pick_pmf, time,
+                medium, rng,
             )
         }
         LightType::SphereArea { center, radius } => {
@@ -508,13 +729,13 @@ fn sample_light(
             let dist = dist2.sqrt() * cos_t
                 - (radius * radius - dist2 * sin_t * sin_t).max(0.0).sqrt();
             let target = *p + wi * dist;
-            let vis = visibility_to(scene, p, &n, &target, time);
-            if vis <= 0.0 {
+            let vis = visibility_to(scene, p, &n, &target, time, medium, rng);
+            if max_component(&vis) <= 0.0 {
                 return Vec3::zero();
             }
             let pdf_sa = pick_pmf / (2.0 * PI * (1.0 - cos_max)).max(1e-12);
             let weight = power_heuristic(pdf_sa, bsdf_pdf);
-            f * light.radiance() * (vis / pdf_sa) * weight
+            f * light.radiance() * vis * (weight / pdf_sa)
         }
         LightType::Dome => {
             let (wi, radiance, pdf_sa) = match &light.env {
@@ -543,12 +764,12 @@ fn sample_light(
             if max_component(&f) <= 0.0 {
                 return Vec3::zero();
             }
-            let vis = visibility_toward(scene, p, &n, &wi, time);
-            if vis <= 0.0 {
+            let vis = visibility_toward(scene, p, &n, &wi, time, medium, rng);
+            if max_component(&vis) <= 0.0 {
                 return Vec3::zero();
             }
             let weight = power_heuristic(pdf_sa, bsdf_pdf);
-            f * radiance * (vis / pdf_sa) * weight
+            f * radiance * vis * (weight / pdf_sa)
         }
     }
 }
@@ -565,6 +786,8 @@ fn area_light_contribution(
     eval: &dyn Fn(&Vec3) -> (Vec3, f64),
     pick_pmf: f64,
     time: f64,
+    medium: Option<u32>,
+    rng: &mut Pcg32,
 ) -> Vec3 {
     let to_light = *sample_point - *p;
     let dist2 = to_light.length_squared().max(1e-12);
@@ -577,52 +800,93 @@ fn area_light_contribution(
     if max_component(&f) <= 0.0 {
         return Vec3::zero();
     }
-    let vis = visibility_to(scene, p, n, sample_point, time);
-    if vis <= 0.0 {
+    let vis = visibility_to(scene, p, n, sample_point, time, medium, rng);
+    if max_component(&vis) <= 0.0 {
         return Vec3::zero();
     }
     let pdf_sa = pick_pmf * dist2 / (cos_light * area);
     let weight = power_heuristic(pdf_sa, bsdf_pdf);
-    f * light.radiance() * (vis / pdf_sa) * weight
+    f * light.radiance() * vis * (weight / pdf_sa)
 }
 
 /// Fractional visibility toward a point (presence cutouts attenuate).
-fn visibility_to(scene: &Scene, p: &Point3, n: &Vec3, target: &Point3, time: f64) -> f64 {
+fn visibility_to(
+    scene: &Scene,
+    p: &Point3,
+    n: &Vec3,
+    target: &Point3,
+    time: f64,
+    medium: Option<u32>,
+    rng: &mut Pcg32,
+) -> Vec3 {
     let dir = *target - *p;
     let dist = dir.length();
-    transmittance(scene, *p + *n * RAY_OFFSET, dir.normalize(), dist - 1e-3, time)
+    transmittance(scene, *p + *n * RAY_OFFSET, dir.normalize(), dist - 1e-3, time, medium, rng)
 }
 
-fn visibility_toward(scene: &Scene, p: &Point3, n: &Vec3, wi: &Vec3, time: f64) -> f64 {
-    transmittance(scene, *p + *n * RAY_OFFSET, *wi, f64::INFINITY, time)
+fn visibility_toward(
+    scene: &Scene,
+    p: &Point3,
+    n: &Vec3,
+    wi: &Vec3,
+    time: f64,
+    medium: Option<u32>,
+    rng: &mut Pcg32,
+) -> Vec3 {
+    transmittance(scene, *p + *n * RAY_OFFSET, *wi, 1e8, time, medium, rng)
 }
 
-/// Walks blockers along a shadow ray; opaque surfaces kill it, presence
-/// cutouts multiply through.
+/// Walks blockers along a shadow ray: opaque surfaces kill it, presence
+/// cutouts attenuate, volume hulls toggle the medium, and each segment
+/// picks up the medium's (possibly ratio-tracked) transmittance —
+/// shadows through colored fog come out colored.
+#[allow(clippy::too_many_arguments)]
 fn transmittance(
     scene: &Scene,
     mut origin: Point3,
     dir: Vec3,
     mut remaining: f64,
     time: f64,
-) -> f64 {
-    let mut vis = 1.0;
+    mut medium: Option<u32>,
+    rng: &mut Pcg32,
+) -> Vec3 {
+    let mut vis = Vec3::one();
     for _ in 0..MAX_PRESENCE_SKIPS {
         let ray = Ray::new(origin, dir).with_time(time);
-        let Some(hit) = scene.intersect(&ray) else {
+        let hit = scene.intersect(&ray);
+        let seg = hit.as_ref().map(|h| h.t).unwrap_or(remaining).min(remaining);
+        if let Some(mid) = medium {
+            vis = vis
+                * volume::transmittance(&scene.media[mid as usize], &origin, &dir, seg, rng);
+            if max_component(&vis) < 1e-4 {
+                return Vec3::zero();
+            }
+        }
+        let Some(hit) = hit else {
             return vis;
         };
         if hit.t >= remaining {
             return vis;
         }
         let material = &scene.materials[hit.material_id];
+        // Volume hull: pass through, switching medium.
+        if material.interior.is_some()
+            && material.hair.is_none()
+            && material.pbr.lobe_weights().is_none()
+            && max_component(&(material.emission + material.pbr.glow)) <= 0.0
+        {
+            medium = if hit.front_face { material.interior } else { scene.atmosphere };
+            origin = hit.point + dir * RAY_OFFSET;
+            remaining -= hit.t + RAY_OFFSET;
+            continue;
+        }
         let presence = shade_params(scene, material, &hit, 0.0).presence.clamp(0.0, 1.0);
         if presence >= 1.0 {
-            return 0.0;
+            return Vec3::zero();
         }
-        vis *= 1.0 - presence;
-        if vis < 1e-4 {
-            return 0.0;
+        vis = vis * (1.0 - presence);
+        if max_component(&vis) < 1e-4 {
+            return Vec3::zero();
         }
         origin = hit.point + dir * RAY_OFFSET;
         remaining -= hit.t + RAY_OFFSET;

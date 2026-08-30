@@ -57,7 +57,7 @@ skipped forever.
 | Displace | ✅ | extension: `Displace "noise" "amplitude"/"frequency"/"octaves"/"gain"/"lacunarity"/"offset"` — fBm displacement at dice time; pattern-driven displacement arrives with P6 |
 | LightSource / AreaLightSource | ✅ / ✅ | point+distant; quad polygons under AreaLightSource become sampleable rect lights (path integrator) |
 | Illuminate (light linking) | ⏭ P6 | |
-| Atmosphere / Interior / Exterior | ⏭ P10 | |
+| Atmosphere / Interior / Exterior | ✅ / ✅ / ⏭ | extension params sigma_a/sigma_s/g/emission/maxdistance + density "fbm" (delta/ratio tracking); Interior binds to hulls (invisible when lobeless) and glass; Exterior warns |
 | Displacement (RSL-era) | 🚫 | RSL-only; `Displace` is the modern path |
 | Orientation / ReverseOrientation / Sides | 🟡 | honored for meshes at P2 |
 | Basis | ✅ | named (bezier/b-spline/catmull-rom/hermite/power) or custom 4x4 matrices + steps |

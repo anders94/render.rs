@@ -32,6 +32,9 @@ pub struct Material {
     /// path tracer shades curve hits with the hair BSDF instead of the
     /// surface lobes.
     pub hair: Option<HairParams>,
+    /// Participating medium inside this geometry (Interior request);
+    /// index into Scene::media.
+    pub interior: Option<u32>,
 }
 
 impl Material {
@@ -47,6 +50,7 @@ impl Material {
             pbr: PbrParams::from_matte(color),
             pattern_bindings: Vec::new(),
             hair: None,
+            interior: None,
         }
     }
 
@@ -62,6 +66,7 @@ impl Material {
             pbr: PbrParams::from_plastic(color, roughness),
             pattern_bindings: Vec::new(),
             hair: None,
+            interior: None,
         }
     }
 
@@ -77,6 +82,7 @@ impl Material {
             pbr: PbrParams::from_metal(color, roughness),
             pattern_bindings: Vec::new(),
             hair: None,
+            interior: None,
         }
     }
 

@@ -260,6 +260,7 @@ fn render_pt_impl(
         gpu.curve_infos_bytes(),
         gpu.light_bvh_bytes(),
         gpu.light_aux_bytes(),
+        gpu.media_bytes(),
     ]
     .into_iter()
     .map(|bytes| upload(&device, bytes))
@@ -322,9 +323,9 @@ fn render_pt_impl(
                 enc.setBytes_length_atIndex(
                     NonNull::new(&uniforms as *const GpuPtUniforms as *mut c_void).unwrap(),
                     std::mem::size_of::<GpuPtUniforms>(),
-                    22,
+                    23,
                 );
-                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 23);
+                enc.setBuffer_offset_atIndex(Some(&accum_buf), 0, 24);
             }
             let grid = MTLSize { width: w, height: band, depth: 1 };
             enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
@@ -370,9 +371,9 @@ fn render_pt_impl(
                                 NonNull::new(&runi as *const GpuPtUniforms as *mut c_void)
                                     .unwrap(),
                                 std::mem::size_of::<GpuPtUniforms>(),
-                                22,
+                                23,
                             );
-                            enc2.setBuffer_offset_atIndex(Some(&accum_buf), 0, 23);
+                            enc2.setBuffer_offset_atIndex(Some(&accum_buf), 0, 24);
                         }
                         let grid2 = MTLSize { width: w, height: rband, depth: 1 };
                         enc2.dispatchThreads_threadsPerThreadgroup(grid2, tg);

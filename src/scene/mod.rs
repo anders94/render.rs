@@ -2,6 +2,7 @@ mod camera;
 pub mod envmap;
 mod light;
 pub mod light_sampler;
+pub mod medium;
 mod material;
 pub mod pbr;
 pub mod transform;
@@ -10,6 +11,7 @@ pub use camera::{Camera, PixelFilter, Projection};
 pub use envmap::EnvMap;
 pub use light::{Light, LightType};
 pub use light_sampler::LightSampler;
+pub use medium::{DensityField, Medium};
 pub use material::{Material, MaterialType};
 pub use pbr::PbrParams;
 pub use transform::TransformStack;
@@ -42,6 +44,10 @@ pub struct Scene {
     pub pixel_samples: (u32, u32),
     /// Many-light sampler (built once after lights are final).
     pub light_sampler: LightSampler,
+    /// Participating media, referenced by Material::interior.
+    pub media: Vec<Medium>,
+    /// Global medium the camera starts in (Atmosphere request).
+    pub atmosphere: Option<u32>,
     tlas: Bvh,
 }
 
@@ -60,6 +66,8 @@ impl Scene {
             has_motion: false,
             pixel_samples: (1, 1),
             light_sampler: LightSampler::build(&[]),
+            media: Vec::new(),
+            atmosphere: None,
             tlas: Bvh::build(&[]),
         }
     }
