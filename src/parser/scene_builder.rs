@@ -153,6 +153,8 @@ pub struct SceneBuilder {
     pattern_nodes: Vec<PatternNode>,
     /// Pattern handle -> node index.
     pattern_handles: HashMap<String, u32>,
+    /// Camera motion delta (inverse) captured at WorldBegin.
+    camera_motion_inv: Option<Matrix4>,
     /// identifier name -> object id, and the id counter.
     object_ids: HashMap<String, u32>,
     next_object_id: u32,
@@ -190,6 +192,7 @@ impl SceneBuilder {
             archive_depth: 0,
             pattern_nodes: Vec::new(),
             pattern_handles: HashMap::new(),
+            camera_motion_inv: None,
             object_ids: HashMap::new(),
             next_object_id: 1,
             id_manifest: std::collections::BTreeMap::new(),
@@ -210,6 +213,7 @@ impl SceneBuilder {
         camera.projection = self.projection;
         camera.filter = self.pixel_filter;
         camera.shutter = self.shutter;
+        camera.motion_inv = self.camera_motion_inv;
         if let Some((fstop, focal_len, focal_dist)) = self.depth_of_field {
             if fstop.is_finite() && fstop > 0.0 {
                 camera.lens_radius = focal_len / (2.0 * fstop);
@@ -233,7 +237,8 @@ impl SceneBuilder {
         scene.atmosphere = data.atmosphere;
         scene.id_manifest = self.id_manifest.clone();
         scene.has_motion = scene.instances.iter().any(|i| i.transform1.is_some())
-            || scene.meshes.iter().any(|m| m.positions1.is_some());
+            || scene.meshes.iter().any(|m| m.positions1.is_some())
+            || scene.camera.motion_inv.is_some();
         scene.build_tlas();
         Ok(scene)
     }
@@ -263,7 +268,23 @@ impl SceneBuilder {
     fn process(&mut self, req: &RibRequest, data: &mut SceneData) -> Result<()> {
         match req.name.as_str() {
             // ---- structure ------------------------------------------------
-            "version" | "WorldBegin" | "WorldEnd" | "FrameBegin" | "FrameEnd" => {}
+            "version" | "WorldEnd" | "FrameBegin" | "FrameEnd" => {}
+            "WorldBegin" => {
+                // A motion block that wrapped pre-World transforms animates
+                // the camera: capture the delta and clear the motion state
+                // so it does not leak onto world geometry.
+                if let (Some(t0), Some(t1)) = (self.state.motion_t0, self.state.motion_t1) {
+                    if let (Some(t0_inv), Some(t1_inv)) = (t0.inverse(), t1.inverse()) {
+                        // delta = t1 * t0^-1 (in baked space); rays use its
+                        // inverse.
+                        let delta_inv = (t1 * t0_inv).inverse();
+                        let _ = t1_inv;
+                        self.camera_motion_inv = delta_inv;
+                    }
+                    self.state.motion_t0 = None;
+                    self.state.motion_t1 = None;
+                }
+            }
             "AttributeBegin" => {
                 self.attribute_stack.push(self.state.clone());
                 self.transform_stack.push();
@@ -351,7 +372,10 @@ impl SceneBuilder {
                 }
             }
             "Exterior" => {
-                self.warn_once("Exterior media not implemented; ignoring");
+                self.warn_once(
+                    "Exterior is subsumed by nested Interior tracking (rays \
+                     exiting an object return to the enclosing medium); ignoring",
+                );
             }
 
             // Procedural geometry: DelayedReadArchive loads eagerly (we
@@ -1972,6 +1996,8 @@ mod tests {
             p: [0.0; 3],
             n: [0.0, 0.0, 1.0],
             footprint: 0.0,
+            dst_major: [0.0; 2],
+            dst_minor: [0.0; 2],
         };
         let pbr = material.resolved_pbr(&scene.patterns, &ctx);
         assert!((pbr.diffuse_color.x - 0.75).abs() < 1e-9, "{:?}", pbr.diffuse_color);

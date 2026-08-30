@@ -21,6 +21,8 @@ pub struct Intersection {
     /// Curve tangent at the hit (zero for surface geometry) — the hair
     /// BSDF shades against this.
     pub tangent: Vec3,
+    /// World-space gradients of s and t (texture Jacobian; zero = none).
+    pub st_grad: [Vec3; 2],
 }
 
 impl Intersection {
@@ -34,6 +36,7 @@ impl Intersection {
             st: [0.0, 0.0],
             st_density: 0.0,
             tangent: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            st_grad: [Vec3 { x: 0.0, y: 0.0, z: 0.0 }; 2],
         }
     }
 
@@ -50,6 +53,11 @@ impl Intersection {
 
     pub fn with_tangent(mut self, tangent: Vec3) -> Self {
         self.tangent = tangent;
+        self
+    }
+
+    pub fn with_st_grad(mut self, st_grad: [Vec3; 2]) -> Self {
+        self.st_grad = st_grad;
         self
     }
 }

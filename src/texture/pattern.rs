@@ -73,6 +73,10 @@ pub struct ShadeCtx {
     pub n: [f64; 3],
     /// Pixel footprint diameter in st units (ray cone at the hit).
     pub footprint: f64,
+    /// Anisotropic st footprint axes (EWA); [0,0] each = isotropic
+    /// fallback to `footprint`.
+    pub dst_major: [f64; 2],
+    pub dst_minor: [f64; 2],
 }
 
 const MISSING_COLOR: Vec3 = Vec3 { x: 1.0, y: 0.0, z: 1.0 };
@@ -95,6 +99,31 @@ fn sample_tex(tex: &TextureRef, wrap: Wrap, s: f64, t: f64, footprint: f64) -> V
     }
 }
 
+/// Anisotropic texture lookup (t axis flipped into image space).
+fn sample_tex_ewa(
+    tex: &TextureRef,
+    wrap: Wrap,
+    s: f64,
+    t: f64,
+    du: [f64; 2],
+    dv: [f64; 2],
+) -> Vec3 {
+    match tex.resolve(s, t) {
+        Some((id, s, t)) => {
+            let c = global_cache().sample_ewa(
+                id,
+                s,
+                1.0 - t,
+                [du[0], -du[1]],
+                [dv[0], -dv[1]],
+                wrap,
+            );
+            Vec3::new(c[0] as f64, c[1] as f64, c[2] as f64)
+        }
+        None => MISSING_COLOR,
+    }
+}
+
 fn eval_at(nodes: &[PatternNode], index: u32, ctx: &ShadeCtx, depth: u32) -> Vec3 {
     if depth > 16 {
         return MISSING_COLOR; // cycle guard; builder-produced graphs are DAGs
@@ -106,7 +135,17 @@ fn eval_at(nodes: &[PatternNode], index: u32, ctx: &ShadeCtx, depth: u32) -> Vec
         PatternNode::Texture { tex, wrap, scale } => {
             let s = ctx.st[0] * scale[0];
             let t = ctx.st[1] * scale[1];
-            sample_tex(tex, *wrap, s, t, ctx.footprint * scale[0].abs().max(scale[1].abs()))
+            let aniso = ctx.dst_major[0].abs()
+                + ctx.dst_major[1].abs()
+                + ctx.dst_minor[0].abs()
+                + ctx.dst_minor[1].abs();
+            if aniso > 1e-12 {
+                let du = [ctx.dst_major[0] * scale[0], ctx.dst_major[1] * scale[1]];
+                let dv = [ctx.dst_minor[0] * scale[0], ctx.dst_minor[1] * scale[1]];
+                sample_tex_ewa(tex, *wrap, s, t, du, dv)
+            } else {
+                sample_tex(tex, *wrap, s, t, ctx.footprint * scale[0].abs().max(scale[1].abs()))
+            }
         }
         PatternNode::Checker { color_a, color_b, scale } => {
             // Analytically filtered checker: blend toward the mean as the
@@ -256,7 +295,14 @@ mod tests {
     use super::*;
 
     fn ctx(st: [f64; 2]) -> ShadeCtx {
-        ShadeCtx { st, p: [0.0; 3], n: [0.0, 0.0, 1.0], footprint: 0.0 }
+        ShadeCtx {
+            st,
+            p: [0.0; 3],
+            n: [0.0, 0.0, 1.0],
+            footprint: 0.0,
+            dst_major: [0.0; 2],
+            dst_minor: [0.0; 2],
+        }
     }
 
     #[test]

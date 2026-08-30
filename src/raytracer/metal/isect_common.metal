@@ -31,6 +31,14 @@ inline float3 normalize_cpu(float3 v) {
 // flatten time).
 struct Affine { float4 r0, r1, r2; };
 
+inline Affine load_affine_c(constant const float* m) {
+    Affine a;
+    a.r0 = float4(m[0], m[1], m[2],  m[3]);
+    a.r1 = float4(m[4], m[5], m[6],  m[7]);
+    a.r2 = float4(m[8], m[9], m[10], m[11]);
+    return a;
+}
+
 inline Affine load_affine(device const float* m) {
     Affine a;
     a.r0 = float4(m[0], m[1], m[2],  m[3]);

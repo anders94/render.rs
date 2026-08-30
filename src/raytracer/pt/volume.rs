@@ -188,6 +188,57 @@ pub fn transmittance(
     tr
 }
 
+/// Equiangular distance sampling (Kulla-Fajardo 2012): place a sample
+/// along [0, t_max] of the ray with density proportional to 1/r² toward
+/// a point light — exactly where single-scatter glow concentrates.
+/// Returns (t, pdf).
+pub fn equiangular_sample(
+    origin: &Point3,
+    dir: &Vec3,
+    t_max: f64,
+    light_pos: &Point3,
+    u: f64,
+) -> (f64, f64) {
+    let delta = (*light_pos - *origin).dot(dir);
+    let h = (*light_pos - (*origin + *dir * delta)).length().max(1e-6);
+    let theta_a = (-delta / h).atan();
+    let theta_b = ((t_max - delta) / h).atan();
+    let span = (theta_b - theta_a).max(1e-9);
+    let t = delta + h * (theta_a + u * span).tan();
+    let t = t.clamp(0.0, t_max);
+    let pdf = h / (span * (h * h + (t - delta) * (t - delta)));
+    (t, pdf)
+}
+
+/// pdf of equiangular_sample at distance t (for MIS weights).
+pub fn equiangular_pdf(
+    origin: &Point3,
+    dir: &Vec3,
+    t_max: f64,
+    light_pos: &Point3,
+    t: f64,
+) -> f64 {
+    let delta = (*light_pos - *origin).dot(dir);
+    let h = (*light_pos - (*origin + *dir * delta)).length().max(1e-6);
+    let theta_a = (-delta / h).atan();
+    let theta_b = ((t_max - delta) / h).atan();
+    let span = (theta_b - theta_a).max(1e-9);
+    h / (span * (h * h + (t - delta) * (t - delta)))
+}
+
+/// Approximate analytic pdf of the medium's distance sampling at t (used
+/// ONLY for MIS weighting against equiangular — approximate weights are
+/// still unbiased as long as the pair sums to one, which these do).
+pub fn distance_pdf_approx(medium: &Medium, t: f64, t_max: f64) -> f64 {
+    let st = medium.sigma_t();
+    let s = ((st.x + st.y + st.z) / 3.0).max(1e-9);
+    if t < t_max {
+        s * (-s * t).exp()
+    } else {
+        (-s * t_max).exp()
+    }
+}
+
 /// Random-walk medium for subsurface scattering, from PxrSurface's
 /// artist parameters. Two fits do the heavy lifting:
 /// - albedo inversion (Kulla-Conty): the walk's single-scatter albedo

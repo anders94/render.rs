@@ -225,7 +225,12 @@ pub struct GpuPtUniforms {
     /// Global medium index (u32::MAX = none).
     pub atmosphere: u32,
     pub media_count: u32,
-    pub pad_med: [u32; 2],
+    /// 1 when cam_motion_inv is live.
+    pub has_cam_motion: u32,
+    /// Wavefront: first pixel id of the current slab.
+    pub wf_slab_base: u32,
+    /// Inverse camera-motion delta at shutter close (row-major 4x4).
+    pub cam_motion_inv: [f32; 16],
 }
 
 const _: () = assert!(std::mem::size_of::<GpuBvhNode>() == 32);
@@ -236,7 +241,7 @@ const _: () = assert!(std::mem::size_of::<GpuCurveInfo>() == 16);
 const _: () = assert!(std::mem::size_of::<GpuPtMaterial>() == 220);
 const _: () = assert!(std::mem::size_of::<GpuMedium>() == 80);
 const _: () = assert!(std::mem::size_of::<GpuPtLight>() == 76);
-const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 192);
+const _: () = assert!(std::mem::size_of::<GpuPtUniforms>() == 256);
 const _: () = assert!(std::mem::size_of::<GpuLightAux>() == 8);
 
 pub struct GpuPtScene {
@@ -661,7 +666,18 @@ impl GpuPtScene {
             pad_ls: 0,
             atmosphere: scene.atmosphere.unwrap_or(u32::MAX),
             media_count: media.len() as u32,
-            pad_med: [0; 2],
+            has_cam_motion: scene.camera.motion_inv.is_some() as u32,
+            wf_slab_base: 0,
+            cam_motion_inv: scene
+                .camera
+                .motion_inv
+                .as_ref()
+                .map(|m| matrix_to_f32(m))
+                .transpose()?
+                .unwrap_or([
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ]),
         };
 
         let patterns = super::pattern_codegen::build(scene);

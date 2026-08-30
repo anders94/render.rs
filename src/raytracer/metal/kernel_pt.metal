@@ -52,7 +52,9 @@ struct PtUniforms {
     uint  pad_ls;
     uint  atmosphere;       // global medium index, 0xFFFFFFFF = none
     uint  media_count;
-    uint  pad_med[2];
+    uint  has_cam_motion;
+    uint  wf_slab_base;
+    float cam_motion_inv[16];
 };
 
 // PtMaterial is defined in pattern_prelude.metal (compiled just before
@@ -320,6 +322,36 @@ inline float3 med_transmittance(device const MediumG& m, float3 o, float3 d,
         if (max(max(tr.x, tr.y), tr.z) < 1e-5f) return float3(0.0f);
     }
     return tr;
+}
+
+// Equiangular distance sampling toward a point light (Kulla-Fajardo);
+// mirrors pt/volume.rs.
+inline float equiangular_sample_t(float3 o, float3 d, float t_max, float3 lp,
+                                  float u, thread float& pdf_out) {
+    float delta = dot(lp - o, d);
+    float h = max(length(lp - (o + d * delta)), 1e-6f);
+    float ta = atan(-delta / h);
+    float tb = atan((t_max - delta) / h);
+    float span = max(tb - ta, 1e-9f);
+    float t = delta + h * tan(ta + u * span);
+    t = clamp(t, 0.0f, t_max);
+    pdf_out = h / (span * (h * h + (t - delta) * (t - delta)));
+    return t;
+}
+
+inline float equiangular_pdf_t(float3 o, float3 d, float t_max, float3 lp, float t) {
+    float delta = dot(lp - o, d);
+    float h = max(length(lp - (o + d * delta)), 1e-6f);
+    float ta = atan(-delta / h);
+    float tb = atan((t_max - delta) / h);
+    float span = max(tb - ta, 1e-9f);
+    return h / (span * (h * h + (t - delta) * (t - delta)));
+}
+
+inline float distance_pdf_approx(device const MediumG& m, float t, float t_max) {
+    float s = max((m.sigma_a[0] + m.sigma_s[0] + m.sigma_a[1] + m.sigma_s[1]
+        + m.sigma_a[2] + m.sigma_s[2]) / 3.0f, 1e-9f);
+    return t < t_max ? s * exp(-s * t) : exp(-s * t_max);
 }
 
 // A volume hull: interior medium, no lobes, no emission — pure boundary.
@@ -1275,17 +1307,27 @@ inline float3 pt_visibility(thread const PtScene& s, float3 p, float3 n,
     float3 origin = p + n * PT_RAY_OFFSET;
     float remaining = dist - 1e-3f;
     float3 vis = float3(1.0f);
+    // Nested media along the shadow ray: inherit the shading medium as
+    // the stack top, push/pop at hull crossings.
+    uint vstack[8];
+    uint vdepth = 0u;
+    if (medium != 0xFFFFFFFFu && medium != s.u->atmosphere) vstack[vdepth++] = medium;
     for (int i = 0; i < 16; i++) {
         PtHit h = pt_trace_scene(s, origin, dir, time);
         float seg = h.hit ? min(h.t, remaining) : remaining;
-        if (medium != 0xFFFFFFFFu) {
-            vis *= med_transmittance(s.media[medium], origin, dir, seg, rng);
+        uint cur = vdepth > 0u ? vstack[vdepth - 1u] : s.u->atmosphere;
+        if (cur != 0xFFFFFFFFu) {
+            vis *= med_transmittance(s.media[cur], origin, dir, seg, rng);
             if (max(max(vis.x, vis.y), vis.z) < 1e-4f) return float3(0.0f);
         }
         if (!h.hit || h.t >= remaining) return vis;
         PtMaterial pm = s.materials[h.material];
         if (is_volume_hull(pm)) {
-            medium = h.front ? pm.interior : s.u->atmosphere;
+            if (h.front) {
+                if (vdepth < 8u) vstack[vdepth++] = pm.interior;
+            } else if (vdepth > 0u) {
+                vdepth--;
+            }
             origin = h.p + dir * PT_RAY_OFFSET;
             remaining -= h.t + PT_RAY_OFFSET;
             continue;
@@ -1768,57 +1810,116 @@ inline float3 sample_one_light(thread const PtScene& s, PtLight l, float3 p,
 
 // aux layout: 0-2 albedo, 3-5 normal, 6 depth, 7 id, 8-10 diffuse share,
 // 11 hit flag. Mirrors pt::trace_full's AuxSample.
-inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
-                    float time, thread Pcg32& rng, thread float* aux) {
+struct WfState {
+    float3 l;
+    float3 beta;
+    float prev_pdf;
+    float3 prev_origin;
+    bool from_camera;
+    uint presence_skips;
+    float cone_width;
+    float cone_spread;
+    uint med_stack[8];
+    uint med_depth;
+    int first_spec;
+    bool aux_set;
+    float travel;
+    uint depth;
+    float3 origin;
+    float3 dir;
+    float time;
+};
+
+// One path-tracing step: everything that happens between one closest-hit
+// result and the next ray cast (volume events, hull/presence skips,
+// emitter hits, NEE, BSDF/hair/SSS continuation, Russian roulette).
+// Returns 0 when the path dies, 1 when st.origin/st.dir hold the next
+// segment. The megakernel loops this in-register; the wavefront scheduler
+// runs it as its shade stage over compacted queues — one function, two
+// schedulers, identical sampling streams.
+inline int pt_shade_step(thread const PtScene& s, thread WfState& st, PtHit h,
+                         thread Pcg32& rng, thread float* aux) {
     constant PtUniforms& u = *s.u;
-    float3 l = float3(0.0f);
-    float3 beta = float3(1.0f);
-    float prev_pdf = 0.0f;
-    float3 prev_origin = origin;
-    bool from_camera = true;
-    uint presence_skips = 0u;
-    float num_lights = (float)u.light_count;
-    // Ray cone for texture mip selection (mirror of pt::trace).
-    float cone_width = 0.0f;
-    float cone_spread = 2.0f * u.half_height / (float)u.height;
-    // Participating medium the ray currently travels in.
-    uint medium = u.atmosphere;
-    int first_spec = -1;      // -1 unset, 0 diffuse-like, 1 specular-like
-    bool aux_set = false;
-    float travel = 0.0f;
-
-    uint depth = 0u;
-    while (depth < u.max_bounces) {
-        PtHit h = pt_trace_scene(s, origin, dir, time);
-
         // Medium interaction along this segment (mirror of pt::trace).
+        uint medium = st.med_depth > 0u ? st.med_stack[st.med_depth - 1u] : u.atmosphere;
         if (medium != 0xFFFFFFFFu) {
             device const MediumG& med = s.media[medium];
             float t_limit = h.hit ? h.t : PT_BIG;
+
+            // Shared per-segment light pick (see CPU comments).
+            float seg_pmf;
+            uint seg_li = ls_sample(
+                s, st.origin + st.dir * min(min(t_limit, med.max_distance) * 0.5f, 50.0f),
+                pcg_f32(rng), seg_pmf);
+            bool seg_is_point = u.light_count > 0u && s.lights[seg_li].kind == 0u;
+            float t_seg = min(t_limit, med.max_distance);
+
+            // Equiangular single-scatter NEE for point lights.
+            if (seg_is_point && t_seg > 1e-6f) {
+                float3 lp = m3(s.lights[seg_li].a);
+                float pdf_eq;
+                float t_eq = equiangular_sample_t(st.origin, st.dir, t_seg, lp,
+                                                  pcg_f32(rng), pdf_eq);
+                if (pdf_eq > 1e-12f) {
+                    float3 p = st.origin + st.dir * t_eq;
+                    float rho = med_density(med, p);
+                    if (rho > 0.0f) {
+                        float3 tr = med_transmittance(med, st.origin, st.dir, t_eq, rng);
+                        float3 sig_s = float3(med.sigma_s[0], med.sigma_s[1],
+                                              med.sigma_s[2]) * rho;
+                        float3 to_l = lp - p;
+                        float dist2 = max(dot(to_l, to_l), 1e-12f);
+                        float3 wi = to_l / sqrt(dist2);
+                        float3 wo2 = -normalize_cpu(st.dir);
+                        float ph = hg_phase_g(med.g, -dot(wo2, wi));
+                        float3 vis = pt_visibility(s, p, float3(0.0f), wi,
+                                                   sqrt(dist2), st.time, medium, rng);
+                        if (max(max(vis.x, vis.y), vis.z) > 0.0f) {
+                            float pdf_d = distance_pdf_approx(med, t_eq, t_seg);
+                            float w_eq = pdf_eq / (pdf_eq + pdf_d);
+                            float3 rad = m3(s.lights[seg_li].radiance);
+                            float3 _c = st.beta * sig_s * tr * vis * rad
+                                * (ph * w_eq / (dist2 * pdf_eq * seg_pmf));
+                            st.l += _c;
+                            if (st.first_spec != 1) {
+                                aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z;
+                            }
+                        }
+                    }
+                }
+            }
+
             float mt;
             float3 mweight;
-            if (med_sample_distance(med, origin, dir, t_limit, beta, rng, mt, mweight)) {
-                beta *= mweight;
-                float3 p = origin + dir * mt;
-                if (!aux_set) {
-                    aux_set = true;
+            if (med_sample_distance(med, st.origin, st.dir, t_limit, st.beta, rng, mt, mweight)) {
+                st.beta *= mweight;
+                float3 p = st.origin + st.dir * mt;
+                if (!st.aux_set) {
+                    st.aux_set = true;
                     float3 stv = float3(med.sigma_a[0] + med.sigma_s[0],
                                         med.sigma_a[1] + med.sigma_s[1],
                                         med.sigma_a[2] + med.sigma_s[2]);
                     aux[0] = med.sigma_s[0] / max(stv.x, 1e-9f);
                     aux[1] = med.sigma_s[1] / max(stv.y, 1e-9f);
                     aux[2] = med.sigma_s[2] / max(stv.z, 1e-9f);
-                    float3 nv = -normalize_cpu(dir);
+                    float3 nv = -normalize_cpu(st.dir);
                     aux[3] = nv.x; aux[4] = nv.y; aux[5] = nv.z;
-                    aux[6] = travel + mt;
+                    aux[6] = st.travel + mt;
                     aux[7] = 0.0f;
                     aux[11] = 1.0f;
                 }
-                if (first_spec < 0) first_spec = 0;
+                if (st.first_spec < 0) st.first_spec = 0;
                 float3 emv = float3(med.emission[0], med.emission[1], med.emission[2]);
-                if (emv.x + emv.y + emv.z > 0.0f) l += beta * emv;
-                float3 wo = -normalize_cpu(dir);
+                if (emv.x + emv.y + emv.z > 0.0f) st.l += st.beta * emv;
+                float3 wo = -normalize_cpu(st.dir);
                 if (u.light_count > 0u) {
+                    float w_dist = 1.0f;
+                    if (seg_is_point) {
+                        float3 lp = m3(s.lights[seg_li].a);
+                        float pdf_d = distance_pdf_approx(med, mt, t_seg);
+                        float pdf_e = equiangular_pdf_t(st.origin, st.dir, t_seg, lp, mt);
+                        w_dist = pdf_d / (pdf_d + pdf_e);
+                    }
                     EvalCtx ec;
                     ec.hair = false;
                     ec.phase = true;
@@ -1828,65 +1929,67 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                     ec.m = s.materials[0];
                     ec.eta = 1.0f;
                     ec.h = 0.0f;
-                    float pick;
-                    uint li = ls_sample(s, p, pcg_f32(rng), pick);
-                    float3 c = sample_one_light(s, s.lights[li], p, float3(0.0f), ec,
-                                                pick, time, medium, rng);
-                    { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
+                    float3 c = sample_one_light(s, s.lights[seg_li], p, float3(0.0f), ec,
+                                                seg_pmf, st.time, medium, rng);
+                    { float3 _c = st.beta * c * w_dist; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
                 }
                 float ppdf;
                 float3 wi = hg_sample_g(med.g, wo, pcg_f32(rng), pcg_f32(rng), ppdf);
-                prev_pdf = ppdf;
-                prev_origin = p;
-                from_camera = false;
-                cone_spread += 0.4f;
-                origin = p;
-                dir = wi;
-                depth++;
-                if (depth >= u.rr_start) {
-                    float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
-                    if (q <= 0.0f || pcg_f32(rng) > q) break;
-                    beta /= q;
+                st.prev_pdf = ppdf;
+                st.prev_origin = p;
+                st.from_camera = false;
+                st.cone_spread += 0.4f;
+                st.origin = p;
+                st.dir = wi;
+                st.depth++;
+                if (st.depth >= u.rr_start) {
+                    float q = min(max(max(st.beta.x, st.beta.y), st.beta.z), 0.95f);
+                    if (q <= 0.0f || pcg_f32(rng) > q) return 0;
+                    st.beta /= q;
                 }
-                continue;
+                return 1;
             }
-            beta *= mweight;
-            if (max(max(beta.x, beta.y), beta.z) <= 0.0f) break;
+            st.beta *= mweight;
+            if (max(max(st.beta.x, st.beta.y), st.beta.z) <= 0.0f) return 0;
         }
 
         if (!h.hit) {
             if (u.dome_index != 0xFFFFFFFFu) {
-                float3 d = normalize_cpu(dir);
+                float3 d = normalize_cpu(st.dir);
                 float w = 1.0f;
-                if (!from_camera) {
-                    float pl = env_pdf(s, d) * ls_pmf(s, prev_origin, u.dome_index);
-                    w = power_heuristic(prev_pdf, pl);
+                if (!st.from_camera) {
+                    float pl = env_pdf(s, d) * ls_pmf(s, st.prev_origin, u.dome_index);
+                    w = power_heuristic(st.prev_pdf, pl);
                 }
                 float3 dome_rad = env_eval(s, d) * m3(s.lights[u.dome_index].radiance);
-                { float3 _c = beta * dome_rad * w; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
+                { float3 _c = st.beta * dome_rad * w; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
             } else {
-                { float3 _c = beta * c3(u.background); l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
+                { float3 _c = st.beta * c3(u.background); st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
             }
-            break;
+            return 0;
         }
         PtMaterial m = s.materials[h.material];
 
         // Invisible volume hull: crossing toggles the medium.
-        if (is_volume_hull(m) && presence_skips < 16u) {
-            presence_skips++;
-            travel += h.t;
-            medium = h.front ? m.interior : u.atmosphere;
-            origin = h.p + normalize_cpu(dir) * PT_RAY_OFFSET;
-            continue;
+        if (is_volume_hull(m) && st.presence_skips < 16u) {
+            st.presence_skips++;
+            st.travel += h.t;
+            if (h.front) {
+                if (st.med_depth < 8u) st.med_stack[st.med_depth++] = m.interior;
+            } else if (st.med_depth > 0u) {
+                st.med_depth--;
+            }
+            st.origin = h.p + normalize_cpu(st.dir) * PT_RAY_OFFSET;
+            return 1;
         }
 
-        float3 wo = -normalize_cpu(dir);
-        cone_width += h.t * cone_spread;
-        travel += h.t;
+        float3 wo = -normalize_cpu(st.dir);
+        st.cone_width += h.t * st.cone_spread;
+        st.travel += h.t;
         apply_patterns(h.material, m, h.st, h.p, h.n,
-                       cone_width * h.st_density, s.tex_data, s.tex_mips);
-        if (!aux_set) {
-            aux_set = true;
+                       st.cone_width * h.st_density, s.tex_data, s.tex_mips);
+        if (!st.aux_set) {
+            st.aux_set = true;
             float lum_f0 = 0.2126f * m.spec_f0[0] + 0.7152f * m.spec_f0[1]
                 + 0.0722f * m.spec_f0[2];
             float has_spec = lum_f0 > 1e-6f ? 1.0f : 0.0f;
@@ -1897,17 +2000,17 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             }
             float3 nv = dot(h.n, wo) >= 0.0f ? h.n : -h.n;
             aux[3] = nv.x; aux[4] = nv.y; aux[5] = nv.z;
-            aux[6] = travel;
+            aux[6] = st.travel;
             aux[7] = (float)m.obj_id;
             aux[11] = 1.0f;
         }
 
         float presence = clamp(m.presence, 0.0f, 1.0f);
-        if (presence < 1.0f && pcg_f32(rng) >= presence && presence_skips < 16u) {
-            presence_skips++;
-            travel += h.t;
-            origin = h.p + normalize_cpu(dir) * PT_RAY_OFFSET;
-            continue;
+        if (presence < 1.0f && pcg_f32(rng) >= presence && st.presence_skips < 16u) {
+            st.presence_skips++;
+            st.travel += h.t;
+            st.origin = h.p + normalize_cpu(st.dir) * PT_RAY_OFFSET;
+            return 1;
         }
 
         bool entering = h.front;
@@ -1917,12 +2020,12 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
         float3 em = m3(m.emission);
         if (max(max(em.x, em.y), em.z) > 0.0f) {
             float w = 1.0f;
-            if (!from_camera && m.area_light != 0xFFFFFFFFu) {
-                float pl = light_pdf_solid_angle(s.lights[m.area_light], prev_origin, h.p)
-                    * ls_pmf(s, prev_origin, m.area_light);
-                w = power_heuristic(prev_pdf, pl);
+            if (!st.from_camera && m.area_light != 0xFFFFFFFFu) {
+                float pl = light_pdf_solid_angle(s.lights[m.area_light], st.prev_origin, h.p)
+                    * ls_pmf(s, st.prev_origin, m.area_light);
+                w = power_heuristic(st.prev_pdf, pl);
             }
-            { float3 _c = beta * em * w; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
+            { float3 _c = st.beta * em * w; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
         }
 
         // Hair fibers: full-sphere Marschner scattering (mirror of the
@@ -1943,34 +2046,34 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                 ec.h = hh;
                 float pick;
                 uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
-                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, medium, rng);
-                { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
+                float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, st.time, medium, rng);
+                { float3 _c = st.beta * c; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
             }
             float3 wi_f, fv;
             float pv;
-            if (!hair_sample(m, wo_f, hh, rng, wi_f, fv, pv)) break;
+            if (!hair_sample(m, wo_f, hh, rng, wi_f, fv, pv)) return 0;
             float3 wi = to_world(ff, wi_f);
-            beta *= fv / pv;   // per-solid-angle f: no cosine
-            if (first_spec < 0) first_spec = 0;
-            prev_pdf = pv;
-            prev_origin = h.p;
-            from_camera = false;
-            cone_spread += 0.4f;
+            st.beta *= fv / pv;   // per-solid-angle f: no cosine
+            if (st.first_spec < 0) st.first_spec = 0;
+            st.prev_pdf = pv;
+            st.prev_origin = h.p;
+            st.from_camera = false;
+            st.cone_spread += 0.4f;
             float3 side = dot(wi, h.n) >= 0.0f ? h.n : -h.n;
-            origin = h.p + side * PT_RAY_OFFSET;
-            dir = wi;
-            depth++;
-            if (depth >= u.rr_start) {
-                float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
-                if (q <= 0.0f || pcg_f32(rng) > q) break;
-                beta /= q;
+            st.origin = h.p + side * PT_RAY_OFFSET;
+            st.dir = wi;
+            st.depth++;
+            if (st.depth >= u.rr_start) {
+                float q = min(max(max(st.beta.x, st.beta.y), st.beta.z), 0.95f);
+                if (q <= 0.0f || pcg_f32(rng) > q) return 0;
+                st.beta /= q;
             }
-            continue;
+            return 1;
         }
 
         // Subsurface random walk (mirror of pt::trace's SSS branch).
         if (m.sss_gain > 0.0f && m.is_hair == 0u && pcg_f32(rng) < m.sss_gain) {
-            if (first_spec < 0) first_spec = 0;
+            if (st.first_spec < 0) st.first_spec = 0;
             MediumG sm;
             for (int k = 0; k < 3; k++) {
                 sm.sigma_s[k] = m.sss_sigma_s[k];
@@ -1990,7 +2093,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             float3 wpos = h.p - n * PT_RAY_OFFSET;
             bool exited = false;
             for (int step = 0; step < 256; step++) {
-                PtHit wh = pt_trace_scene(s, wpos, wdir, time);
+                PtHit wh = pt_trace_scene(s, wpos, wdir, st.time);
                 if (!wh.hit) break;
                 float mt;
                 float3 mweight;
@@ -1999,7 +2102,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                 float3 st3 = float3(m.sss_sigma_t[0], m.sss_sigma_t[1], m.sss_sigma_t[2]);
                 float3 ss3 = float3(m.sss_sigma_s[0], m.sss_sigma_s[1], m.sss_sigma_s[2]);
                 {
-                    float3 b = max(beta, float3(0.0f));
+                    float3 b = max(st.beta, float3(0.0f));
                     float total = b.x + b.y + b.z;
                     float3 w = total > 1e-12f ? b / total : float3(1.0f / 3.0f);
                     float u1 = pcg_f32(rng);
@@ -2014,7 +2117,7 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                         mweight = ss3 * tr / pdf;
                         mt = t;
                         // Scatter: isotropic direction.
-                        beta *= mweight;
+                        st.beta *= mweight;
                         float3 sp = wpos + wdir * mt;
                         float su = pcg_f32(rng);
                         float sv = pcg_f32(rng);
@@ -2023,16 +2126,16 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                         float sph = 2.0f * PT_PI * sv;
                         wpos = sp;
                         wdir = float3(rr2 * cos(sph), rr2 * sin(sph), z);
-                        float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
+                        float q = min(max(max(st.beta.x, st.beta.y), st.beta.z), 0.95f);
                         if (q <= 0.0f || (step > 8 && pcg_f32(rng) > q)) break;
-                        if (step > 8) beta /= q;
+                        if (step > 8) st.beta /= q;
                         continue;
                     }
                     // Pass to the boundary: exit diffusely.
                     float3 tr = exp(-st3 * wh.t);
                     float pdf = w.x * tr.x + w.y * tr.y + w.z * tr.z;
                     if (pdf <= 1e-30f) break;
-                    beta *= tr / pdf;
+                    st.beta *= tr / pdf;
                 }
                 float3 out_n = dot(wh.n, wdir) > 0.0f ? wh.n : -wh.n;
                 FrameL xf = frame_of(out_n);
@@ -2050,8 +2153,8 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                     float pick;
                     uint li = ls_sample(s, exit_p, pcg_f32(rng), pick);
                     float3 c = sample_one_light(s, s.lights[li], exit_p, out_n, ec,
-                                                pick, time, medium, rng);
-                    { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
+                                                pick, st.time, medium, rng);
+                    { float3 _c = st.beta * c; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
                 }
                 float xu1 = pcg_f32(rng);
                 float xu2 = pcg_f32(rng);
@@ -2060,23 +2163,23 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
                 float3 lw = float3(xr * cos(xph), xr * sin(xph),
                                    sqrt(max(1.0f - xu1, 0.0f)));
                 float3 wi = to_world(xf, lw);
-                prev_pdf = max(lw.z, 1e-9f) / PT_PI;
-                prev_origin = exit_p;
-                from_camera = false;
-                cone_spread += 0.4f;
-                origin = exit_p + out_n * PT_RAY_OFFSET;
-                dir = wi;
+                st.prev_pdf = max(lw.z, 1e-9f) / PT_PI;
+                st.prev_origin = exit_p;
+                st.from_camera = false;
+                st.cone_spread += 0.4f;
+                st.origin = exit_p + out_n * PT_RAY_OFFSET;
+                st.dir = wi;
                 exited = true;
                 break;
             }
-            if (!exited) break;
-            depth++;
-            if (depth >= u.rr_start) {
-                float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
-                if (q <= 0.0f || pcg_f32(rng) > q) break;
-                beta /= q;
+            if (!exited) return 0;
+            st.depth++;
+            if (st.depth >= u.rr_start) {
+                float q = min(max(max(st.beta.x, st.beta.y), st.beta.z), 0.95f);
+                if (q <= 0.0f || pcg_f32(rng) > q) return 0;
+                st.beta /= q;
             }
-            continue;
+            return 1;
         }
 
         FrameL frame = frame_of(n);
@@ -2096,38 +2199,72 @@ inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
             ec.h = 0.0f;
             float pick;
             uint li = ls_sample(s, h.p, pcg_f32(rng), pick);
-            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, time, medium, rng);
-            { float3 _c = beta * c; l += _c; if (first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
+            float3 c = sample_one_light(s, s.lights[li], h.p, n, ec, pick, st.time, medium, rng);
+            { float3 _c = st.beta * c; st.l += _c; if (st.first_spec != 1) { aux[8] += _c.x; aux[9] += _c.y; aux[10] += _c.z; } }
         }
 
         float3 wi_l, f;
         float pdf;
         bool transmitted;
         bool spec_lobe;
-        if (!bsdf_sample(m, wo_l, eta, rng, wi_l, f, pdf, transmitted, spec_lobe)) break;
+        if (!bsdf_sample(m, wo_l, eta, rng, wi_l, f, pdf, transmitted, spec_lobe)) return 0;
         float3 wi = to_world(frame, wi_l);
-        beta *= f * (fabs(wi_l.z) / pdf);
-        if (first_spec < 0) first_spec = spec_lobe ? 1 : 0;
-        prev_pdf = pdf;
-        prev_origin = h.p;
-        from_camera = false;
-        cone_spread += min(1.0f / (1.0f + pdf), 0.4f);
+        st.beta *= f * (fabs(wi_l.z) / pdf);
+        if (st.first_spec < 0) st.first_spec = spec_lobe ? 1 : 0;
+        st.prev_pdf = pdf;
+        st.prev_origin = h.p;
+        st.from_camera = false;
+        st.cone_spread += min(1.0f / (1.0f + pdf), 0.4f);
 
         if (transmitted && m.interior != 0xFFFFFFFFu) {
-            medium = entering ? m.interior : u.atmosphere;
+            if (entering) {
+                if (st.med_depth < 8u) st.med_stack[st.med_depth++] = m.interior;
+            } else if (st.med_depth > 0u) {
+                st.med_depth--;
+            }
         }
         float off = transmitted ? -PT_RAY_OFFSET : PT_RAY_OFFSET;
-        origin = h.p + n * off;
-        dir = wi;
-        depth++;
+        st.origin = h.p + n * off;
+        st.dir = wi;
+        st.depth++;
 
-        if (depth >= u.rr_start) {
-            float q = min(max(max(beta.x, beta.y), beta.z), 0.95f);
-            if (q <= 0.0f || pcg_f32(rng) > q) break;
-            beta /= q;
+        if (st.depth >= u.rr_start) {
+            float q = min(max(max(st.beta.x, st.beta.y), st.beta.z), 0.95f);
+            if (q <= 0.0f || pcg_f32(rng) > q) return 0;
+            st.beta /= q;
         }
+    return 1;
+}
+
+inline void wf_state_init(thread WfState& st, thread const PtScene& s,
+                          float3 origin, float3 dir, float time) {
+    st.l = float3(0.0f);
+    st.beta = float3(1.0f);
+    st.prev_pdf = 0.0f;
+    st.prev_origin = origin;
+    st.from_camera = true;
+    st.presence_skips = 0u;
+    st.cone_width = 0.0f;
+    st.cone_spread = 2.0f * s.u->half_height / (float)s.u->height;
+    st.med_depth = 0u;
+    st.first_spec = -1;
+    st.aux_set = false;
+    st.travel = 0.0f;
+    st.depth = 0u;
+    st.origin = origin;
+    st.dir = dir;
+    st.time = time;
+}
+
+inline float3 pt_li(thread const PtScene& s, float3 origin, float3 dir,
+                    float time, thread Pcg32& rng, thread float* aux) {
+    WfState st;
+    wf_state_init(st, s, origin, dir, time);
+    while (st.depth < s.u->max_bounces) {
+        PtHit h = pt_trace_scene(s, st.origin, st.dir, st.time);
+        if (pt_shade_step(s, st, h, rng, aux) == 0) break;
     }
-    return l;
+    return st.l;
 }
 
 // Filter importance sampling: subpixel offset from one uniform,
@@ -2247,6 +2384,18 @@ kernel void render_pt(device const Object*     objects          [[buffer(0)]],
             }
         }
         float rtime = (u.has_motion != 0u) ? pcg_f32(rng) : 0.0f;
+        if (u.has_cam_motion != 0u && rtime > 0.0f) {
+            // lerp(I, motion_inv, t) applied to the camera ray (mirror of
+            // Camera::apply_motion).
+            Affine mi = load_affine_c(u.cam_motion_inv);
+            Affine id;
+            id.r0 = float4(1.0f, 0.0f, 0.0f, 0.0f);
+            id.r1 = float4(0.0f, 1.0f, 0.0f, 0.0f);
+            id.r2 = float4(0.0f, 0.0f, 1.0f, 0.0f);
+            Affine mt = affine_lerp(id, mi, rtime);
+            ray_o = xf_point(mt, ray_o);
+            d = normalize_cpu(xf_vec(mt, d));
+        }
         float aux[12];
         for (int k = 0; k < 12; k++) aux[k] = 0.0f;
         float3 li = pt_li(s, ray_o, d, rtime, rng, aux);

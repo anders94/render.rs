@@ -40,9 +40,12 @@ creases; bicubic patch meshes with all standard bases; NURBS; fBm
 displacement at dice time; curves/hair as rounded-cone capsule chains; and
 `Points` particles.
 
-**Volumes.** Participating media via `Atmosphere` and `Interior`:
-homogeneous fog analytically, heterogeneous fBm clouds by delta tracking,
-with ratio-tracked colored transmittance and Henyey-Greenstein phase.
+**Volumes.** Participating media via `Atmosphere` and `Interior`, with
+proper nesting (a glass ball inside a cloud returns exiting rays to the
+cloud): homogeneous fog analytically, heterogeneous fBm clouds by delta
+tracking, ratio-tracked colored transmittance, Henyey-Greenstein phase,
+and equiangular sampling MIS'd against distance sampling so point-light
+glow in fog converges at a fraction of the samples.
 
 ![subsurface scattering busts](renders/bust.png)
 *Backlit marble and skin — random-walk subsurface scattering bleeding
@@ -50,23 +53,29 @@ light through thin edges.*
 
 **Textures & patterns.** A tiled-mip `.tex` texture format with a
 `render txmake` converter, a sharded-LRU tile cache with a byte budget,
-trilinear filtering driven by ray-cone footprints (no shimmer at grazing
-angles), UDIM tile sets, and a pattern node graph
+ray-cone-driven filtering — trilinear on the GPU, EWA anisotropic on the
+CPU (grazing planks keep their along-track detail) — UDIM tile sets, and
+a pattern node graph
 (texture/checker/fractal/mix/colorCorrect/ramp/triplanar) connected to
 material parameters with `"reference"` declarations — compiled to Metal
 Shading Language at runtime for the GPU.
 
 **Camera.** Perspective and orthographic projections, thin-lens depth of
-field, motion blur (transform and deformation, `MotionBegin`/`Shutter`),
-box/triangle/gaussian pixel filters via filter importance sampling, and
-adaptive sampling with variance-based stopping (`--adaptive`).
+field, motion blur (transform, deformation, and camera — a `MotionBegin`
+block around the pre-`WorldBegin` transforms pans the camera over the
+shutter), box/triangle/gaussian pixel filters via filter importance
+sampling, and adaptive sampling with variance-based stopping
+(`--adaptive`).
 
 **Production output.** `--aovs` renders a full AOV stack — beauty,
 diffuse/specular split, albedo, normal, depth, and object id with an
 `Attribute "identifier"` manifest — written as a multilayer OpenEXR that
-Nuke/Natron split by layer. `--denoise` runs an AOV-guided à-trous filter
-on the diffuse layer (specular passes through raw, so glass stays sharp).
-`--tonemap aces|srgb|linear` selects the display transform.
+Nuke/Natron split by layer. `--denoise` prefers Intel Open Image Denoise
+when the library is installed (loaded at runtime, no build dependency)
+and falls back to a built-in AOV-guided à-trous filter; both operate on
+the diffuse layer only, with specular passed through raw so glass stays
+sharp. `--tonemap aces|srgb|linear` selects the display transform.
+`--preview` opens a progressive window that re-renders on RIB edits.
 
 **Scale.** Binary RIB read/write (`render catrib`), `Procedural`
 generators (`DelayedReadArchive`, `RunProgram`), checkpoint/resume for
@@ -114,8 +123,12 @@ budget, `RENDER_PT_BAND_ROWS` GPU dispatch sizing.
 - **CPU** — the f64 reference implementation. Every feature lands here
   first; correctness fixtures (furnace tests, unbiased-estimator checks,
   BVH brute-force cross-checks) run against it.
-- **Metal** — an f32 compute megakernel, compiled from embedded MSL at
-  runtime (no build-time GPU toolchain). The scene is flattened once into
+- **Metal** — f32 compute, compiled from embedded MSL at runtime (no
+  build-time GPU toolchain), with two schedulers sharing one path-step
+  function: the default megakernel, and `--gpu-schedule wavefront` —
+  queued raygen/extend/shade stages with dead-path compaction that render
+  bit-identical images and run ~1.7x faster on divergent scenes (the 4K
+  forest); the megakernel stays quicker on small coherent frames. The scene is flattened once into
   `#[repr(C)]` buffers shared byte-identically by both sides; pattern
   graphs are code-generated into the kernel per scene. Parity with the CPU
   is *statistical* (same light transport, independent float error) and
@@ -187,7 +200,13 @@ Phases P0-P11 of [ROADMAP.md](ROADMAP.md) are complete — RIB
 generalization, the path-tracing pivot, meshes/BVH/instancing, the Metal
 port, PBR materials and lights, subdivision/patches/displacement, textures
 and patterns, camera and motion, hair, movie-scale infrastructure,
-volumes/SSS, and the production pipeline. Deferred items are recorded
+volumes/SSS, and the production pipeline — plus the once-deferred items:
+wavefront GPU scheduling, camera motion blur, equiangular volume
+sampling, EWA filtering (CPU), nested media, OIDN, and the interactive
+preview. Still consciously out: OSL via FFI (not in homebrew; the
+roadmap's off-ramp applies — the native pattern graph is the committed
+workhorse), NanoVDB ingest (tractable, sketched, waiting on real assets),
+GPU-side EWA, deep EXR, ptex, USD/Hydra. Deferred items are recorded
 honestly where they were skipped: wavefront GPU scheduling, OSL via FFI,
 OIDN, interactive preview, EWA filtering, VDB ingest, deep EXR, USD.
 

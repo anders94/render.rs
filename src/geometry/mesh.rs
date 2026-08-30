@@ -141,6 +141,37 @@ impl Mesh {
         (t > 1e-9 && t < t_max).then_some((t, u, v))
     }
 
+    /// Position-space gradients of s and t over triangle `tri` (local
+    /// space): grad_s · direction = ds along that direction. The standard
+    /// tangent-space solve from the two edges.
+    fn st_gradients(&self, tri: u32) -> Option<(Vec3, Vec3)> {
+        let st = self.st.as_ref()?;
+        let i0 = self.indices[tri as usize * 3] as usize;
+        let i1 = self.indices[tri as usize * 3 + 1] as usize;
+        let i2 = self.indices[tri as usize * 3 + 2] as usize;
+        let p0 = self.vertex(i0 as u32);
+        let e1 = self.vertex(i1 as u32) - p0;
+        let e2 = self.vertex(i2 as u32) - p0;
+        let ds1 = (st[i1][0] - st[i0][0]) as f64;
+        let dt1 = (st[i1][1] - st[i0][1]) as f64;
+        let ds2 = (st[i2][0] - st[i0][0]) as f64;
+        let dt2 = (st[i2][1] - st[i0][1]) as f64;
+        // Solve for grad_s, grad_t in the triangle plane:
+        // e1·grad_s = ds1, e2·grad_s = ds2 (and likewise t) — via the
+        // dual basis of (e1, e2) within the plane.
+        let n = e1.cross(&e2);
+        let n2 = n.length_squared();
+        if n2 < 1e-24 {
+            return None;
+        }
+        // e1·(e2×n) = |n|² and e2·(e1×n) = -|n|² (Lagrange identity).
+        let dual1 = e2.cross(&n) / n2; // e1·dual1 = 1, e2·dual1 = 0
+        let dual2 = e1.cross(&n) / -n2; // e1·dual2 = 0, e2·dual2 = 1
+        let grad_s = dual1 * ds1 + dual2 * ds2;
+        let grad_t = dual1 * dt1 + dual2 * dt2;
+        Some((grad_s, grad_t))
+    }
+
     /// Interpolated st at a hit, plus the triangle's st-density (st units
     /// per local-space unit, the sqrt of st-area over surface area).
     fn st_at(&self, tri: u32, u: f64, v: f64) -> Option<([f64; 2], f64)> {
@@ -308,6 +339,7 @@ impl Instance {
                 world_normal: world_n,
                 st: [0.5, v],
                 st_density: 0.0,
+                st_grad: [Vec3::zero(), Vec3::zero()],
                 tangent: world_t,
             });
         }
@@ -326,12 +358,24 @@ impl Instance {
             .st_at(tri, hit_uv.0, hit_uv.1)
             .map(|(st, d)| (st, d / self.scale))
             .unwrap_or(([0.0, 0.0], 0.0));
+        // World-space st gradients: local gradients pull back through the
+        // inverse transform (gradients are covectors).
+        let (gs, gt) = mesh
+            .st_gradients(tri)
+            .map(|(gs, gt)| {
+                (
+                    self.inverse.transform_normal(&gs),
+                    self.inverse.transform_normal(&gt),
+                )
+            })
+            .unwrap_or((Vec3::zero(), Vec3::zero()));
         Some(MeshHit {
             t_param: t,
             tri,
             world_normal: world_n,
             st,
             st_density,
+            st_grad: [gs, gt],
             tangent: Vec3::zero(),
         })
     }
@@ -371,6 +415,9 @@ pub struct MeshHit {
     pub st: [f64; 2],
     /// st units per world unit (0 when the mesh has no st).
     pub st_density: f64,
+    /// World-space gradients of s and t (zero when absent) — the texture
+    /// Jacobian for anisotropic (EWA) filtering.
+    pub st_grad: [Vec3; 2],
     /// Curve tangent at the hit (zero for surface geometry).
     pub tangent: Vec3,
 }
@@ -387,6 +434,7 @@ pub fn to_intersection(hit: &MeshHit, ray: &Ray, material_id: usize) -> Intersec
     Intersection::new(point.distance(&ray.origin), point, normal, material_id)
         .with_front_face(front_face)
         .with_st(hit.st, hit.st_density)
+        .with_st_grad(hit.st_grad)
         .with_tangent(hit.tangent)
 }
 

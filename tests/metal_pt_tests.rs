@@ -407,6 +407,104 @@ fn volumes_sss_statistical_parity() {
 }
 
 #[test]
+fn camera_motion_statistical_parity() {
+    // Deferral: camera transform blur — a pre-WorldBegin motion block
+    // pans the camera over the shutter.
+    let scene_rib = r#"
+        Format 96 96 1.0
+        Projection "perspective" "fov" [40]
+        Shutter 0 1
+        Option "background" "color" [0.35 0.45 0.65]
+        MotionBegin [0 1]
+            Translate 0 0 0
+            Translate 1.2 0.2 0
+        MotionEnd
+        WorldBegin
+            LightSource "distantlight" "sun" "from" [4 8 -6] "to" [0 0 6] "intensity" [1.2]
+            Color 0.7 0.7 0.7
+            Polygon "P" [-30 -1.2 -5  30 -1.2 -5  30 -1.2 40  -30 -1.2 40]
+            Color 0.8 0.3 0.2
+            Translate 0 0 7
+            Sphere 1 -1 1 360
+        WorldEnd
+    "#;
+    let requests = render_rs::parser::parse_rib(scene_rib).unwrap();
+    let scene = render_rs::parser::SceneBuilder::new().build(&requests).unwrap();
+    assert!(scene.camera.motion_inv.is_some());
+    assert!(scene.has_motion);
+
+    let cpu = pt::render(&scene, 128);
+    let gpu = metal::render_pt(&scene, 128).unwrap();
+    let mc = image_mean(&cpu);
+    let mg = image_mean(&gpu);
+    let rel = ((mc.x - mg.x).abs() + (mc.y - mg.y).abs() + (mc.z - mg.z).abs())
+        / (mc.x + mc.y + mc.z).max(0.05);
+    assert!(rel < 0.04, "camera motion mean mismatch: {mc:?} vs {mg:?} (rel {rel:.4})");
+    let e = rmse(&cpu, &gpu);
+    assert!(e < 0.12, "camera motion RMSE {e:.4}");
+
+    // And the blur is real: the sphere's edge must smear horizontally
+    // compared to a static render.
+    let static_rib = scene_rib.replace(
+        "MotionBegin [0 1]
+            Translate 0 0 0
+            Translate 1.2 0.2 0
+        MotionEnd",
+        "",
+    );
+    let sscene = render_rs::parser::SceneBuilder::new()
+        .build(&render_rs::parser::parse_rib(&static_rib).unwrap())
+        .unwrap();
+    let stat = pt::render(&sscene, 128);
+    // The pan drags the sphere across the frame over the shutter, so its
+    // redness-weighted centroid must shift horizontally vs the static
+    // render (robust against noise and partial-coverage thresholds).
+    let centroid_of = |img: &Image| -> f64 {
+        let mut wsum = 0.0;
+        let mut xsum = 0.0;
+        for row in img.iter().take(70).skip(20) {
+            for (x, p) in row.iter().enumerate() {
+                let redness = (p.x - p.z).max(0.0);
+                wsum += redness;
+                xsum += redness * x as f64;
+            }
+        }
+        xsum / wsum.max(1e-9)
+    };
+    let c_moving = centroid_of(&cpu);
+    let c_static = centroid_of(&stat);
+    assert!(
+        (c_moving - c_static).abs() > 4.0,
+        "no smear: moving centroid {c_moving:.1} vs static {c_static:.1}"
+    );
+}
+
+#[test]
+fn wavefront_matches_megakernel_exactly() {
+    // The wavefront scheduler runs the same pt_shade_step and RNG streams
+    // as the megakernel — output must match to floating-point identity,
+    // not just statistically.
+    let scene = load_fixture_scene("cornell.rib", 96, 96);
+    let mega = metal::render_pt(&scene, 24).unwrap();
+    let session = metal::WfSession::new(&scene).unwrap();
+    session.render_samples(0, 24).unwrap();
+    let wave = session.image();
+    let mut max_delta = 0.0f64;
+    for (ra, rb) in mega.iter().zip(&wave) {
+        for (pa, pb) in ra.iter().zip(rb) {
+            max_delta = max_delta
+                .max((pa.x - pb.x).abs())
+                .max((pa.y - pb.y).abs())
+                .max((pa.z - pb.z).abs());
+        }
+    }
+    assert!(
+        max_delta < 1e-6,
+        "wavefront diverged from megakernel: max delta {max_delta}"
+    );
+}
+
+#[test]
 fn metal_pt_deterministic() {
     let scene = load_fixture_scene("cornell.rib", 64, 64);
     let a = metal::render_pt(&scene, 16).unwrap();

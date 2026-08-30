@@ -1,3 +1,5 @@
+mod preview;
+
 use anyhow::Result;
 use clap::Parser;
 use render_rs::output::{write_exr, write_png, write_ppm, write_ppm_ascii};
@@ -84,6 +86,16 @@ struct Args {
     /// Also dump each AOV layer as <prefix>_<layer>.png (with --aovs).
     #[arg(long)]
     aov_dump: Option<String>,
+
+    /// Interactive progressive preview window (q/Esc quit, s save);
+    /// re-renders when the RIB file changes on disk.
+    #[arg(long)]
+    preview: bool,
+
+    /// GPU scheduler for the Metal path tracer: megakernel (default) or
+    /// wavefront (queued stages with dead-path compaction).
+    #[arg(long, default_value = "megakernel")]
+    gpu_schedule: String,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, clap::ValueEnum)]
@@ -202,6 +214,17 @@ fn main() -> Result<()> {
     let tonemap = render_rs::output::Tonemap::from_name(&args.tonemap)
         .ok_or_else(|| anyhow::anyhow!("unknown tonemap {:?}", args.tonemap))?;
 
+    if args.preview {
+        return preview::run(preview::PreviewOptions {
+            rib_file: args.rib_file.clone(),
+            width: args.width,
+            height: args.height,
+            use_metal: matches!(args.backend, Backend::Metal),
+            tonemap,
+            max_spp: args.spp.unwrap_or(512),
+        });
+    }
+
     // AOV path: render the film, optionally denoise, then write.
     if (args.aovs || args.denoise) && args.integrator == Integrator::Path {
         let spp = args.spp.unwrap_or_else(|| {
@@ -224,8 +247,13 @@ fn main() -> Result<()> {
             }
         };
         let beauty = if args.denoise {
-            println!("Denoising (albedo/normal-guided a-trous)...");
-            render_rs::output::denoise(&film)
+            if let Some(out) = render_rs::output::oidn::denoise_oidn(&film) {
+                println!("Denoising (OIDN, albedo/normal-guided)...");
+                out
+            } else {
+                println!("Denoising (albedo/normal-guided a-trous)...");
+                render_rs::output::denoise(&film)
+            }
         } else {
             film.beauty.clone()
         };
@@ -319,14 +347,21 @@ fn main() -> Result<()> {
                 let (sx, sy) = scene.pixel_samples;
                 (sx * sy).max(64)
             });
-            println!("Path tracing on Metal at {spp} spp...");
             #[cfg(target_os = "macos")]
             {
-                render_rs::raytracer::metal::render_pt_checkpointed(
-                    &scene,
-                    spp,
-                    args.checkpoint.as_deref(),
-                )?
+                if args.gpu_schedule == "wavefront" {
+                    println!("Path tracing on Metal (wavefront) at {spp} spp...");
+                    let session = render_rs::raytracer::metal::WfSession::new(&scene)?;
+                    session.render_samples(0, spp)?;
+                    session.image()
+                } else {
+                    println!("Path tracing on Metal at {spp} spp...");
+                    render_rs::raytracer::metal::render_pt_checkpointed(
+                        &scene,
+                        spp,
+                        args.checkpoint.as_deref(),
+                    )?
+                }
             }
             #[cfg(not(target_os = "macos"))]
             anyhow::bail!("the metal backend requires macOS")

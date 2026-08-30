@@ -2,6 +2,7 @@ mod exr_writer;
 pub mod film;
 pub mod denoise;
 pub mod multilayer;
+pub mod oidn;
 pub mod tonemap;
 mod ppm;
 mod png_writer;

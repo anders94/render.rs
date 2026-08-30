@@ -1,4 +1,4 @@
-use crate::math::{Point3, Vec3};
+use crate::math::{Matrix4, Point3, Vec3};
 use crate::raytracer::Ray;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,12 @@ pub struct Camera {
     pub filter: PixelFilter,
     /// Shutter open/close times (motion samples map onto [open, close]).
     pub shutter: (f64, f64),
+    /// Camera motion: the inverse world-to-camera delta at shutter close
+    /// (identity at open). Rays at time t are transformed by
+    /// lerp(I, motion_inv, t) — the world the baked geometry lives in IS
+    /// camera space at shutter open, so moving the camera means counter-
+    /// moving the rays.
+    pub motion_inv: Option<Matrix4>,
 }
 
 impl Camera {
@@ -108,6 +114,7 @@ impl Camera {
             ortho_half: (aspect, 1.0),
             filter: PixelFilter::Box { width: 1.0 },
             shutter: (0.0, 0.0),
+            motion_inv: None,
         }
     }
 
@@ -122,6 +129,20 @@ impl Camera {
     /// values address subpixel positions. (The Whitted path and tests.)
     pub fn generate_ray(&self, px: f64, py: f64) -> Ray {
         self.generate_ray_lens(px, py, 0.5, 0.5)
+    }
+
+    /// Apply camera motion to a ray at shutter time t.
+    pub fn apply_motion(&self, ray: Ray, t: f64) -> Ray {
+        let Some(m1) = &self.motion_inv else { return ray };
+        if t <= 0.0 {
+            return ray;
+        }
+        let m = Matrix4::identity().lerp(m1, t);
+        Ray {
+            origin: m.transform_point(&ray.origin),
+            direction: m.transform_vec(&ray.direction).normalize(),
+            time: ray.time,
+        }
     }
 
     /// Ray through (px, py) with a lens sample (lu, lv) in [0,1)^2 for

@@ -279,6 +279,103 @@ impl TextureCache {
         (info.width, info.height, out)
     }
 
+    /// EWA (elliptical weighted average) anisotropic lookup. `du`/`dv`
+    /// are the texture-space footprint axes (in st units) of the pixel's
+    /// ellipse; the mip comes from the MINOR axis so the major axis keeps
+    /// its detail, and the ellipse is integrated with a gaussian falloff
+    /// (Heckbert). Falls back to trilinear for degenerate ellipses.
+    pub fn sample_ewa(
+        &self,
+        id: TexId,
+        s: f64,
+        t: f64,
+        du: [f64; 2],
+        dv: [f64; 2],
+        wrap: Wrap,
+    ) -> [f32; 3] {
+        let header = self.header(id);
+        let mut major = (du[0] * du[0] + du[1] * du[1]).sqrt();
+        let mut minor = (dv[0] * dv[0] + dv[1] * dv[1]).sqrt();
+        let (mut ax_major, mut ax_minor) = (du, dv);
+        if minor > major {
+            std::mem::swap(&mut major, &mut minor);
+            std::mem::swap(&mut ax_major, &mut ax_minor);
+        }
+        if major <= 1e-9 {
+            return self.sample(id, s, t, 0.0, wrap);
+        }
+        // Cap anisotropy: widen the minor axis rather than taking
+        // unbounded taps.
+        const MAX_ANISO: f64 = 16.0;
+        if minor < major / MAX_ANISO {
+            minor = major / MAX_ANISO;
+        }
+        // Mip from the minor axis footprint.
+        let base = header.width.max(header.height) as f64;
+        let level = (minor * base).max(1e-9).log2().clamp(0.0, (header.mips.len() - 1) as f64);
+        let mip = level.floor() as usize;
+        let info = &header.mips[mip];
+        let (mw, mh) = (info.width as f64, info.height as f64);
+
+        // Ellipse in this mip's texel space.
+        let px = s * mw - 0.5;
+        let py = t * mh - 0.5;
+        let dux = ax_major[0] * mw;
+        let duy = ax_major[1] * mh;
+        let dvx = ax_minor[0] * mw;
+        let dvy = ax_minor[1] * mh;
+        // Implicit ellipse coefficients (Heckbert): A x² + B xy + C y² = F.
+        let mut a = duy * duy + dvy * dvy + 1.0;
+        let mut b = -2.0 * (dux * duy + dvx * dvy);
+        let mut c = dux * dux + dvx * dvx + 1.0;
+        let f = a * c - 0.25 * b * b;
+        if f <= 1e-12 {
+            return self.sample(id, s, t, minor, wrap);
+        }
+        let inv_f = 1.0 / f;
+        a *= inv_f;
+        b *= inv_f;
+        c *= inv_f;
+
+        // Bounding box of the ellipse.
+        let det = -b * b + 4.0 * a * c;
+        if det <= 0.0 {
+            return self.sample(id, s, t, minor, wrap);
+        }
+        let u_rad = (4.0 * c * det).sqrt() / det;
+        let v_rad = (4.0 * a * det).sqrt() / det;
+        let x0 = (px - u_rad).floor() as i64;
+        let x1 = (px + u_rad).ceil() as i64;
+        let y0 = (py - v_rad).floor() as i64;
+        let y1 = (py + v_rad).ceil() as i64;
+        if (x1 - x0) * (y1 - y0) > 4096 {
+            // Ellipse got absurd (shouldn't happen post-clamp): trilinear.
+            return self.sample(id, s, t, minor, wrap);
+        }
+
+        let mut sum = [0.0f32; 3];
+        let mut wsum = 0.0f32;
+        for y in y0..=y1 {
+            let dy = y as f64 - py;
+            for x in x0..=x1 {
+                let dx = x as f64 - px;
+                let r2 = a * dx * dx + b * dx * dy + c * dy * dy;
+                if r2 < 1.0 {
+                    let w = (-2.0 * r2).exp() as f32;
+                    let px3 = self.texel(id, &header, mip, x, y, wrap);
+                    for k in 0..3 {
+                        sum[k] += px3[k] * w;
+                    }
+                    wsum += w;
+                }
+            }
+        }
+        if wsum <= 1e-9 {
+            return self.sample(id, s, t, minor, wrap);
+        }
+        [sum[0] / wsum, sum[1] / wsum, sum[2] / wsum]
+    }
+
     pub fn stats_line(&self) -> String {
         let h = self.stats.hits.load(Ordering::Relaxed);
         let m = self.stats.misses.load(Ordering::Relaxed);
@@ -328,6 +425,53 @@ mod tests {
         // Huge footprint hits the 1x1 mip: overall mean ~ (0.5, 0.5, 0.5).
         let top = cache.sample(id, 0.25, 0.75, 10.0, Wrap::Periodic);
         assert!((top[0] - 0.5).abs() < 0.05 && (top[2] - 0.5).abs() < 0.01, "{top:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// EWA with a footprint long in t but narrow in s must keep
+    /// s-varying stripes sharp, where an isotropic (trilinear) lookup at
+    /// the same major-axis size washes them out.
+    #[test]
+    fn ewa_preserves_detail_across_anisotropy() {
+        let path = std::env::temp_dir().join("render_rs_ewa_test.tex");
+        let (w, h) = (256usize, 256usize);
+        let mut pixels = vec![0.0f32; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x / 8) % 2 == 0 { 1.0 } else { 0.0 };
+                let i = (y * w + x) * 3;
+                pixels[i] = v;
+                pixels[i + 1] = v;
+                pixels[i + 2] = v;
+            }
+        }
+        crate::texture::tex::write_tex(
+            &path,
+            &crate::texture::tex::LinearImage { width: w, height: h, pixels },
+        )
+        .unwrap();
+        let cache = TextureCache::new(64 * 1024 * 1024);
+        let id = cache.open(&path).unwrap();
+
+        // Ellipse: 1 texel wide in s, 64 texels long in t.
+        let du = [0.0, 64.0 / 256.0]; // major along t
+        let dv = [1.0 / 256.0, 0.0]; // minor along s
+        // Contrast between a white stripe center and a black stripe center.
+        let on = cache.sample_ewa(id, 4.5 / 256.0, 0.5, du, dv, Wrap::Periodic);
+        let off = cache.sample_ewa(id, 12.5 / 256.0, 0.5, du, dv, Wrap::Periodic);
+        let ewa_contrast = (on[0] - off[0]).abs();
+        // Isotropic trilinear at the major-axis footprint.
+        let on_t = cache.sample(id, 4.5 / 256.0, 0.5, 64.0 / 256.0, Wrap::Periodic);
+        let off_t = cache.sample(id, 12.5 / 256.0, 0.5, 64.0 / 256.0, Wrap::Periodic);
+        let tri_contrast = (on_t[0] - off_t[0]).abs();
+        assert!(
+            ewa_contrast > 0.5,
+            "EWA lost the stripes: contrast {ewa_contrast:.3}"
+        );
+        assert!(
+            tri_contrast < 0.2,
+            "trilinear unexpectedly sharp: {tri_contrast:.3}"
+        );
         std::fs::remove_file(&path).ok();
     }
 
